@@ -422,7 +422,7 @@ impl DeviceTree {
     }
 
     fn struct_align4(&mut self) {
-        while self.dt_struct.len() % 4 != 0 {
+        while !self.dt_struct.len().is_multiple_of(4) {
             self.dt_struct.push(0);
         }
     }

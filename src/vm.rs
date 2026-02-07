@@ -612,7 +612,7 @@ impl VmInstance {
             }
 
             // Minimal progress logging (only at major milestones, verbose only)
-            if iteration % 1000000 == 0 {
+            if iteration.is_multiple_of(1000000) {
                 let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
                 debug!("iter={}M, PC=0x{:x}", iteration / 1000000, pc);
             }
