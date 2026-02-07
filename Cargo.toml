@@ -1,0 +1,27 @@
+[package]
+name = "sandal"
+version = "0.1.0"
+edition = "2021"
+authors = ["maralla"]
+description = "Ultra-lightweight Linux VM for macOS with filesystem and network access control"
+
+[[bin]]
+name = "sandal"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+memmap2 = "0.9"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols
+panic = "abort"     # Smaller binary
+
+[build-dependencies]
+cc = "1.0"

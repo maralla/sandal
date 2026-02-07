@@ -1,0 +1,12 @@
+/target/
+Cargo.lock
+*.kernel
+*.img
+*.initrd
+.DS_Store
+*.swp
+*.swo
+*~
+rootfs*
+kernels
+PROGRESS.md
