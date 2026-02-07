@@ -3,7 +3,7 @@ name = "sandal"
 version = "0.1.0"
 edition = "2021"
 authors = ["maralla"]
-description = "Ultra-lightweight Linux VM for macOS with filesystem and network access control"
+description = "A high-performance, lightweight sandbox for running untrusted code securely on macOS Apple Silicon"
 
 [[bin]]
 name = "sandal"
