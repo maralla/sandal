@@ -241,13 +241,9 @@ impl VirtioRngDevice {
         let mut total_written = 0u32;
         let mut idx = head;
 
-        loop {
-            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx)
-            {
-                Some(d) => d,
-                None => break,
-            };
-
+        while let Some((addr, len, flags, next)) =
+            read_descriptor(memory, ram_base, q.desc_addr, idx)
+        {
             // Only write to device-writable descriptors
             if flags & VIRTQ_DESC_F_WRITE != 0 {
                 let offset = match addr.checked_sub(ram_base) {

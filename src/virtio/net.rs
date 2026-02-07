@@ -105,7 +105,7 @@ impl VirtioNetDevice {
             // Config space: MAC address (6 bytes) + status (2 bytes)
             // The kernel reads this byte-by-byte (vm_get8) for MAC and
             // halfword (vm_get16) for status. Return data at exact offset.
-            offset if offset >= REG_CONFIG_BASE && offset < REG_CONFIG_BASE + 8 => {
+            offset if (REG_CONFIG_BASE..REG_CONFIG_BASE + 8).contains(&offset) => {
                 let config_off = (offset - REG_CONFIG_BASE) as usize;
                 let mut config = [0u8; 8];
                 config[0..6].copy_from_slice(&self.mac);
@@ -251,13 +251,9 @@ impl VirtioNetDevice {
             let mut packet = Vec::new();
             let mut desc_idx = desc_head;
             let mut total_len = 0u32;
-            loop {
-                let (addr, len, flags, next) =
-                    match read_descriptor(memory, ram_base, q.desc_addr, desc_idx) {
-                        Some(d) => d,
-                        None => break,
-                    };
-
+            while let Some((addr, len, flags, next)) =
+                read_descriptor(memory, ram_base, q.desc_addr, desc_idx)
+            {
                 let offset = match addr.checked_sub(ram_base) {
                     Some(o) => o as usize,
                     None => break,

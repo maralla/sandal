@@ -47,13 +47,13 @@ pub fn build_from_directory(
         }
 
         let metadata = fs::symlink_metadata(entry_path)
-            .with_context(|| format!("Failed to stat {:?}", entry_path))?;
+            .with_context(|| format!("Failed to stat {entry_path:?}"))?;
 
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
             let target = fs::read_link(entry_path)
-                .with_context(|| format!("Failed to read symlink {:?}", entry_path))?;
+                .with_context(|| format!("Failed to read symlink {entry_path:?}"))?;
             let target_bytes = target.to_string_lossy().into_owned().into_bytes();
 
             // Symlink: mode has 0o120000 bit set
@@ -88,7 +88,7 @@ pub fn build_from_directory(
             )?;
         } else if file_type.is_file() {
             let data =
-                fs::read(entry_path).with_context(|| format!("Failed to read {:?}", entry_path))?;
+                fs::read(entry_path).with_context(|| format!("Failed to read {entry_path:?}"))?;
             let mode = 0o100000 | (metadata.permissions().mode() & 0o7777);
             write_cpio_entry(
                 &mut archive,
@@ -413,7 +413,7 @@ fi
 /bin/mount -t tmpfs tmpfs /tmp 2>/dev/null
 
 # Set system clock to host time (needed for TLS certificate validation)
-date -s "@{timestamp}" >/dev/null 2>&1
+date -s "@{now}" >/dev/null 2>&1
 
 # Seed kernel entropy pool (needed for TLS/getrandom)
 /usr/sbin/seed-entropy 2>/dev/null
@@ -425,23 +425,18 @@ export TERM=linux
 cd /
 {net_setup}
 # Signal boot complete to host (triggers direct UART output)
-echo "{boot_marker}"
+echo "{BOOT_MARKER}"
 
 # Run the command
-{cmd}
+{escaped_cmd}
 SANDAL_RC=$?
 
 # Signal exit code to host
-echo "{marker}$SANDAL_RC"
+echo "{EXIT_MARKER}$SANDAL_RC"
 
 # Power off
 exec /sbin/poweroff -f
-"#,
-        timestamp = now,
-        net_setup = net_setup,
-        cmd = escaped_cmd,
-        marker = EXIT_MARKER,
-        boot_marker = BOOT_MARKER
+"#
     )
 }
 
@@ -458,13 +453,14 @@ fn shell_escape(s: &str) -> String {
 
 /// Build a cpio archive from a pre-built initrd file (just reads it).
 pub fn load_initrd(path: &Path) -> Result<Vec<u8>> {
-    fs::read(path).with_context(|| format!("Failed to read initrd from {:?}", path))
+    fs::read(path).with_context(|| format!("Failed to read initrd from {path:?}"))
 }
 
 /// Recursively collect all filesystem entries under `base`.
+#[allow(clippy::only_used_in_recursion)]
 fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
     let read_dir =
-        fs::read_dir(current).with_context(|| format!("Failed to read directory {:?}", current))?;
+        fs::read_dir(current).with_context(|| format!("Failed to read directory {current:?}"))?;
 
     for entry in read_dir {
         let entry = entry?;
@@ -480,6 +476,7 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<PathBuf>) -> R
 }
 
 /// Write a single cpio "newc" format entry.
+#[allow(clippy::too_many_arguments)]
 fn write_cpio_entry(
     archive: &mut Vec<u8>,
     name: &str,

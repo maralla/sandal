@@ -14,7 +14,7 @@ impl Vm {
         let ret = unsafe { hv_vm_create_wrapper(0) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to create VM: error code {}", ret);
+            anyhow::bail!("Failed to create VM: error code {ret}");
         }
 
         // Set up GIC for interrupt handling (required for timer, UART, etc.)
@@ -70,8 +70,7 @@ impl Vm {
             if r != HV_SUCCESS {
                 hv_gic_config_release_wrapper(config);
                 return Err(anyhow::anyhow!(
-                    "Failed to set GIC distributor base: error code {}",
-                    r
+                    "Failed to set GIC distributor base: error code {r}"
                 ));
             }
 
@@ -79,8 +78,7 @@ impl Vm {
             if r != HV_SUCCESS {
                 hv_gic_config_release_wrapper(config);
                 return Err(anyhow::anyhow!(
-                    "Failed to set GIC redistributor base: error code {}",
-                    r
+                    "Failed to set GIC redistributor base: error code {r}"
                 ));
             }
 
@@ -90,7 +88,7 @@ impl Vm {
         };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to create GIC: error code {}", ret);
+            anyhow::bail!("Failed to create GIC: error code {ret}");
         }
 
         // Query SPI range
@@ -147,11 +145,7 @@ impl Vm {
         let ret = unsafe { hv_vm_map_wrapper(host_addr, guest_addr, size, flags) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!(
-                "Failed to map memory at 0x{:x}: error code {}",
-                guest_addr,
-                ret
-            );
+            anyhow::bail!("Failed to map memory at 0x{guest_addr:x}: error code {ret}");
         }
 
         Ok(())
@@ -173,11 +167,7 @@ impl Vm {
         let ret = unsafe { hv_vm_unmap_wrapper(guest_addr, size) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!(
-                "Failed to unmap memory at 0x{:x}: error code {}",
-                guest_addr,
-                ret
-            );
+            anyhow::bail!("Failed to unmap memory at 0x{guest_addr:x}: error code {ret}");
         }
 
         Ok(())
@@ -189,7 +179,7 @@ impl Drop for Vm {
         unsafe {
             let ret = hv_vm_destroy_wrapper();
             if ret != HV_SUCCESS {
-                log::warn!("Failed to destroy VM: error code {}", ret);
+                log::warn!("Failed to destroy VM: error code {ret}");
             }
         }
     }

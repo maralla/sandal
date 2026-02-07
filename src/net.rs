@@ -160,7 +160,7 @@ impl NetworkFilter {
             let hostname_lower = hostname.to_lowercase();
             // Check if hostname matches any allowed host (exact or subdomain)
             hosts.iter().any(|allowed| {
-                hostname_lower == *allowed || hostname_lower.ends_with(&format!(".{}", allowed))
+                hostname_lower == *allowed || hostname_lower.ends_with(&format!(".{allowed}"))
             })
         } else {
             true // Can't parse — pass through

@@ -105,7 +105,7 @@ impl VirtioBlkDevice {
             // offset 0: capacity (u64, in 512-byte sectors)
             // offset 8: size_max (u32)
             // offset 12: seg_max (u32)
-            offset if offset >= REG_CONFIG_BASE && offset < REG_CONFIG_BASE + 64 => {
+            offset if (REG_CONFIG_BASE..REG_CONFIG_BASE + 64).contains(&offset) => {
                 let config_off = (offset - REG_CONFIG_BASE) as usize;
                 match config_off {
                     0 => (self.capacity_sectors & 0xFFFFFFFF) as u32,
@@ -281,12 +281,9 @@ impl VirtioBlkDevice {
         // Collect all descriptors in the chain
         let mut descs: Vec<(u64, u32, u16)> = Vec::new(); // (addr, len, flags)
         let mut idx = head;
-        loop {
-            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx)
-            {
-                Some(d) => d,
-                None => break,
-            };
+        while let Some((addr, len, flags, next)) =
+            read_descriptor(memory, ram_base, q.desc_addr, idx)
+        {
             descs.push((addr, len, flags));
             if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;

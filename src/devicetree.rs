@@ -28,6 +28,7 @@ impl DeviceTree {
     }
 
     /// Build a complete device tree for QEMU-virt-like ARM64 machine
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         memory_size: u64,
         uart_base: u64,
@@ -72,7 +73,7 @@ impl DeviceTree {
             // preventing printk from cluttering the interactive terminal.
             // In verbose mode we omit it so all kernel output is visible.
             let quiet = if verbose { "" } else { " quiet" };
-            dt.prop_string("bootargs", &format!("{}{}{}", earlycon, rootfs, quiet));
+            dt.prop_string("bootargs", &format!("{earlycon}{rootfs}{quiet}"));
         }
         if use_8250_uart {
             dt.prop_string("stdout-path", "/serial@9000000");
@@ -111,7 +112,7 @@ impl DeviceTree {
 
         // GIC v3 interrupt controller node
         // phandle 0x8001 for reference from other nodes
-        let gic_node_name = format!("intc@{:x}", gic_dist_base);
+        let gic_node_name = format!("intc@{gic_dist_base:x}");
         dt.begin_node(&gic_node_name);
         dt.prop_string("compatible", "arm,gic-v3");
         dt.prop_u32("#interrupt-cells", 3);
@@ -202,7 +203,7 @@ impl DeviceTree {
 
         // Virtio-net MMIO node (optional)
         if let Some((virtio_base, virtio_spi)) = virtio_net {
-            let node_name = format!("virtio_mmio@{:x}", virtio_base);
+            let node_name = format!("virtio_mmio@{virtio_base:x}");
             dt.begin_node(&node_name);
             dt.prop_string("compatible", "virtio,mmio");
             let mut vreg = Vec::new();
@@ -221,7 +222,7 @@ impl DeviceTree {
 
         // Virtio-blk MMIO node (optional)
         if let Some((blk_base, blk_spi)) = virtio_blk {
-            let node_name = format!("virtio_mmio@{:x}", blk_base);
+            let node_name = format!("virtio_mmio@{blk_base:x}");
             dt.begin_node(&node_name);
             dt.prop_string("compatible", "virtio,mmio");
             let mut vreg = Vec::new();
@@ -239,7 +240,7 @@ impl DeviceTree {
 
         // Virtio-rng MMIO node (optional — provides entropy to the guest)
         if let Some((rng_base, rng_spi)) = virtio_rng {
-            let node_name = format!("virtio_mmio@{:x}", rng_base);
+            let node_name = format!("virtio_mmio@{rng_base:x}");
             dt.begin_node(&node_name);
             dt.prop_string("compatible", "virtio,mmio");
             let mut vreg = Vec::new();

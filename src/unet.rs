@@ -598,29 +598,18 @@ impl UserNet {
 
     fn poll_dns_rx(&mut self) {
         let mut buf = [0u8; 2048];
-        loop {
-            match self.dns_socket.recv_from(&mut buf) {
-                Ok((len, _addr)) => {
-                    if len < 2 {
-                        continue;
-                    }
-                    let dns_id = u16::from_be_bytes([buf[0], buf[1]]);
+        while let Ok((len, _addr)) = self.dns_socket.recv_from(&mut buf) {
+            if len < 2 {
+                continue;
+            }
+            let dns_id = u16::from_be_bytes([buf[0], buf[1]]);
 
-                    if let Some(pending) = self.pending_dns.remove(&dns_id) {
-                        let dns_data = &buf[..len];
-                        let udp = build_udp(53, pending.guest_port, dns_data);
-                        let ip = build_ipv4_packet(
-                            DNS_IP,
-                            pending.guest_ip,
-                            IP_UDP,
-                            &udp,
-                            &mut self.ip_id,
-                        );
-                        let frame = build_eth_frame(&GUEST_MAC, &GATEWAY_MAC, ETH_IPV4, &ip);
-                        self.rx_queue.push_back(frame);
-                    }
-                }
-                Err(_) => break, // WouldBlock or other error
+            if let Some(pending) = self.pending_dns.remove(&dns_id) {
+                let dns_data = &buf[..len];
+                let udp = build_udp(53, pending.guest_port, dns_data);
+                let ip = build_ipv4_packet(DNS_IP, pending.guest_ip, IP_UDP, &udp, &mut self.ip_id);
+                let frame = build_eth_frame(&GUEST_MAC, &GATEWAY_MAC, ETH_IPV4, &ip);
+                self.rx_queue.push_back(frame);
             }
         }
     }
@@ -1024,6 +1013,7 @@ fn build_ipv4_packet(
     pkt
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tcp_segment(
     src_port: u16,
     dst_port: u16,
@@ -1072,6 +1062,7 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp_segment: &[u8]) -> u16 {
 }
 
 /// Build a complete Ethernet frame containing a TCP segment.
+#[allow(clippy::too_many_arguments)]
 fn make_tcp_packet(
     src_ip: [u8; 4],
     src_port: u16,

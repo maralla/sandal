@@ -199,7 +199,7 @@ impl Ext2Builder {
         if self
             .entries
             .get(&dir_ino)
-            .map_or(false, |e| e.children.contains_key(name))
+            .is_some_and(|e| e.children.contains_key(name))
         {
             return;
         }
@@ -258,6 +258,7 @@ impl Ext2Builder {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn add_directory_recursive(
         &mut self,
         base: &Path,
@@ -265,7 +266,7 @@ impl Ext2Builder {
         parent_ino: u32,
     ) -> Result<()> {
         let read_dir = fs::read_dir(current)
-            .with_context(|| format!("Failed to read directory {:?}", current))?;
+            .with_context(|| format!("Failed to read directory {current:?}"))?;
 
         for entry in read_dir {
             let entry = entry?;
@@ -329,7 +330,7 @@ impl Ext2Builder {
         if data_blocks > 12 + ptrs_per_block {
             // Double indirect: 1 top + ceil((remaining) / ptrs_per_block)
             let remaining = data_blocks - 12 - ptrs_per_block;
-            meta += 1 + (remaining + ptrs_per_block - 1) / ptrs_per_block;
+            meta += 1 + remaining.div_ceil(ptrs_per_block);
         }
         meta
     }
@@ -338,7 +339,7 @@ impl Ext2Builder {
         // Ensure enough free inodes for runtime file creation (wget, tmp files, etc.)
         // At least 256 extra inodes beyond what the rootfs uses
         let num_inodes = (self.next_ino as usize + 256).max(512);
-        let inode_table_blocks = (num_inodes * INODE_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let inode_table_blocks = (num_inodes * INODE_SIZE).div_ceil(BLOCK_SIZE);
         let first_data_block = 4 + inode_table_blocks; // after superblock, bgdt, bitmaps, inode table
 
         // First pass: figure out how many data blocks we need (including indirect blocks)
@@ -347,7 +348,7 @@ impl Ext2Builder {
             if entry.mode & 0xF000 == S_IFDIR {
                 data_blocks_needed += 1; // One block per directory
             } else if entry.mode & 0xF000 == S_IFREG {
-                let file_blocks = ((entry.data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE).max(1);
+                let file_blocks = entry.data.len().div_ceil(BLOCK_SIZE).max(1);
                 data_blocks_needed += file_blocks + Self::indirect_blocks_needed(file_blocks);
             }
             // Symlinks < 60 bytes stored inline, chardevs have no data blocks
@@ -376,7 +377,7 @@ impl Ext2Builder {
         // Allocate blocks for regular files (data blocks + indirect blocks)
         for (&ino, entry) in &self.entries {
             if entry.mode & 0xF000 == S_IFREG {
-                let num_data = ((entry.data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE).max(1);
+                let num_data = entry.data.len().div_ceil(BLOCK_SIZE).max(1);
                 let data_blocks: Vec<u32> = (next_block..next_block + num_data as u32).collect();
                 next_block += num_data as u32;
 
@@ -597,7 +598,7 @@ impl Ext2Builder {
 
             // Write inode fields using direct offsets into image
             // i_mode
-            write_le16(image, inode_off + 0, entry.mode);
+            write_le16(image, inode_off, entry.mode);
             // i_uid
             write_le16(image, inode_off + 2, 0);
             // i_size

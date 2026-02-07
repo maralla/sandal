@@ -412,8 +412,8 @@ impl VmInstance {
         }
 
         debug!("Bootloader configured:");
-        debug!("   Kernel at GPA: 0x{:x}", kernel_entry_gpa);
-        debug!("   DTB at GPA: 0x{:x}", dtb_gpa);
+        debug!("   Kernel at GPA: 0x{kernel_entry_gpa:x}");
+        debug!("   DTB at GPA: 0x{dtb_gpa:x}");
 
         Ok(())
     }
@@ -483,10 +483,7 @@ impl VmInstance {
 
         let dtb_offset = DTB_OFFSET as usize;
         if dtb_offset + dtb.len() > self.memory.len() {
-            anyhow::bail!(
-                "Not enough memory for device tree at offset 0x{:x}",
-                dtb_offset
-            );
+            anyhow::bail!("Not enough memory for device tree at offset 0x{dtb_offset:x}");
         }
 
         self.memory[dtb_offset..dtb_offset + dtb.len()].copy_from_slice(&dtb);
@@ -549,7 +546,7 @@ impl VmInstance {
                 }
             );
             debug!("   CPSR: 0x{:x} (EL{}h)", verify_cpsr, verify_cpsr & 0xF);
-            debug!("   SP:   0x{:x}", sp_addr);
+            debug!("   SP:   0x{sp_addr:x}");
             debug!("   Kernel entry: 0x{:x}", self.kernel_entry);
 
             if verify_pc != bootloader_gpa {
@@ -624,7 +621,7 @@ impl VmInstance {
                 Ok(r) => r,
                 Err(e) => {
                     let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
-                    error!("hv_vcpu_run error at PC=0x{:x}: {}", pc, e);
+                    error!("hv_vcpu_run error at PC=0x{pc:x}: {e}");
                     return Err(e);
                 }
             };
@@ -656,13 +653,7 @@ impl VmInstance {
                         };
                         let fault_addr = vcpu.read_fault_address().unwrap_or(0);
                         trace!(
-                            "#{}: PC=0x{:x} EC=0x{:x}({}) ISS=0x{:x} fault=0x{:x}",
-                            iteration,
-                            pc,
-                            ec,
-                            ec_name,
-                            iss,
-                            fault_addr
+                            "#{iteration}: PC=0x{pc:x} EC=0x{ec:x}({ec_name}) ISS=0x{iss:x} fault=0x{fault_addr:x}"
                         );
                     }
 
@@ -705,19 +696,15 @@ impl VmInstance {
                                     cpsr,
                                     cpsr & 0xF
                                 );
-                                debug!("[HVC]   SP_EL0=0x{:x} SP_EL1=0x{:x}", sp_el0, sp_el1);
+                                debug!("[HVC]   SP_EL0=0x{sp_el0:x} SP_EL1=0x{sp_el1:x}");
+                                debug!("[HVC]   X4=0x{x4:x} X7=0x{x7:x} X8=0x{x8:x} LR=0x{lr:x}");
+                                debug!("[HVC]   ELR_EL1=0x{elr:x}");
                                 debug!(
-                                    "[HVC]   X4=0x{:x} X7=0x{:x} X8=0x{:x} LR=0x{:x}",
-                                    x4, x7, x8, lr
-                                );
-                                debug!("[HVC]   ELR_EL1=0x{:x}", elr);
-                                debug!(
-                                    "[HVC]   TTBR1_EL1=0x{:x} TCR_EL1=0x{:x} T1SZ={}",
-                                    ttbr1, tcr, t1sz
+                                    "[HVC]   TTBR1_EL1=0x{ttbr1:x} TCR_EL1=0x{tcr:x} T1SZ={t1sz}"
                                 );
 
                                 if let Some(phys) = self.translate_va_to_pa(sp, ttbr1, t1sz) {
-                                    debug!("[HVC]   SP VA 0x{:x} -> PA 0x{:x}", sp, phys);
+                                    debug!("[HVC]   SP VA 0x{sp:x} -> PA 0x{phys:x}");
                                     if phys >= RAM_BASE
                                         && phys + 16 < RAM_BASE + self.memory_size as u64
                                     {
@@ -730,7 +717,7 @@ impl VmInstance {
                                                 .try_into()
                                                 .unwrap(),
                                         );
-                                        debug!("[HVC]   [SP+0]=0x{:x} [SP+8]=0x{:x}", val0, val1);
+                                        debug!("[HVC]   [SP+0]=0x{val0:x} [SP+8]=0x{val1:x}");
                                     }
                                 }
                             }
@@ -740,7 +727,7 @@ impl VmInstance {
                             if result == 0xDEAD_DEAD {
                                 // Shutdown/reboot requested — return the exit code from guest
                                 let code = self.exit_code.unwrap_or(0);
-                                debug!("System shutdown requested, exit code: {}", code);
+                                debug!("System shutdown requested, exit code: {code}");
                                 return Ok(code);
                             }
 
@@ -796,9 +783,8 @@ impl VmInstance {
                                                     vcpu.write_register(HvReg::Pc, lr)?;
                                                     emulated_smccc = true;
 
-                                                    debug!("[HVC]   Emulated SMCCC: res@VA=0x{:x} PA=0x{:x}, wrote a0=0x{:x}", 
-                                                             res_ptr_va, res_pa, result);
-                                                    debug!("[HVC]   PC -> LR 0x{:x} (skipped __arm_smccc_hvc body)", lr);
+                                                    debug!("[HVC]   Emulated SMCCC: res@VA=0x{res_ptr_va:x} PA=0x{res_pa:x}, wrote a0=0x{result:x}");
+                                                    debug!("[HVC]   PC -> LR 0x{lr:x} (skipped __arm_smccc_hvc body)");
                                                 }
                                             }
                                         }
@@ -832,14 +818,11 @@ impl VmInstance {
                         0x20 | 0x21 => {
                             // Instruction Abort
                             let fault_addr = vcpu.read_fault_address().unwrap_or(0);
-                            error!(
-                                "Instruction Abort at PC=0x{:x}, fault_addr=0x{:x}",
-                                pc, fault_addr
-                            );
-                            error!("ISS=0x{:x}", iss);
+                            error!("Instruction Abort at PC=0x{pc:x}, fault_addr=0x{fault_addr:x}");
+                            error!("ISS=0x{iss:x}");
                             // Dump register state
                             self.dump_registers(&vcpu)?;
-                            return Err(anyhow::anyhow!("Instruction Abort at PC=0x{:x}", pc));
+                            return Err(anyhow::anyhow!("Instruction Abort at PC=0x{pc:x}"));
                         }
 
                         0x3C => {
@@ -869,22 +852,19 @@ impl VmInstance {
                                     }
                                     _ => {
                                         if iteration <= 20 {
-                                            debug!(
-                                                "Semihosting op=0x{:x}, param=0x{:x}",
-                                                op, param
-                                            );
+                                            debug!("Semihosting op=0x{op:x}, param=0x{param:x}");
                                         }
                                     }
                                 }
                             } else {
-                                debug!("BRK #{} at PC=0x{:x}", imm, pc);
+                                debug!("BRK #{imm} at PC=0x{pc:x}");
                             }
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
 
                         _ => {
                             if iteration <= 100 {
-                                warn!("Unhandled EC=0x{:x} at PC=0x{:x}, ISS=0x{:x}", ec, pc, iss);
+                                warn!("Unhandled EC=0x{ec:x} at PC=0x{pc:x}, ISS=0x{iss:x}");
                             }
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
@@ -901,7 +881,7 @@ impl VmInstance {
                 }
 
                 _ => {
-                    warn!("Unknown exit reason: {}", exit_reason);
+                    warn!("Unknown exit reason: {exit_reason}");
                     break;
                 }
             }
@@ -965,9 +945,9 @@ impl VmInstance {
 
         if log::log_enabled!(log::Level::Debug) {
             let final_pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
-            debug!("Final PC: 0x{:x}", final_pc);
-            debug!("Total iterations: {}", iteration);
-            debug!("Exit code: {}", code);
+            debug!("Final PC: 0x{final_pc:x}");
+            debug!("Total iterations: {iteration}");
+            debug!("Exit code: {code}");
         }
 
         Ok(code)
@@ -1029,14 +1009,13 @@ impl VmInstance {
         // right before running the user command.
         if trimmed.contains(crate::initramfs::BOOT_MARKER) {
             self.boot_complete = true;
-            debug!("{}", trimmed);
+            debug!("{trimmed}");
             return;
         }
 
         // Before boot is complete: only show in debug mode
         if !self.boot_complete {
-            debug!("{}", trimmed);
-            return;
+            debug!("{trimmed}");
         }
 
         // After boot: characters were already written directly to stdout
@@ -1060,10 +1039,7 @@ impl VmInstance {
             }
             0x84000003 | 0xC4000003 => {
                 // PSCI_CPU_ON
-                debug!(
-                    "[PSCI] CPU_ON(cpu={}, entry=0x{:x}, ctx=0x{:x}) -> ALREADY_ON",
-                    x1, x2, x3
-                );
+                debug!("[PSCI] CPU_ON(cpu={x1}, entry=0x{x2:x}, ctx=0x{x3:x}) -> ALREADY_ON");
                 Ok((-4i64) as u64) // PSCI_RET_ALREADY_ON
             }
             0x84000004 | 0xC4000004 => {
@@ -1087,7 +1063,7 @@ impl VmInstance {
                 }
             }
             _ => {
-                debug!("[PSCI] Unknown function: 0x{:x}", func);
+                debug!("[PSCI] Unknown function: 0x{func:x}");
                 Ok((-1i64) as u64) // NOT_SUPPORTED
             }
         }
@@ -1103,17 +1079,11 @@ impl VmInstance {
         let op1 = (iss >> 14) & 0x7;
         let op2 = (iss >> 17) & 0x7;
 
-        let sys_reg_id = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+        let _sys_reg_id = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
 
         if is_read {
             // MRS - provide emulated value
-            let value = match sys_reg_id {
-                // Common ID registers
-                _ => {
-                    // Default: return 0 for unknown registers
-                    0u64
-                }
-            };
+            let value = 0u64;
             Self::write_guest_register(vcpu, rt, value)?;
         }
         // MSR writes are silently ignored (trapped regs are usually debug/ICC regs)
@@ -1128,7 +1098,7 @@ impl VmInstance {
         let rt = ((iss >> 16) & 0x1F) as u8;
 
         // UART at 0x09000000
-        if fault_addr >= UART_BASE && fault_addr < UART_BASE + 0x1000 {
+        if (UART_BASE..UART_BASE + 0x1000).contains(&fault_addr) {
             let reg_offset = fault_addr - UART_BASE;
 
             if is_write {
@@ -1292,7 +1262,7 @@ impl VmInstance {
             }
         }
         // Virtio-net MMIO region
-        else if fault_addr >= VIRTIO_NET_BASE && fault_addr < VIRTIO_NET_BASE + VIRTIO_NET_SIZE {
+        else if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + VIRTIO_NET_SIZE).contains(&fault_addr) {
             let offset = fault_addr - VIRTIO_NET_BASE;
             if let Some(ref mut net) = self.virtio_net {
                 if is_write {
@@ -1322,7 +1292,7 @@ impl VmInstance {
             }
         }
         // Virtio-blk MMIO region
-        else if fault_addr >= VIRTIO_BLK_BASE && fault_addr < VIRTIO_BLK_BASE + VIRTIO_BLK_SIZE {
+        else if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_BLK_SIZE).contains(&fault_addr) {
             let offset = fault_addr - VIRTIO_BLK_BASE;
             if let Some(ref mut blk) = self.virtio_blk {
                 if is_write {
@@ -1340,14 +1310,12 @@ impl VmInstance {
                     let value = blk.mmio_read(offset);
                     Self::write_guest_register(vcpu, rt, value as u64)?;
                 }
-            } else {
-                if !is_write {
-                    Self::write_guest_register(vcpu, rt, 0)?;
-                }
+            } else if !is_write {
+                Self::write_guest_register(vcpu, rt, 0)?;
             }
         }
         // Virtio-rng MMIO region
-        else if fault_addr >= VIRTIO_RNG_BASE && fault_addr < VIRTIO_RNG_BASE + VIRTIO_RNG_SIZE {
+        else if (VIRTIO_RNG_BASE..VIRTIO_RNG_BASE + VIRTIO_RNG_SIZE).contains(&fault_addr) {
             let offset = fault_addr - VIRTIO_RNG_BASE;
             if let Some(ref mut rng) = self.virtio_rng {
                 if is_write {
@@ -1365,14 +1333,12 @@ impl VmInstance {
                     let value = rng.mmio_read(offset);
                     Self::write_guest_register(vcpu, rt, value as u64)?;
                 }
-            } else {
-                if !is_write {
-                    Self::write_guest_register(vcpu, rt, 0)?;
-                }
+            } else if !is_write {
+                Self::write_guest_register(vcpu, rt, 0)?;
             }
         }
         // GIC distributor region (0x08000000 - 0x0800FFFF)
-        else if fault_addr >= 0x08000000 && fault_addr < 0x08010000 {
+        else if (0x08000000..0x08010000).contains(&fault_addr) {
             if !is_write {
                 // GIC distributor reads - return reasonable defaults
                 let value = match fault_addr - 0x08000000 {
@@ -1385,14 +1351,11 @@ impl VmInstance {
             }
             // GIC writes - silently ignored
         }
-        // GIC redistributor region (0x080A0000 - 0x080BFFFF)
-        else if fault_addr >= 0x080A0000 && fault_addr < 0x080C0000 {
-            if !is_write {
-                Self::write_guest_register(vcpu, rt, 0)?;
-            }
-        }
+        // GIC redistributor region (0x080A0000 - 0x080BFFFF) or
         // GIC CPU interface (0x08010000 - 0x0801FFFF)
-        else if fault_addr >= 0x08010000 && fault_addr < 0x08020000 {
+        else if (0x080A0000..0x080C0000).contains(&fault_addr)
+            || (0x08010000..0x08020000).contains(&fault_addr)
+        {
             if !is_write {
                 Self::write_guest_register(vcpu, rt, 0)?;
             }
@@ -1497,20 +1460,20 @@ impl VmInstance {
         for i in 0..=30 {
             let val = Self::read_guest_register(vcpu, i)?;
             if val != 0 {
-                error!("  X{:<2} = 0x{:016x}", i, val);
+                error!("  X{i:<2} = 0x{val:016x}");
             }
         }
         let pc = vcpu.read_register(HvReg::Pc)?;
         let cpsr = vcpu.read_register(HvReg::Cpsr)?;
-        error!("  PC   = 0x{:016x}", pc);
+        error!("  PC   = 0x{pc:016x}");
         error!("  CPSR = 0x{:016x} (EL{})", cpsr, cpsr & 0xF);
 
         let sctlr = vcpu.read_sys_register(HvSysReg::SctlrEl1).unwrap_or(0);
         let elr = vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0);
         let vbar = vcpu.read_sys_register(HvSysReg::VbarEl1).unwrap_or(0);
-        error!("  SCTLR_EL1 = 0x{:x}", sctlr);
-        error!("  ELR_EL1   = 0x{:x}", elr);
-        error!("  VBAR_EL1  = 0x{:x}", vbar);
+        error!("  SCTLR_EL1 = 0x{sctlr:x}");
+        error!("  ELR_EL1   = 0x{elr:x}");
+        error!("  VBAR_EL1  = 0x{vbar:x}");
 
         Ok(())
     }
@@ -1625,15 +1588,12 @@ pub fn run(args: Args) -> Result<()> {
     let use_8250 = vm.uart_type == UartType::Uart8250;
     if let Some(rootfs_path) = rootfs_arg {
         if !rootfs_path.is_dir() {
-            anyhow::bail!("--rootfs path {:?} is not a directory", rootfs_path);
+            anyhow::bail!("--rootfs path {rootfs_path:?} is not a directory");
         }
 
         if prefer_virtio_blk {
             // Kernel supports virtio-blk but NOT initramfs — use ext2 image on virtio-blk
-            info!(
-                "Packing host directory {:?} as ext2 on virtio-blk...",
-                rootfs_path
-            );
+            info!("Packing host directory {rootfs_path:?} as ext2 on virtio-blk...");
             let disk_image = crate::ext2::build_ext2_from_directory(
                 rootfs_path,
                 &args.command,
@@ -1650,7 +1610,7 @@ pub fn run(args: Args) -> Result<()> {
             vm.use_virtio_blk = true;
         } else {
             // Default: use initramfs (cpio archive) — works with most kernels
-            info!("Packing host directory {:?} as initramfs...", rootfs_path);
+            info!("Packing host directory {rootfs_path:?} as initramfs...");
             let initrd_data = crate::initramfs::build_from_directory(
                 rootfs_path,
                 &args.command,
@@ -1661,7 +1621,7 @@ pub fn run(args: Args) -> Result<()> {
             vm.load_initrd(&initrd_data)?;
         }
     } else if let Some(initrd_path) = &args.initrd {
-        info!("Loading initrd from {:?}...", initrd_path);
+        info!("Loading initrd from {initrd_path:?}...");
         let initrd_data =
             crate::initramfs::load_initrd(initrd_path).context("Failed to load initrd")?;
         vm.load_initrd(&initrd_data)?;
@@ -1676,7 +1636,7 @@ pub fn run(args: Args) -> Result<()> {
     // Run the VM
     let exit_code = vm.run_command(&args.command)?;
 
-    debug!("VM exited with code: {}", exit_code);
+    debug!("VM exited with code: {exit_code}");
 
     std::process::exit(exit_code);
 }

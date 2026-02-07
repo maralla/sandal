@@ -25,7 +25,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_create_wrapper(&mut id, &mut exit_info) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to create VCPU: error code {}", ret);
+            anyhow::bail!("Failed to create VCPU: error code {ret}");
         }
 
         Ok(Vcpu { id, exit_info })
@@ -36,7 +36,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_run_wrapper(self.id) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to run VCPU: error code {}", ret);
+            anyhow::bail!("Failed to run VCPU: error code {ret}");
         }
 
         // Return exit reason
@@ -50,7 +50,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_read_register_wrapper(self.id, reg as u32, &mut value) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to read register: error code {}", ret);
+            anyhow::bail!("Failed to read register: error code {ret}");
         }
 
         Ok(value)
@@ -61,7 +61,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_write_register_wrapper(self.id, reg as u32, value) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to write register: error code {}", ret);
+            anyhow::bail!("Failed to write register: error code {ret}");
         }
 
         Ok(())
@@ -126,7 +126,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_read_sys_reg_wrapper(self.id, reg as u32, &mut value) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to read system register: error code {}", ret);
+            anyhow::bail!("Failed to read system register: error code {ret}");
         }
 
         Ok(value)
@@ -138,7 +138,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_write_sys_reg_wrapper(self.id, reg as u32, value) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to write system register: error code {}", ret);
+            anyhow::bail!("Failed to write system register: error code {ret}");
         }
 
         Ok(())
@@ -150,7 +150,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_set_vtimer_mask_wrapper(self.id, masked) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to set vtimer mask: error code {}", ret);
+            anyhow::bail!("Failed to set vtimer mask: error code {ret}");
         }
 
         Ok(())
@@ -163,7 +163,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_get_vtimer_mask_wrapper(self.id, &mut masked) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to get vtimer mask: error code {}", ret);
+            anyhow::bail!("Failed to get vtimer mask: error code {ret}");
         }
 
         Ok(masked)
@@ -175,7 +175,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_set_vtimer_offset_wrapper(self.id, offset) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to set vtimer offset: error code {}", ret);
+            anyhow::bail!("Failed to set vtimer offset: error code {ret}");
         }
 
         Ok(())
@@ -188,7 +188,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_get_vtimer_offset_wrapper(self.id, &mut offset) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to get vtimer offset: error code {}", ret);
+            anyhow::bail!("Failed to get vtimer offset: error code {ret}");
         }
 
         Ok(offset)
@@ -203,7 +203,7 @@ impl Vcpu {
             unsafe { hv_vcpus_exit_wrapper(vcpu_ids.as_ptr() as *mut _, vcpu_ids.len() as u32) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to force vcpu exit: error code {}", ret);
+            anyhow::bail!("Failed to force vcpu exit: error code {ret}");
         }
 
         Ok(())
@@ -218,7 +218,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_set_pending_interrupt_wrapper(self.id, int_type, pending) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to set pending interrupt: error code {}", ret);
+            anyhow::bail!("Failed to set pending interrupt: error code {ret}");
         }
 
         Ok(())
@@ -232,7 +232,7 @@ impl Vcpu {
         let ret = unsafe { hv_vcpu_set_trap_debug_exceptions_wrapper(self.id, value) };
 
         if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to set trap debug exceptions: error code {}", ret);
+            anyhow::bail!("Failed to set trap debug exceptions: error code {ret}");
         }
 
         Ok(())
@@ -244,7 +244,7 @@ impl Drop for Vcpu {
         unsafe {
             let ret = hv_vcpu_destroy_wrapper(self.id);
             if ret != HV_SUCCESS {
-                log::warn!("Failed to destroy VCPU: error code {}", ret);
+                log::warn!("Failed to destroy VCPU: error code {ret}");
             }
         }
     }
