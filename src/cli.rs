@@ -32,7 +32,7 @@ pub struct Args {
     #[arg(short = 'm', long = "memory", default_value = "256")]
     pub memory: usize,
 
-    /// Kernel image path (defaults to bundled kernel)
+    /// Kernel image path [default: kernels/vmlinux]
     #[arg(short = 'k', long = "kernel")]
     pub kernel: Option<PathBuf>,
 
@@ -40,7 +40,7 @@ pub struct Args {
     #[arg(short = 'i', long = "initrd")]
     pub initrd: Option<PathBuf>,
 
-    /// Use a host directory as the root filesystem (packed as initramfs)
+    /// Root filesystem directory (packed as initramfs) [default: rootfs/]
     #[arg(short = 'r', long = "rootfs")]
     pub rootfs: Option<PathBuf>,
 
