@@ -2,7 +2,6 @@
 /// This is the format Linux expects for initramfs images.
 ///
 /// Format reference: https://www.kernel.org/doc/Documentation/early-userspace/buffer-format.txt
-
 use anyhow::{Context, Result};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -20,7 +19,12 @@ pub const BOOT_MARKER: &str = "SANDAL_BOOT_COMPLETE";
 /// Build a cpio newc archive from a directory on the host,
 /// injecting a command to run as the init process.
 /// Returns the raw bytes of the archive (uncompressed).
-pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8250_uart: bool) -> Result<Vec<u8>> {
+pub fn build_from_directory(
+    dir: &Path,
+    command: &[String],
+    network: bool,
+    use_8250_uart: bool,
+) -> Result<Vec<u8>> {
     let mut archive = Vec::new();
     let mut inode: u32 = 300000; // Start with a high inode number to avoid collisions
 
@@ -32,7 +36,8 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
     entries.sort();
 
     for entry_path in &entries {
-        let rel_path = entry_path.strip_prefix(dir)
+        let rel_path = entry_path
+            .strip_prefix(dir)
             .context("Failed to compute relative path")?;
         let archive_path = rel_path.to_string_lossy().to_string();
 
@@ -53,18 +58,51 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
 
             // Symlink: mode has 0o120000 bit set
             let mode = 0o120777;
-            write_cpio_entry(&mut archive, &archive_path, inode, mode, 0, 0,
-                             1, metadata.mtime() as u32, &target_bytes, 0, 0)?;
+            write_cpio_entry(
+                &mut archive,
+                &archive_path,
+                inode,
+                mode,
+                0,
+                0,
+                1,
+                metadata.mtime() as u32,
+                &target_bytes,
+                0,
+                0,
+            )?;
         } else if file_type.is_dir() {
             let mode = 0o040000 | (metadata.permissions().mode() & 0o7777);
-            write_cpio_entry(&mut archive, &archive_path, inode, mode, 0, 0,
-                             2, metadata.mtime() as u32, &[], 0, 0)?;
+            write_cpio_entry(
+                &mut archive,
+                &archive_path,
+                inode,
+                mode,
+                0,
+                0,
+                2,
+                metadata.mtime() as u32,
+                &[],
+                0,
+                0,
+            )?;
         } else if file_type.is_file() {
-            let data = fs::read(entry_path)
-                .with_context(|| format!("Failed to read {:?}", entry_path))?;
+            let data =
+                fs::read(entry_path).with_context(|| format!("Failed to read {:?}", entry_path))?;
             let mode = 0o100000 | (metadata.permissions().mode() & 0o7777);
-            write_cpio_entry(&mut archive, &archive_path, inode, mode, 0, 0,
-                             1, metadata.mtime() as u32, &data, 0, 0)?;
+            write_cpio_entry(
+                &mut archive,
+                &archive_path,
+                inode,
+                mode,
+                0,
+                0,
+                1,
+                metadata.mtime() as u32,
+                &data,
+                0,
+                0,
+            )?;
         }
         // Skip other file types (devices, sockets, etc.)
 
@@ -73,7 +111,9 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
 
     // Ensure /dev directory exists (may already be in entries)
     let has_dev = entries.iter().any(|e| {
-        e.strip_prefix(dir).map(|r| r.to_string_lossy() == "dev").unwrap_or(false)
+        e.strip_prefix(dir)
+            .map(|r| r.to_string_lossy() == "dev")
+            .unwrap_or(false)
     });
     if !has_dev {
         write_cpio_entry(&mut archive, "dev", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
@@ -83,25 +123,97 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
     // Create essential device nodes that can't be created on macOS with mknod
     // Character device mode: 0o020000 | permissions
     // /dev/console: major 5, minor 1
-    write_cpio_entry(&mut archive, "dev/console", inode, 0o020666, 0, 0, 1, 0, &[], 5, 1)?;
+    write_cpio_entry(
+        &mut archive,
+        "dev/console",
+        inode,
+        0o020666,
+        0,
+        0,
+        1,
+        0,
+        &[],
+        5,
+        1,
+    )?;
     inode += 1;
     // Serial console device node — depends on UART type
     if use_8250_uart {
         // /dev/ttyS0: major 4, minor 64 (8250/16550 UART)
-        write_cpio_entry(&mut archive, "dev/ttyS0", inode, 0o020666, 0, 0, 1, 0, &[], 4, 64)?;
+        write_cpio_entry(
+            &mut archive,
+            "dev/ttyS0",
+            inode,
+            0o020666,
+            0,
+            0,
+            1,
+            0,
+            &[],
+            4,
+            64,
+        )?;
     } else {
         // /dev/ttyAMA0: major 204, minor 64 (PL011 UART)
-        write_cpio_entry(&mut archive, "dev/ttyAMA0", inode, 0o020666, 0, 0, 1, 0, &[], 204, 64)?;
+        write_cpio_entry(
+            &mut archive,
+            "dev/ttyAMA0",
+            inode,
+            0o020666,
+            0,
+            0,
+            1,
+            0,
+            &[],
+            204,
+            64,
+        )?;
     }
     inode += 1;
     // /dev/null: major 1, minor 3
-    write_cpio_entry(&mut archive, "dev/null", inode, 0o020666, 0, 0, 1, 0, &[], 1, 3)?;
+    write_cpio_entry(
+        &mut archive,
+        "dev/null",
+        inode,
+        0o020666,
+        0,
+        0,
+        1,
+        0,
+        &[],
+        1,
+        3,
+    )?;
     inode += 1;
     // /dev/tty: major 5, minor 0
-    write_cpio_entry(&mut archive, "dev/tty", inode, 0o020666, 0, 0, 1, 0, &[], 5, 0)?;
+    write_cpio_entry(
+        &mut archive,
+        "dev/tty",
+        inode,
+        0o020666,
+        0,
+        0,
+        1,
+        0,
+        &[],
+        5,
+        0,
+    )?;
     inode += 1;
     // /dev/zero: major 1, minor 5
-    write_cpio_entry(&mut archive, "dev/zero", inode, 0o020666, 0, 0, 1, 0, &[], 1, 5)?;
+    write_cpio_entry(
+        &mut archive,
+        "dev/zero",
+        inode,
+        0o020666,
+        0,
+        0,
+        1,
+        0,
+        &[],
+        1,
+        5,
+    )?;
     inode += 1;
 
     // Inject host CA certificates for HTTPS support
@@ -109,21 +221,60 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
         if let Some(ca_data) = load_host_ca_certificates() {
             // Ensure etc/ssl/certs directory exists
             let has_ssl_certs = entries.iter().any(|e| {
-                e.strip_prefix(dir).map(|r| r.to_string_lossy() == "etc/ssl/certs").unwrap_or(false)
+                e.strip_prefix(dir)
+                    .map(|r| r.to_string_lossy() == "etc/ssl/certs")
+                    .unwrap_or(false)
             });
             if !has_ssl_certs {
                 let has_ssl = entries.iter().any(|e| {
-                    e.strip_prefix(dir).map(|r| r.to_string_lossy() == "etc/ssl").unwrap_or(false)
+                    e.strip_prefix(dir)
+                        .map(|r| r.to_string_lossy() == "etc/ssl")
+                        .unwrap_or(false)
                 });
                 if !has_ssl {
-                    write_cpio_entry(&mut archive, "etc/ssl", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
+                    write_cpio_entry(
+                        &mut archive,
+                        "etc/ssl",
+                        inode,
+                        0o040755,
+                        0,
+                        0,
+                        2,
+                        0,
+                        &[],
+                        0,
+                        0,
+                    )?;
                     inode += 1;
                 }
-                write_cpio_entry(&mut archive, "etc/ssl/certs", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
+                write_cpio_entry(
+                    &mut archive,
+                    "etc/ssl/certs",
+                    inode,
+                    0o040755,
+                    0,
+                    0,
+                    2,
+                    0,
+                    &[],
+                    0,
+                    0,
+                )?;
                 inode += 1;
             }
-            write_cpio_entry(&mut archive, "etc/ssl/certs/ca-certificates.crt", inode, 0o100644, 0, 0,
-                             1, 0, &ca_data, 0, 0)?;
+            write_cpio_entry(
+                &mut archive,
+                "etc/ssl/certs/ca-certificates.crt",
+                inode,
+                0o100644,
+                0,
+                0,
+                1,
+                0,
+                &ca_data,
+                0,
+                0,
+            )?;
             inode += 1;
         }
     }
@@ -132,27 +283,65 @@ pub fn build_from_directory(dir: &Path, command: &[String], network: bool, use_8
     let seeder_bin = generate_entropy_seeder();
     // Ensure /usr/sbin directory exists
     let has_usr_sbin = entries.iter().any(|e| {
-        e.strip_prefix(dir).map(|r| r.to_string_lossy() == "usr/sbin").unwrap_or(false)
+        e.strip_prefix(dir)
+            .map(|r| r.to_string_lossy() == "usr/sbin")
+            .unwrap_or(false)
     });
     if !has_usr_sbin {
         let has_usr = entries.iter().any(|e| {
-            e.strip_prefix(dir).map(|r| r.to_string_lossy() == "usr").unwrap_or(false)
+            e.strip_prefix(dir)
+                .map(|r| r.to_string_lossy() == "usr")
+                .unwrap_or(false)
         });
         if !has_usr {
             write_cpio_entry(&mut archive, "usr", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
             inode += 1;
         }
-        write_cpio_entry(&mut archive, "usr/sbin", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
+        write_cpio_entry(
+            &mut archive,
+            "usr/sbin",
+            inode,
+            0o040755,
+            0,
+            0,
+            2,
+            0,
+            &[],
+            0,
+            0,
+        )?;
         inode += 1;
     }
-    write_cpio_entry(&mut archive, "usr/sbin/seed-entropy", inode, 0o100755, 0, 0,
-                     1, 0, &seeder_bin, 0, 0)?;
+    write_cpio_entry(
+        &mut archive,
+        "usr/sbin/seed-entropy",
+        inode,
+        0o100755,
+        0,
+        0,
+        1,
+        0,
+        &seeder_bin,
+        0,
+        0,
+    )?;
     inode += 1;
 
     // Inject the /init script that runs the user's command
     let init_script = generate_init_script(command, network);
-    write_cpio_entry(&mut archive, "init", inode, 0o100755, 0, 0, 1, 0,
-                     init_script.as_bytes(), 0, 0)?;
+    write_cpio_entry(
+        &mut archive,
+        "init",
+        inode,
+        0o100755,
+        0,
+        0,
+        1,
+        0,
+        init_script.as_bytes(),
+        0,
+        0,
+    )?;
     let _inode = inode + 1;
 
     // Write trailer entry
@@ -176,7 +365,8 @@ pub fn generate_init_script_ext(command: &[String], network: bool) -> String {
 /// prints an exit marker, and powers off.
 fn generate_init_script(command: &[String], network: bool) -> String {
     // Shell-escape each argument
-    let escaped_cmd = command.iter()
+    let escaped_cmd = command
+        .iter()
         .map(|arg| shell_escape(arg))
         .collect::<Vec<_>>()
         .join(" ");
@@ -212,7 +402,8 @@ fi
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    format!(r#"#!/bin/sh
+    format!(
+        r#"#!/bin/sh
 # Sandal VM init — auto-generated
 
 # Mount essential filesystems
@@ -245,12 +436,20 @@ echo "{marker}$SANDAL_RC"
 
 # Power off
 exec /sbin/poweroff -f
-"#, timestamp = now, net_setup = net_setup, cmd = escaped_cmd, marker = EXIT_MARKER, boot_marker = BOOT_MARKER)
+"#,
+        timestamp = now,
+        net_setup = net_setup,
+        cmd = escaped_cmd,
+        marker = EXIT_MARKER,
+        boot_marker = BOOT_MARKER
+    )
 }
 
 /// Simple shell escaping: wrap in single quotes, escaping any embedded single quotes.
 fn shell_escape(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.') {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -264,8 +463,8 @@ pub fn load_initrd(path: &Path) -> Result<Vec<u8>> {
 
 /// Recursively collect all filesystem entries under `base`.
 fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
-    let read_dir = fs::read_dir(current)
-        .with_context(|| format!("Failed to read directory {:?}", current))?;
+    let read_dir =
+        fs::read_dir(current).with_context(|| format!("Failed to read directory {:?}", current))?;
 
     for entry in read_dir {
         let entry = entry?;
@@ -294,7 +493,7 @@ fn write_cpio_entry(
     devmajor: u32,
     devminor: u32,
 ) -> Result<()> {
-    // The name in cpio must NOT have a leading '/' 
+    // The name in cpio must NOT have a leading '/'
     let name = name.trim_start_matches('/');
 
     // namesize includes the trailing NUL
@@ -317,19 +516,19 @@ fn write_cpio_entry(
          {:08X}\
          {:08X}\
          {:08X}",
-        ino,        // inode
-        mode,       // mode
-        uid,        // uid
-        gid,        // gid
-        nlink,      // nlink
-        mtime,      // mtime
-        filesize,   // filesize
-        0u32,       // devmajor (filesystem device, not used)
-        0u32,       // devminor (filesystem device, not used)
-        devmajor,   // rdevmajor (character/block device major)
-        devminor,   // rdevminor (character/block device minor)
-        namesize,   // namesize
-        0u32,       // checksum (always 0 for newc)
+        ino,      // inode
+        mode,     // mode
+        uid,      // uid
+        gid,      // gid
+        nlink,    // nlink
+        mtime,    // mtime
+        filesize, // filesize
+        0u32,     // devmajor (filesystem device, not used)
+        0u32,     // devminor (filesystem device, not used)
+        devmajor, // rdevmajor (character/block device major)
+        devminor, // rdevminor (character/block device minor)
+        namesize, // namesize
+        0u32,     // checksum (always 0 for newc)
     );
 
     assert_eq!(header.len(), 110);
@@ -363,9 +562,7 @@ fn write_cpio_entry(
 /// Returns None if the certificate file cannot be read.
 pub fn load_host_ca_certificates() -> Option<Vec<u8>> {
     // macOS system CA certificate bundle
-    let ca_paths = [
-        "/etc/ssl/cert.pem",
-    ];
+    let ca_paths = ["/etc/ssl/cert.pem"];
     for path in &ca_paths {
         if let Ok(data) = fs::read(path) {
             if !data.is_empty() {
@@ -390,7 +587,9 @@ pub fn generate_entropy_seeder() -> Vec<u8> {
     let mut seed_data = [0u8; 256];
     let mut urandom = fs::File::open("/dev/urandom").expect("Failed to open /dev/urandom");
     use std::io::Read;
-    urandom.read_exact(&mut seed_data).expect("Failed to read entropy from /dev/urandom");
+    urandom
+        .read_exact(&mut seed_data)
+        .expect("Failed to read entropy from /dev/urandom");
 
     // ARM64 code (assembled manually)
     //
@@ -435,7 +634,9 @@ pub fn generate_entropy_seeder() -> Vec<u8> {
         let immhi = ((offset >> 2) as u32) & 0x7FFFF;
         (immlo << 29) | (0b10000 << 24) | (immhi << 5) | rd
     }
-    fn svc0() -> u32 { 0xD4000001 }
+    fn svc0() -> u32 {
+        0xD4000001
+    }
 
     // Instruction 0 (offset 0x00): movn x0, #99 (AT_FDCWD = -100)
     code.extend_from_slice(&movn_x(0, 99).to_le_bytes());
@@ -474,8 +675,8 @@ pub fn generate_entropy_seeder() -> Vec<u8> {
 
     // struct rand_pool_info at offset 0x40
     code.extend_from_slice(&2048i32.to_le_bytes()); // entropy_count = 256 * 8 bits
-    code.extend_from_slice(&256i32.to_le_bytes());  // buf_size = 256
-    code.extend_from_slice(&seed_data);             // 256 bytes of random data
+    code.extend_from_slice(&256i32.to_le_bytes()); // buf_size = 256
+    code.extend_from_slice(&seed_data); // 256 bytes of random data
 
     // Now build the ELF binary
     let code_len = code.len();
@@ -489,30 +690,30 @@ pub fn generate_entropy_seeder() -> Vec<u8> {
 
     // ELF header (64 bytes for 64-bit)
     elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // e_ident magic
-    elf.push(2);    // EI_CLASS: ELFCLASS64
-    elf.push(1);    // EI_DATA: ELFDATA2LSB (little-endian)
-    elf.push(1);    // EI_VERSION: EV_CURRENT
-    elf.push(0);    // EI_OSABI: ELFOSABI_NONE
+    elf.push(2); // EI_CLASS: ELFCLASS64
+    elf.push(1); // EI_DATA: ELFDATA2LSB (little-endian)
+    elf.push(1); // EI_VERSION: EV_CURRENT
+    elf.push(0); // EI_OSABI: ELFOSABI_NONE
     elf.extend_from_slice(&[0; 8]); // EI_ABIVERSION + padding
-    elf.extend_from_slice(&2u16.to_le_bytes());  // e_type: ET_EXEC
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
     elf.extend_from_slice(&0xB7u16.to_le_bytes()); // e_machine: EM_AARCH64
-    elf.extend_from_slice(&1u32.to_le_bytes());  // e_version: EV_CURRENT
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version: EV_CURRENT
     elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
     elf.extend_from_slice(&(ehdr_size as u64).to_le_bytes()); // e_phoff (program header offset)
-    elf.extend_from_slice(&0u64.to_le_bytes());  // e_shoff (no section headers)
-    elf.extend_from_slice(&0u32.to_le_bytes());  // e_flags
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no section headers)
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
     elf.extend_from_slice(&ehdr_size.to_le_bytes()); // e_ehsize
     elf.extend_from_slice(&phdr_size.to_le_bytes()); // e_phentsize
-    elf.extend_from_slice(&1u16.to_le_bytes());  // e_phnum (1 program header)
-    elf.extend_from_slice(&0u16.to_le_bytes());  // e_shentsize
-    elf.extend_from_slice(&0u16.to_le_bytes());  // e_shnum
-    elf.extend_from_slice(&0u16.to_le_bytes());  // e_shstrndx
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum (1 program header)
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
     assert_eq!(elf.len(), 64);
 
     // Program header (56 bytes for 64-bit)
-    elf.extend_from_slice(&1u32.to_le_bytes());  // p_type: PT_LOAD
-    elf.extend_from_slice(&5u32.to_le_bytes());  // p_flags: PF_R | PF_X
-    elf.extend_from_slice(&0u64.to_le_bytes());  // p_offset: load from start of file
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
+    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags: PF_R | PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset: load from start of file
     elf.extend_from_slice(&(load_addr).to_le_bytes()); // p_vaddr
     elf.extend_from_slice(&(load_addr).to_le_bytes()); // p_paddr
     let total_size = file_offset + code_len as u64;

@@ -3,7 +3,6 @@
 /// Provides entropy from the host to the guest via the virtio MMIO transport.
 /// This is essential for guests that need cryptographic random numbers (e.g. TLS),
 /// especially on kernels without hardware RNG support (like kernel 4.14 on ARM64 VMs).
-
 use super::*;
 use std::io::Read;
 
@@ -41,10 +40,10 @@ impl VirtioRngDevice {
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         match offset {
-            REG_MAGIC_VALUE     => VIRTIO_MMIO_MAGIC,
-            REG_VERSION         => VIRTIO_MMIO_VERSION,
-            REG_DEVICE_ID       => VIRTIO_ID_RNG,
-            REG_VENDOR_ID       => VIRTIO_MMIO_VENDOR,
+            REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
+            REG_VERSION => VIRTIO_MMIO_VERSION,
+            REG_DEVICE_ID => VIRTIO_ID_RNG,
+            REG_VENDOR_ID => VIRTIO_MMIO_VENDOR,
             REG_DEVICE_FEATURES => {
                 let features = VIRTIO_F_VERSION_1;
                 if self.device_features_sel == 0 {
@@ -68,7 +67,7 @@ impl VirtioRngDevice {
                 }
             }
             REG_INTERRUPT_STATUS => self.interrupt_status,
-            REG_STATUS           => self.status,
+            REG_STATUS => self.status,
             REG_CONFIG_GENERATION => 0,
             _ => 0,
         }
@@ -78,16 +77,24 @@ impl VirtioRngDevice {
     /// Returns Some(queue_index) if QueueNotify was written.
     pub fn mmio_write(&mut self, offset: u64, value: u32) -> Option<u32> {
         match offset {
-            REG_DEVICE_FEATURES_SEL => { self.device_features_sel = value; }
+            REG_DEVICE_FEATURES_SEL => {
+                self.device_features_sel = value;
+            }
             REG_DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
-                    self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value as u64;
+                    self.driver_features =
+                        (self.driver_features & 0xFFFFFFFF00000000) | value as u64;
                 } else {
-                    self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | ((value as u64) << 32);
+                    self.driver_features =
+                        (self.driver_features & 0x00000000FFFFFFFF) | ((value as u64) << 32);
                 }
             }
-            REG_DRIVER_FEATURES_SEL => { self.driver_features_sel = value; }
-            REG_QUEUE_SEL => { self.queue_sel = value; }
+            REG_DRIVER_FEATURES_SEL => {
+                self.driver_features_sel = value;
+            }
+            REG_QUEUE_SEL => {
+                self.queue_sel = value;
+            }
             REG_QUEUE_NUM => {
                 if (self.queue_sel as usize) < NUM_QUEUES {
                     self.queues[self.queue_sel as usize].num = value;
@@ -106,7 +113,9 @@ impl VirtioRngDevice {
             }
             REG_STATUS => {
                 self.status = value;
-                if value == 0 { self.reset(); }
+                if value == 0 {
+                    self.reset();
+                }
             }
             REG_QUEUE_DESC_LOW => {
                 if (self.queue_sel as usize) < NUM_QUEUES {
@@ -162,7 +171,9 @@ impl VirtioRngDevice {
     /// Returns true if the used ring was updated (interrupt needed).
     pub fn process_queue(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
         let q = self.queues[0].clone();
-        if !q.ready || q.num == 0 { return false; }
+        if !q.ready || q.num == 0 {
+            return false;
+        }
 
         let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
             Some(idx) => idx,
@@ -180,16 +191,23 @@ impl VirtioRngDevice {
         };
 
         while last_avail != avail_idx {
-            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num) {
+            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
+            {
                 Some(d) => d,
                 None => break,
             };
 
             let total_written = self.fill_random(memory, ram_base, &q, desc_head, &mut rng);
 
-            write_used_ring(memory, ram_base, q.used_addr,
-                           used_idx_start.wrapping_add(used_count), q.num,
-                           desc_head as u32, total_written);
+            write_used_ring(
+                memory,
+                ram_base,
+                q.used_addr,
+                used_idx_start.wrapping_add(used_count),
+                q.num,
+                desc_head as u32,
+                total_written,
+            );
             used_count += 1;
             last_avail = last_avail.wrapping_add(1);
         }
@@ -197,8 +215,12 @@ impl VirtioRngDevice {
         self.queues[0].last_avail_idx = last_avail;
 
         if used_count > 0 {
-            write_used_idx(memory, ram_base, q.used_addr,
-                          used_idx_start.wrapping_add(used_count));
+            write_used_idx(
+                memory,
+                ram_base,
+                q.used_addr,
+                used_idx_start.wrapping_add(used_count),
+            );
             self.interrupt_status |= 1;
             true
         } else {
@@ -208,13 +230,20 @@ impl VirtioRngDevice {
 
     /// Fill a descriptor chain with random data from the host.
     /// Returns total bytes written.
-    fn fill_random(&self, memory: &mut [u8], ram_base: u64,
-                   q: &VirtqState, head: u16, rng: &mut std::fs::File) -> u32 {
+    fn fill_random(
+        &self,
+        memory: &mut [u8],
+        ram_base: u64,
+        q: &VirtqState,
+        head: u16,
+        rng: &mut std::fs::File,
+    ) -> u32 {
         let mut total_written = 0u32;
         let mut idx = head;
 
         loop {
-            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx) {
+            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx)
+            {
                 Some(d) => d,
                 None => break,
             };
@@ -226,14 +255,18 @@ impl VirtioRngDevice {
                     None => break,
                 };
                 let len = len as usize;
-                if offset + len > memory.len() { break; }
+                if offset + len > memory.len() {
+                    break;
+                }
 
                 // Fill buffer with random data from host
                 let _ = rng.read_exact(&mut memory[offset..offset + len]);
                 total_written += len as u32;
             }
 
-            if flags & VIRTQ_DESC_F_NEXT == 0 { break; }
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
+                break;
+            }
             idx = next;
         }
 

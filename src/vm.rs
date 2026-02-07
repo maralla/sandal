@@ -1,16 +1,17 @@
 use crate::cli::Args;
-use crate::hypervisor::{self, Vcpu, Vm, HvReg, HvSysReg, HV_MEMORY_READ, HV_MEMORY_WRITE, HV_MEMORY_EXEC};
 use crate::devicetree::DeviceTree;
-use crate::virtio::net::VirtioNetDevice;
+use crate::hypervisor::{
+    self, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
+};
 use crate::virtio::blk::VirtioBlkDevice;
+use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 use anyhow::{Context, Result};
-use log::{debug, warn, error, trace, info};
+use log::{debug, error, info, trace, warn};
 use memmap2::MmapMut;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
-
 
 const RAM_BASE: u64 = 0x40000000; // Match QEMU virt machine
 const KERNEL_OFFSET: u64 = 0x80000; // Kernel at RAM + 512KB (standard ARM64 load addr)
@@ -50,20 +51,20 @@ pub struct VmInstance {
     uart_type: UartType,
     kernel_entry: u64,
     initrd_info: Option<(u64, u64)>, // (start_gpa, end_gpa)
-    exit_code: Option<i32>,    // Set when guest signals exit via UART marker
-    boot_complete: bool,       // Set once kernel finishes booting and init runs
-    uart_line_buf: String,     // Buffer for current line being received
+    exit_code: Option<i32>,          // Set when guest signals exit via UART marker
+    boot_complete: bool,             // Set once kernel finishes booting and init runs
+    uart_line_buf: String,           // Buffer for current line being received
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
     virtio_rng: Option<VirtioRngDevice>,
     use_virtio_blk: bool,
-    uart_ier: u8,          // 8250 IER: bit 1 = THRE interrupt enable
-    uart_thr_written: bool,  // 8250: THR was written, THRE will be raised after ISR exits
-    uart_thre_pending: bool, // 8250: THRE interrupt needs to be delivered (ready for IIR)
-    uart_irq_asserted: bool, // 8250: SPI has been asserted, waiting for ISR to read IIR
+    uart_ier: u8,              // 8250 IER: bit 1 = THRE interrupt enable
+    uart_thr_written: bool,    // 8250: THR was written, THRE will be raised after ISR exits
+    uart_thre_pending: bool,   // 8250: THRE interrupt needs to be delivered (ready for IIR)
+    uart_irq_asserted: bool,   // 8250: SPI has been asserted, waiting for ISR to read IIR
     uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read
-    uart_suppress_line: bool, // True if rest of line is suppressed (kernel/marker)
+    uart_suppress_line: bool,  // True if rest of line is suppressed (kernel/marker)
 }
 
 // ============= Terminal raw mode =============
@@ -177,7 +178,11 @@ fn set_blocking(fd: RawFd) {
 /// Block until stdin has data available (or error/hangup).
 /// Returns > 0 if data ready, 0 on timeout (shouldn't happen), < 0 on error.
 fn poll_stdin_once(fd: RawFd) -> i32 {
-    let mut pfd = PollFd { fd, events: POLLIN, revents: 0 };
+    let mut pfd = PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
     // Block up to 1 second then re-check (allows thread to notice shutdown)
     unsafe { poll(&mut pfd, 1, 1000) }
 }
@@ -221,7 +226,7 @@ impl VmInstance {
             _ => Ok(()),
         }
     }
-    
+
     /// Helper to read from guest register by number (0-31)
     fn read_guest_register(vcpu: &Vcpu, rt: u8) -> Result<u64> {
         match rt {
@@ -260,19 +265,18 @@ impl VmInstance {
             _ => Ok(0),
         }
     }
-    
+
     pub fn new(memory_mb: usize) -> Result<Self> {
         // Initialize hypervisor
         hypervisor::init().context("Failed to initialize hypervisor")?;
-        
+
         // Create VM
         let vm = Vm::new().context("Failed to create VM")?;
-        
+
         // Allocate main memory
         let memory_size = memory_mb * 1024 * 1024;
-        let memory = MmapMut::map_anon(memory_size)
-            .context("Failed to allocate VM memory")?;
-        
+        let memory = MmapMut::map_anon(memory_size).context("Failed to allocate VM memory")?;
+
         Ok(VmInstance {
             vm,
             memory,
@@ -296,94 +300,109 @@ impl VmInstance {
             uart_suppress_line: false,
         })
     }
-    
+
     /// Detect the UART type from the kernel binary.
     /// Must be called before building the initramfs if using rootfs.
     pub fn detect_uart_type(&mut self, kernel_path: &std::path::Path) -> Result<()> {
         let kernel_data = std::fs::read(kernel_path)?;
         let has_pl011 = kernel_data.windows(5).any(|w| w == b"pl011");
         let has_8250 = kernel_data.windows(4).any(|w| w == b"8250")
-                     || kernel_data.windows(10).any(|w| w == b"serial8250");
-        
+            || kernel_data.windows(10).any(|w| w == b"serial8250");
+
         if has_8250 && !has_pl011 {
             self.uart_type = UartType::Uart8250;
         } else {
             self.uart_type = UartType::PL011;
         }
-        
-        debug!("UART type: {:?} (pl011={}, 8250={})", self.uart_type, has_pl011, has_8250);
+
+        debug!(
+            "UART type: {:?} (pl011={}, 8250={})",
+            self.uart_type, has_pl011, has_8250
+        );
         Ok(())
     }
-    
+
     pub fn setup(&mut self) -> Result<()> {
         let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
-        
+
         // Map main memory at 0x40000000 (QEMU virt machine layout)
-        self.vm.map_memory(
-            self.memory.as_mut_ptr() as *mut std::ffi::c_void,
+        self.vm
+            .map_memory(
+                self.memory.as_mut_ptr() as *mut std::ffi::c_void,
+                RAM_BASE,
+                self.memory_size,
+                flags,
+            )
+            .context("Failed to map main memory")?;
+        debug!(
+            "Main memory mapped at 0x{:x} ({} MB)",
             RAM_BASE,
-            self.memory_size,
-            flags,
-        ).context("Failed to map main memory")?;
-        debug!("Main memory mapped at 0x{:x} ({} MB)", RAM_BASE, self.memory_size / (1024*1024));
-        
+            self.memory_size / (1024 * 1024)
+        );
+
         Ok(())
     }
-    
+
     pub fn load_kernel(&mut self, kernel_path: &std::path::Path) -> Result<()> {
         // === QEMU-style boot sequence ===
         // 1. Write bootloader stub at RAM_BASE (offset 0)
         // 2. Load kernel at RAM_BASE + 0x80000
         // 3. Load DTB at RAM_BASE + DTB_OFFSET
         // 4. Fix up bootloader with absolute addresses
-        
+
         // Step 1: Write QEMU's bootloader at offset 0
         // This bootloader sets up X0 (DTB), clears X1-X3, jumps to kernel
         // From QEMU hw/arm/boot.c bootloader_aarch64[]
         let bootloader: [u32; 10] = [
-            0x580000c0,  // ldr x0, [pc, #0x18]  → load DTB address
-            0xaa1f03e1,  // mov x1, xzr
-            0xaa1f03e2,  // mov x2, xzr
-            0xaa1f03e3,  // mov x3, xzr
-            0x58000084,  // ldr x4, [pc, #0x10]  → load kernel entry
-            0xd61f0080,  // br x4                 → jump to kernel
+            0x580000c0, // ldr x0, [pc, #0x18]  → load DTB address
+            0xaa1f03e1, // mov x1, xzr
+            0xaa1f03e2, // mov x2, xzr
+            0xaa1f03e3, // mov x3, xzr
+            0x58000084, // ldr x4, [pc, #0x10]  → load kernel entry
+            0xd61f0080, // br x4                 → jump to kernel
             // Data section (filled in step 4):
-            0x00000000,  // [6] DTB address low 32 bits
-            0x00000000,  // [7] DTB address high 32 bits
-            0x00000000,  // [8] Kernel entry low 32 bits
-            0x00000000,  // [9] Kernel entry high 32 bits
+            0x00000000, // [6] DTB address low 32 bits
+            0x00000000, // [7] DTB address high 32 bits
+            0x00000000, // [8] Kernel entry low 32 bits
+            0x00000000, // [9] Kernel entry high 32 bits
         ];
-        
+
         unsafe {
             let ptr = self.memory.as_mut_ptr() as *mut u32;
             for (i, &instr) in bootloader.iter().enumerate() {
                 *ptr.add(i) = instr;
             }
         }
-        
+
         // Step 2: Load kernel at offset 0x80000
         let kernel_data = std::fs::read(kernel_path)?;
         let kernel_offset = KERNEL_OFFSET as usize;
-        
+
         if kernel_offset + kernel_data.len() > self.memory_size {
-            anyhow::bail!("Kernel too large for VM memory ({} bytes, memory {} bytes)", 
-                         kernel_data.len(), self.memory_size);
+            anyhow::bail!(
+                "Kernel too large for VM memory ({} bytes, memory {} bytes)",
+                kernel_data.len(),
+                self.memory_size
+            );
         }
-        
-        self.memory[kernel_offset..kernel_offset + kernel_data.len()]
-            .copy_from_slice(&kernel_data);
-        
-        debug!("Kernel loaded at offset 0x{:x} ({} bytes = {} MB)", 
-                 kernel_offset, kernel_data.len(), kernel_data.len() / (1024*1024));
-        
+
+        self.memory[kernel_offset..kernel_offset + kernel_data.len()].copy_from_slice(&kernel_data);
+
+        debug!(
+            "Kernel loaded at offset 0x{:x} ({} bytes = {} MB)",
+            kernel_offset,
+            kernel_data.len(),
+            kernel_data.len() / (1024 * 1024)
+        );
+
         // Step 3: Load device tree
         self.load_device_tree()?;
-        
+
         // Step 4: Fix up bootloader with absolute guest physical addresses
         let dtb_gpa = RAM_BASE + DTB_OFFSET;
         let kernel_entry_gpa = RAM_BASE + KERNEL_OFFSET;
         self.kernel_entry = kernel_entry_gpa;
-        
+
         unsafe {
             let ptr = self.memory.as_mut_ptr() as *mut u32;
             *ptr.add(6) = (dtb_gpa & 0xFFFFFFFF) as u32;
@@ -391,20 +410,23 @@ impl VmInstance {
             *ptr.add(8) = (kernel_entry_gpa & 0xFFFFFFFF) as u32;
             *ptr.add(9) = ((kernel_entry_gpa >> 32) & 0xFFFFFFFF) as u32;
         }
-        
+
         debug!("Bootloader configured:");
         debug!("   Kernel at GPA: 0x{:x}", kernel_entry_gpa);
         debug!("   DTB at GPA: 0x{:x}", dtb_gpa);
-        
+
         Ok(())
     }
-    
+
     /// Load an initrd/initramfs into guest memory
     pub fn load_initrd(&mut self, data: &[u8]) -> Result<()> {
         let offset = INITRD_OFFSET as usize;
         if offset + data.len() > self.memory_size {
-            anyhow::bail!("Initrd too large ({} bytes) for VM memory ({} bytes)",
-                         data.len(), self.memory_size);
+            anyhow::bail!(
+                "Initrd too large ({} bytes) for VM memory ({} bytes)",
+                data.len(),
+                self.memory_size
+            );
         }
 
         self.memory[offset..offset + data.len()].copy_from_slice(data);
@@ -413,15 +435,20 @@ impl VmInstance {
         let end_gpa = start_gpa + data.len() as u64;
         self.initrd_info = Some((start_gpa, end_gpa));
 
-        debug!("Initrd loaded at GPA 0x{:x}-0x{:x} ({} bytes = {} KB)",
-                 start_gpa, end_gpa, data.len(), data.len() / 1024);
+        debug!(
+            "Initrd loaded at GPA 0x{:x}-0x{:x} ({} bytes = {} KB)",
+            start_gpa,
+            end_gpa,
+            data.len(),
+            data.len() / 1024
+        );
 
         Ok(())
     }
 
     fn load_device_tree(&mut self) -> Result<()> {
         // Query GIC parameters from HVF for accurate device tree
-        let (gic_dist_base, gic_dist_size, gic_redist_base, gic_redist_size) = 
+        let (gic_dist_base, gic_dist_size, gic_redist_base, gic_redist_size) =
             crate::hypervisor::vm::Vm::query_gic_params();
         let virtio_net_dt = if self.network_enabled {
             Some((VIRTIO_NET_BASE, VIRTIO_NET_SPI))
@@ -439,78 +466,103 @@ impl VmInstance {
             None
         };
         let use_8250 = self.uart_type == UartType::Uart8250;
-        let dtb = DeviceTree::build(self.memory_size as u64, UART_BASE, 
-                                     gic_dist_base, gic_dist_size, gic_redist_base, gic_redist_size,
-                                     self.initrd_info, virtio_net_dt, virtio_blk_dt, virtio_rng_dt, use_8250, log::log_enabled!(log::Level::Debug))?;
-        
+        let dtb = DeviceTree::build(
+            self.memory_size as u64,
+            UART_BASE,
+            gic_dist_base,
+            gic_dist_size,
+            gic_redist_base,
+            gic_redist_size,
+            self.initrd_info,
+            virtio_net_dt,
+            virtio_blk_dt,
+            virtio_rng_dt,
+            use_8250,
+            log::log_enabled!(log::Level::Debug),
+        )?;
+
         let dtb_offset = DTB_OFFSET as usize;
         if dtb_offset + dtb.len() > self.memory.len() {
-            anyhow::bail!("Not enough memory for device tree at offset 0x{:x}", dtb_offset);
+            anyhow::bail!(
+                "Not enough memory for device tree at offset 0x{:x}",
+                dtb_offset
+            );
         }
-        
+
         self.memory[dtb_offset..dtb_offset + dtb.len()].copy_from_slice(&dtb);
-        
+
         // Verify DTB magic
         let magic = u32::from_be_bytes([dtb[0], dtb[1], dtb[2], dtb[3]]);
-        debug!("Device tree loaded at GPA 0x{:x} ({} bytes, magic=0x{:08x})", 
-                 RAM_BASE + DTB_OFFSET, dtb.len(), magic);
-        
+        debug!(
+            "Device tree loaded at GPA 0x{:x} ({} bytes, magic=0x{:08x})",
+            RAM_BASE + DTB_OFFSET,
+            dtb.len(),
+            magic
+        );
+
         Ok(())
     }
-    
+
     pub fn run_command(&mut self, _command: &[String]) -> Result<i32> {
         debug!("=== Starting Linux kernel execution ===");
-        
+
         // Create VCPU
         let vcpu = Vcpu::new().context("Failed to create vCPU")?;
         debug!("vCPU created (ID: {})", vcpu.id());
-        
+
         // === Configure VCPU state (matching QEMU's boot sequence) ===
-        
+
         // PC → bootloader at RAM_BASE
         let bootloader_gpa = RAM_BASE;
         vcpu.write_register(HvReg::Pc, bootloader_gpa)?;
-        
+
         // CPSR → EL1h with all interrupts masked (DAIF)
         vcpu.write_register(HvReg::Cpsr, 0x3C5)?;
-        
+
         // SCTLR_EL1 → 0 (MMU off, caches off)
         vcpu.write_sys_register(HvSysReg::SctlrEl1, 0)?;
-        
+
         // Stack pointers
         let sp_addr = RAM_BASE + (self.memory_size as u64) - 0x10000; // Near top of RAM
         vcpu.write_sys_register(HvSysReg::SpEl0, sp_addr)?;
         vcpu.write_sys_register(HvSysReg::SpEl1, sp_addr)?;
-        
+
         // Set MPIDR_EL1 for GIC redistributor mapping
         // Bit 31 is RES1 on AArch64, Aff0=0 for CPU 0
         vcpu.write_sys_register(HvSysReg::MpidrEl1, 0x80000000)?;
-        
+
         // Trap debug exceptions
         vcpu.set_trap_debug_exceptions(true)?;
-        
+
         if log::log_enabled!(log::Level::Debug) {
             let verify_pc = vcpu.read_register(HvReg::Pc)?;
             let verify_cpsr = vcpu.read_register(HvReg::Cpsr)?;
             debug!("VCPU configured:");
-            debug!("   PC:   0x{:x} (expected: 0x{:x}) {}", 
-                     verify_pc, bootloader_gpa, 
-                     if verify_pc == bootloader_gpa { "OK" } else { "MISMATCH!" });
+            debug!(
+                "   PC:   0x{:x} (expected: 0x{:x}) {}",
+                verify_pc,
+                bootloader_gpa,
+                if verify_pc == bootloader_gpa {
+                    "OK"
+                } else {
+                    "MISMATCH!"
+                }
+            );
             debug!("   CPSR: 0x{:x} (EL{}h)", verify_cpsr, verify_cpsr & 0xF);
             debug!("   SP:   0x{:x}", sp_addr);
             debug!("   Kernel entry: 0x{:x}", self.kernel_entry);
-            
+
             if verify_pc != bootloader_gpa {
                 warn!("PC mismatch! HvReg values may still be wrong.");
             }
-            
+
             debug!("--- Entering VCPU run loop ---");
         }
-        
+
         let mut iteration: u64 = 0;
         let mut stdin_eof = false;
         let max_iterations: u64 = 100_000_000; // 100M iterations for kernel boot
-        
+
         // Put the terminal in raw mode so we can forward stdin to the guest
         // character-by-character (needed for interactive programs like Python REPL).
         let stdin_fd = std::io::stdin().as_raw_fd();
@@ -553,21 +605,21 @@ impl VmInstance {
         } else {
             None
         };
-        
+
         loop {
             iteration += 1;
-            
+
             if iteration > max_iterations {
                 warn!("Stopped after {} iterations", iteration - 1);
                 break;
             }
-            
+
             // Minimal progress logging (only at major milestones, verbose only)
             if iteration % 1000000 == 0 {
                 let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
                 debug!("iter={}M, PC=0x{:x}", iteration / 1000000, pc);
             }
-            
+
             let exit_reason = match vcpu.run() {
                 Ok(r) => r,
                 Err(e) => {
@@ -576,7 +628,7 @@ impl VmInstance {
                     return Err(e);
                 }
             };
-            
+
             match exit_reason {
                 0 => {
                     // HV_EXIT_REASON_CANCELED — hv_vcpus_exit() was called
@@ -589,7 +641,7 @@ impl VmInstance {
                     let syndrome = vcpu.read_exception_syndrome()?;
                     let ec = (syndrome >> 26) & 0x3F;
                     let iss = syndrome & 0x1FFFFFF;
-                    
+
                     // Detailed logging for first 30 iterations
                     if iteration <= 30 {
                         let ec_name = match ec {
@@ -603,70 +655,98 @@ impl VmInstance {
                             _ => "Other",
                         };
                         let fault_addr = vcpu.read_fault_address().unwrap_or(0);
-                        trace!("#{}: PC=0x{:x} EC=0x{:x}({}) ISS=0x{:x} fault=0x{:x}", 
-                                iteration, pc, ec, ec_name, iss, fault_addr);
+                        trace!(
+                            "#{}: PC=0x{:x} EC=0x{:x}({}) ISS=0x{:x} fault=0x{:x}",
+                            iteration,
+                            pc,
+                            ec,
+                            ec_name,
+                            iss,
+                            fault_addr
+                        );
                     }
-                    
+
                     match ec {
                         0x01 => {
                             // WFI/WFE - just advance PC
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
-                        
+
                         0x16 | 0x17 => {
                             // HVC (0x16) or SMC (0x17) - PSCI handling
                             let x0 = vcpu.read_register(HvReg::X0)?;
                             let x1 = vcpu.read_register(HvReg::X1)?;
                             let x2 = vcpu.read_register(HvReg::X2)?;
                             let x3 = vcpu.read_register(HvReg::X3)?;
-                            
+
                             let lr = vcpu.read_register(HvReg::Lr)?;
-                            
+
                             // Read registers needed for SMCCC workaround
                             let sp_el1 = vcpu.read_sys_register(HvSysReg::SpEl1).unwrap_or(0);
                             let ttbr1 = vcpu.read_sys_register(HvSysReg::Ttbr1El1).unwrap_or(0);
                             let tcr = vcpu.read_sys_register(HvSysReg::TcrEl1).unwrap_or(0);
                             let t1sz = (tcr >> 16) & 0x3F;
                             let sp = sp_el1;
-                            
+
                             if log::log_enabled!(log::Level::Debug) {
                                 let cpsr = vcpu.read_register(HvReg::Cpsr)?;
-                                let sp_el0 = vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0xDEAD);
+                                let sp_el0 =
+                                    vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0xDEAD);
                                 let x4 = vcpu.read_register(HvReg::X4)?;
                                 let x7 = vcpu.read_register(HvReg::X7)?;
                                 let x8 = vcpu.read_register(HvReg::X8)?;
-                                let elr = vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0xDEAD);
-                                
-                                debug!("[HVC] PC=0x{:x} func=0x{:x} CPSR=0x{:x} (EL{})", 
-                                         pc, x0, cpsr, cpsr & 0xF);
+                                let elr =
+                                    vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0xDEAD);
+
+                                debug!(
+                                    "[HVC] PC=0x{:x} func=0x{:x} CPSR=0x{:x} (EL{})",
+                                    pc,
+                                    x0,
+                                    cpsr,
+                                    cpsr & 0xF
+                                );
                                 debug!("[HVC]   SP_EL0=0x{:x} SP_EL1=0x{:x}", sp_el0, sp_el1);
-                                debug!("[HVC]   X4=0x{:x} X7=0x{:x} X8=0x{:x} LR=0x{:x}", x4, x7, x8, lr);
+                                debug!(
+                                    "[HVC]   X4=0x{:x} X7=0x{:x} X8=0x{:x} LR=0x{:x}",
+                                    x4, x7, x8, lr
+                                );
                                 debug!("[HVC]   ELR_EL1=0x{:x}", elr);
-                                debug!("[HVC]   TTBR1_EL1=0x{:x} TCR_EL1=0x{:x} T1SZ={}", ttbr1, tcr, t1sz);
-                                
+                                debug!(
+                                    "[HVC]   TTBR1_EL1=0x{:x} TCR_EL1=0x{:x} T1SZ={}",
+                                    ttbr1, tcr, t1sz
+                                );
+
                                 if let Some(phys) = self.translate_va_to_pa(sp, ttbr1, t1sz) {
                                     debug!("[HVC]   SP VA 0x{:x} -> PA 0x{:x}", sp, phys);
-                                    if phys >= RAM_BASE && phys + 16 < RAM_BASE + self.memory_size as u64 {
+                                    if phys >= RAM_BASE
+                                        && phys + 16 < RAM_BASE + self.memory_size as u64
+                                    {
                                         let offset = (phys - RAM_BASE) as usize;
-                                        let val0 = u64::from_le_bytes(self.memory[offset..offset+8].try_into().unwrap());
-                                        let val1 = u64::from_le_bytes(self.memory[offset+8..offset+16].try_into().unwrap());
+                                        let val0 = u64::from_le_bytes(
+                                            self.memory[offset..offset + 8].try_into().unwrap(),
+                                        );
+                                        let val1 = u64::from_le_bytes(
+                                            self.memory[offset + 8..offset + 16]
+                                                .try_into()
+                                                .unwrap(),
+                                        );
                                         debug!("[HVC]   [SP+0]=0x{:x} [SP+8]=0x{:x}", val0, val1);
                                     }
                                 }
                             }
-                            
+
                             let result = self.handle_psci(x0, x1, x2, x3)?;
-                            
+
                             if result == 0xDEAD_DEAD {
                                 // Shutdown/reboot requested — return the exit code from guest
                                 let code = self.exit_code.unwrap_or(0);
                                 debug!("System shutdown requested, exit code: {}", code);
                                 return Ok(code);
                             }
-                            
+
                             // Set the PSCI return value in X0
                             vcpu.write_register(HvReg::X0, result)?;
-                            
+
                             // CRITICAL WORKAROUND: HVF has a cache coherency issue after HVC VMEXIT.
                             // The first load from stack after resuming reads stale (zero) data.
                             // __arm_smccc_hvc does:
@@ -678,33 +758,44 @@ impl VmInstance {
                             // 1. Read result struct pointer from [SP+0] in guest physical memory
                             // 2. Write X0-X3 results directly into the result struct
                             // 3. Set PC = LR to return from __arm_smccc_hvc to caller
-                            
+
                             let mut emulated_smccc = false;
-                            
+
                             if t1sz > 0 && t1sz < 64 {
                                 // Read [SP+0] from guest physical memory to get result struct pointer
                                 if let Some(sp_pa) = self.translate_va_to_pa(sp, ttbr1, t1sz) {
-                                    if sp_pa >= RAM_BASE && sp_pa + 16 <= RAM_BASE + self.memory_size as u64 {
+                                    if sp_pa >= RAM_BASE
+                                        && sp_pa + 16 <= RAM_BASE + self.memory_size as u64
+                                    {
                                         let sp_off = (sp_pa - RAM_BASE) as usize;
                                         let res_ptr_va = u64::from_le_bytes(
-                                            self.memory[sp_off..sp_off+8].try_into().unwrap()
+                                            self.memory[sp_off..sp_off + 8].try_into().unwrap(),
                                         );
-                                        
+
                                         if res_ptr_va != 0 {
                                             // Translate the result struct VA to PA and write results
-                                            if let Some(res_pa) = self.translate_va_to_pa(res_ptr_va, ttbr1, t1sz) {
-                                                if res_pa >= RAM_BASE && res_pa + 32 <= RAM_BASE + self.memory_size as u64 {
+                                            if let Some(res_pa) =
+                                                self.translate_va_to_pa(res_ptr_va, ttbr1, t1sz)
+                                            {
+                                                if res_pa >= RAM_BASE
+                                                    && res_pa + 32
+                                                        <= RAM_BASE + self.memory_size as u64
+                                                {
                                                     let res_off = (res_pa - RAM_BASE) as usize;
                                                     // Write X0-X3 into struct arm_smccc_res { a0, a1, a2, a3 }
-                                                    self.memory[res_off..res_off+8].copy_from_slice(&result.to_le_bytes());
-                                                    self.memory[res_off+8..res_off+16].copy_from_slice(&x1.to_le_bytes());
-                                                    self.memory[res_off+16..res_off+24].copy_from_slice(&x2.to_le_bytes());
-                                                    self.memory[res_off+24..res_off+32].copy_from_slice(&x3.to_le_bytes());
-                                                    
+                                                    self.memory[res_off..res_off + 8]
+                                                        .copy_from_slice(&result.to_le_bytes());
+                                                    self.memory[res_off + 8..res_off + 16]
+                                                        .copy_from_slice(&x1.to_le_bytes());
+                                                    self.memory[res_off + 16..res_off + 24]
+                                                        .copy_from_slice(&x2.to_le_bytes());
+                                                    self.memory[res_off + 24..res_off + 32]
+                                                        .copy_from_slice(&x3.to_le_bytes());
+
                                                     // Skip entire __arm_smccc_hvc body: set PC = LR
                                                     vcpu.write_register(HvReg::Pc, lr)?;
                                                     emulated_smccc = true;
-                                                    
+
                                                     debug!("[HVC]   Emulated SMCCC: res@VA=0x{:x} PA=0x{:x}, wrote a0=0x{:x}", 
                                                              res_ptr_va, res_pa, result);
                                                     debug!("[HVC]   PC -> LR 0x{:x} (skipped __arm_smccc_hvc body)", lr);
@@ -714,37 +805,43 @@ impl VmInstance {
                                     }
                                 }
                             }
-                            
+
                             if !emulated_smccc {
                                 // Fallback: just advance past HVC
                                 vcpu.write_register(HvReg::Pc, pc + 4)?;
-                                debug!("[HVC]   PC advanced to 0x{:x} (no SMCCC emulation)", pc + 4);
+                                debug!(
+                                    "[HVC]   PC advanced to 0x{:x} (no SMCCC emulation)",
+                                    pc + 4
+                                );
                             }
                         }
-                        
+
                         0x18 => {
                             // MSR/MRS - System register access trap
                             self.handle_sysreg_trap(&vcpu, pc, iss)?;
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
-                        
+
                         0x24 | 0x25 => {
                             // Data Abort - MMIO
                             let fault_addr = vcpu.read_fault_address().unwrap_or(0);
                             self.handle_mmio(&vcpu, pc, iss, fault_addr)?;
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
-                        
+
                         0x20 | 0x21 => {
                             // Instruction Abort
                             let fault_addr = vcpu.read_fault_address().unwrap_or(0);
-                            error!("Instruction Abort at PC=0x{:x}, fault_addr=0x{:x}", pc, fault_addr);
+                            error!(
+                                "Instruction Abort at PC=0x{:x}, fault_addr=0x{:x}",
+                                pc, fault_addr
+                            );
                             error!("ISS=0x{:x}", iss);
                             // Dump register state
                             self.dump_registers(&vcpu)?;
                             return Err(anyhow::anyhow!("Instruction Abort at PC=0x{:x}", pc));
                         }
-                        
+
                         0x3C => {
                             // BRK - breakpoint/semihosting
                             let imm = iss & 0xFFFF;
@@ -752,7 +849,7 @@ impl VmInstance {
                                 // ARM semihosting
                                 let op = vcpu.read_register(HvReg::X0)?;
                                 let param = vcpu.read_register(HvReg::X1)?;
-                                
+
                                 match op {
                                     0x18 => {
                                         debug!("Semihosting: SYS_EXIT");
@@ -760,7 +857,9 @@ impl VmInstance {
                                     }
                                     0x03 => {
                                         // SYS_WRITEC
-                                        if param >= RAM_BASE && param < RAM_BASE + self.memory_size as u64 {
+                                        if param >= RAM_BASE
+                                            && param < RAM_BASE + self.memory_size as u64
+                                        {
                                             let offset = (param - RAM_BASE) as usize;
                                             if offset < self.memory_size {
                                                 let ch = self.memory[offset];
@@ -770,7 +869,10 @@ impl VmInstance {
                                     }
                                     _ => {
                                         if iteration <= 20 {
-                                            debug!("Semihosting op=0x{:x}, param=0x{:x}", op, param);
+                                            debug!(
+                                                "Semihosting op=0x{:x}, param=0x{:x}",
+                                                op, param
+                                            );
                                         }
                                     }
                                 }
@@ -779,7 +881,7 @@ impl VmInstance {
                             }
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
-                        
+
                         _ => {
                             if iteration <= 100 {
                                 warn!("Unhandled EC=0x{:x} at PC=0x{:x}, ISS=0x{:x}", ec, pc, iss);
@@ -788,7 +890,7 @@ impl VmInstance {
                         }
                     }
                 }
-                
+
                 2 => {
                     // HV_EXIT_REASON_VTIMER_ACTIVATED
                     // Virtual timer fired - inject the timer IRQ and unmask
@@ -797,13 +899,13 @@ impl VmInstance {
                     // Inject IRQ (type 0 = IRQ) to signal the timer interrupt
                     vcpu.set_pending_interrupt(0, true)?;
                 }
-                
+
                 _ => {
                     warn!("Unknown exit reason: {}", exit_reason);
                     break;
                 }
             }
-            
+
             // Poll stdin for input and buffer it for the guest UART
             self.poll_stdin(stdin_fd, &mut stdin_eof);
 
@@ -814,7 +916,9 @@ impl VmInstance {
                     && (self.uart_ier & 0x02) != 0
                     && !self.uart_irq_asserted;
                 if rx_pending || tx_pending {
-                    if tx_pending { self.uart_irq_asserted = true; }
+                    if tx_pending {
+                        self.uart_irq_asserted = true;
+                    }
                     Vm::set_gic_spi(UART_SPI, true);
                 }
             }
@@ -833,7 +937,7 @@ impl VmInstance {
                 break;
             }
         }
-        
+
         // Restore terminal mode before any other cleanup or output.
         if stdin_is_tty {
             set_blocking(stdin_fd);
@@ -850,7 +954,7 @@ impl VmInstance {
         if let Some(t) = net_poller_thread {
             t.join().ok();
         }
-        
+
         // Flush any remaining partial line in the UART buffer
         if !self.uart_line_buf.is_empty() {
             let line = std::mem::take(&mut self.uart_line_buf);
@@ -858,17 +962,17 @@ impl VmInstance {
         }
 
         let code = self.exit_code.unwrap_or(0);
-        
+
         if log::log_enabled!(log::Level::Debug) {
             let final_pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
             debug!("Final PC: 0x{:x}", final_pc);
             debug!("Total iterations: {}", iteration);
             debug!("Exit code: {}", code);
         }
-        
+
         Ok(code)
     }
-    
+
     /// Minimal poller for stdin when networking is disabled.
     /// Uses poll() to block until stdin has data, then kicks the vcpu.
     /// Exits when stdin reaches EOF or an error occurs.
@@ -890,7 +994,9 @@ impl VmInstance {
     /// When stdin reaches EOF (pipe closed), sends Ctrl-D (0x04) so the
     /// guest's TTY layer signals end-of-file to user-space readers.
     fn poll_stdin(&mut self, stdin_fd: RawFd, stdin_eof: &mut bool) {
-        if *stdin_eof { return; }
+        if *stdin_eof {
+            return;
+        }
         let mut buf = [0u8; 256];
         let n = unsafe { read(stdin_fd, buf.as_mut_ptr(), buf.len()) };
         if n > 0 {
@@ -909,7 +1015,7 @@ impl VmInstance {
     /// Extracts exit code marker and detects boot completion.
     fn process_uart_line(&mut self, line: &str) {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-        
+
         // Check for exit marker
         if let Some(marker_pos) = trimmed.find(crate::initramfs::EXIT_MARKER) {
             let after = &trimmed[marker_pos + crate::initramfs::EXIT_MARKER.len()..];
@@ -918,7 +1024,7 @@ impl VmInstance {
             }
             return;
         }
-        
+
         // Detect boot completion — the init script prints this marker
         // right before running the user command.
         if trimmed.contains(crate::initramfs::BOOT_MARKER) {
@@ -926,13 +1032,13 @@ impl VmInstance {
             debug!("{}", trimmed);
             return;
         }
-        
+
         // Before boot is complete: only show in debug mode
         if !self.boot_complete {
             debug!("{}", trimmed);
             return;
         }
-        
+
         // After boot: characters were already written directly to stdout
         // by the UART write handler, so nothing more to print here.
     }
@@ -940,29 +1046,40 @@ impl VmInstance {
     /// Handle PSCI calls (Power State Coordination Interface)
     fn handle_psci(&self, func: u64, x1: u64, x2: u64, x3: u64) -> Result<u64> {
         match func {
-            0x84000000 => { // PSCI_VERSION → v1.1
+            0x84000000 => {
+                // PSCI_VERSION → v1.1
                 Ok(0x00010001)
             }
-            0x84000001 | 0xC4000001 => { // PSCI_CPU_SUSPEND
+            0x84000001 | 0xC4000001 => {
+                // PSCI_CPU_SUSPEND
                 Ok(0)
             }
-            0x84000002 => { // PSCI_CPU_OFF
+            0x84000002 => {
+                // PSCI_CPU_OFF
                 Ok(0)
             }
-            0x84000003 | 0xC4000003 => { // PSCI_CPU_ON
-                debug!("[PSCI] CPU_ON(cpu={}, entry=0x{:x}, ctx=0x{:x}) -> ALREADY_ON", x1, x2, x3);
+            0x84000003 | 0xC4000003 => {
+                // PSCI_CPU_ON
+                debug!(
+                    "[PSCI] CPU_ON(cpu={}, entry=0x{:x}, ctx=0x{:x}) -> ALREADY_ON",
+                    x1, x2, x3
+                );
                 Ok((-4i64) as u64) // PSCI_RET_ALREADY_ON
             }
-            0x84000004 | 0xC4000004 => { // PSCI_AFFINITY_INFO
+            0x84000004 | 0xC4000004 => {
+                // PSCI_AFFINITY_INFO
                 Ok(0)
             }
-            0x84000008 => { // PSCI_SYSTEM_OFF
+            0x84000008 => {
+                // PSCI_SYSTEM_OFF
                 Ok(0xDEAD_DEAD)
             }
-            0x84000009 => { // PSCI_SYSTEM_RESET
+            0x84000009 => {
+                // PSCI_SYSTEM_RESET
                 Ok(0xDEAD_DEAD)
             }
-            0x8400000A => { // PSCI_FEATURES
+            0x8400000A => {
+                // PSCI_FEATURES
                 match x1 {
                     0x84000000..=0x8400000A => Ok(0),
                     0xC4000000..=0xC4000005 => Ok(0),
@@ -975,19 +1092,19 @@ impl VmInstance {
             }
         }
     }
-    
+
     /// Handle system register trap (EC=0x18)
     fn handle_sysreg_trap(&self, vcpu: &Vcpu, _pc: u64, iss: u64) -> Result<()> {
-        let is_read = (iss & 1) != 0;  // Bit 0: direction (1=read/MRS, 0=write/MSR)
+        let is_read = (iss & 1) != 0; // Bit 0: direction (1=read/MRS, 0=write/MSR)
         let rt = ((iss >> 5) & 0x1F) as u8;
         let crm = (iss >> 1) & 0xF;
         let crn = (iss >> 10) & 0xF;
         let op0 = (iss >> 20) & 0x3;
         let op1 = (iss >> 14) & 0x7;
         let op2 = (iss >> 17) & 0x7;
-        
+
         let sys_reg_id = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
-        
+
         if is_read {
             // MRS - provide emulated value
             let value = match sys_reg_id {
@@ -1000,30 +1117,30 @@ impl VmInstance {
             Self::write_guest_register(vcpu, rt, value)?;
         }
         // MSR writes are silently ignored (trapped regs are usually debug/ICC regs)
-        
+
         Ok(())
     }
-    
+
     /// Handle MMIO access (Data Abort)
     fn handle_mmio(&mut self, vcpu: &Vcpu, pc: u64, iss: u64, fault_addr: u64) -> Result<()> {
         let is_write = (iss & (1 << 6)) != 0;
         let _sas = (iss >> 22) & 0x3; // Access size: 0=byte, 1=halfword, 2=word, 3=doubleword
         let rt = ((iss >> 16) & 0x1F) as u8;
-        
+
         // UART at 0x09000000
         if fault_addr >= UART_BASE && fault_addr < UART_BASE + 0x1000 {
             let reg_offset = fault_addr - UART_BASE;
-            
+
             if is_write {
                 let value = Self::read_guest_register(vcpu, rt)?;
-                
+
                 // Both PL011 DR and 8250 THR are at offset 0x00
                 if reg_offset == 0 {
                     let ch = (value & 0xFF) as u8;
-                    
+
                     if ch.is_ascii() || ch == b'\n' || ch == b'\r' {
                         self.uart_line_buf.push(ch as char);
-                        
+
                         // After boot: write each character directly to stdout
                         // so interactive echo and prompts appear immediately.
                         // Kernel console messages are already suppressed via
@@ -1056,7 +1173,7 @@ impl VmInstance {
                                 std::io::stdout().flush().ok();
                             }
                         }
-                        
+
                         // Process complete lines (for exit marker detection
                         // and pre-boot filtering)
                         if ch == b'\n' {
@@ -1120,19 +1237,21 @@ impl VmInstance {
                                 0xC1u64 // FIFO enabled + no interrupt pending
                             }
                         }
-                        0x0C => 0x00,      // LCR: line control
-                        0x10 => 0x00,      // MCR: modem control
+                        0x0C => 0x00, // LCR: line control
+                        0x10 => 0x00, // MCR: modem control
                         // LSR (Line Status Register):
                         //   Bit 0: DR  (Data Ready) = 1 if rx_buf has data
                         //   Bit 5: THRE (TX Holding Register Empty) = 1
                         //   Bit 6: TEMT (Transmitter Empty) = 1
                         0x14 => {
                             let mut lsr = 0x60u64; // THRE | TEMT
-                            if has_rx_data { lsr |= 0x01; } // DR
+                            if has_rx_data {
+                                lsr |= 0x01;
+                            } // DR
                             lsr
                         }
-                        0x18 => 0x00,      // MSR: modem status
-                        0x1C => 0x00,      // SCR: scratch
+                        0x18 => 0x00, // MSR: modem status
+                        0x1C => 0x00, // SCR: scratch
                         _ => 0x00,
                     }
                 } else {
@@ -1147,23 +1266,25 @@ impl VmInstance {
                         //   Bit 7: TXFE (TX FIFO Empty) — always set
                         0x18 => {
                             let mut fr = 0x80u64; // TXFE
-                            if !has_rx_data { fr |= 0x10; } // RXFE
+                            if !has_rx_data {
+                                fr |= 0x10;
+                            } // RXFE
                             fr
                         }
-                        0x2C => 0x00,    // LCR_H: line control
-                        0x30 => 0x0301,  // CR: UART enabled, TX enabled, RX enabled
-                        0x38 => 0x00,    // IMSC: interrupt mask
-                        0x40 => 0x00,    // RIS: raw interrupt status
-                        0x44 => 0x00,    // MIS: masked interrupt status
-                        0x48 => 0x00,    // ICR: interrupt clear
-                        0xFE0 => 0x11,   // PeriphID0: PL011 identification
-                        0xFE4 => 0x10,   // PeriphID1
-                        0xFE8 => 0x34,   // PeriphID2: revision 3, PL011
-                        0xFEC => 0x00,   // PeriphID3
-                        0xFF0 => 0x0D,   // CellID0 (PrimeCell component ID)
-                        0xFF4 => 0xF0,   // CellID1
-                        0xFF8 => 0x05,   // CellID2
-                        0xFFC => 0xB1,   // CellID3
+                        0x2C => 0x00,   // LCR_H: line control
+                        0x30 => 0x0301, // CR: UART enabled, TX enabled, RX enabled
+                        0x38 => 0x00,   // IMSC: interrupt mask
+                        0x40 => 0x00,   // RIS: raw interrupt status
+                        0x44 => 0x00,   // MIS: masked interrupt status
+                        0x48 => 0x00,   // ICR: interrupt clear
+                        0xFE0 => 0x11,  // PeriphID0: PL011 identification
+                        0xFE4 => 0x10,  // PeriphID1
+                        0xFE8 => 0x34,  // PeriphID2: revision 3, PL011
+                        0xFEC => 0x00,  // PeriphID3
+                        0xFF0 => 0x0D,  // CellID0 (PrimeCell component ID)
+                        0xFF4 => 0xF0,  // CellID1
+                        0xFF8 => 0x05,  // CellID2
+                        0xFFC => 0xB1,  // CellID3
                         _ => 0x00,
                     }
                 };
@@ -1286,27 +1407,32 @@ impl VmInstance {
             unsafe {
                 UNKNOWN_MMIO_COUNT += 1;
                 if UNKNOWN_MMIO_COUNT <= 20 {
-                    warn!("[MMIO] Unknown {} to 0x{:x} (X{}) at PC=0x{:x}", 
-                             if is_write { "WRITE" } else { "READ" }, fault_addr, rt, pc);
+                    warn!(
+                        "[MMIO] Unknown {} to 0x{:x} (X{}) at PC=0x{:x}",
+                        if is_write { "WRITE" } else { "READ" },
+                        fault_addr,
+                        rt,
+                        pc
+                    );
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Walk guest page tables to translate VA to PA
     /// For TTBR1_EL1 (kernel addresses starting with 0xFFFF...)
     fn translate_va_to_pa(&self, va: u64, ttbr1: u64, t1sz: u64) -> Option<u64> {
         // ARM64 4KB page table walk
         // Extract table base from TTBR1 (mask off ASID and other bits)
         let table_base = ttbr1 & !0xFFF;
-        
+
         // VA bits used: 64 - T1SZ
         let va_bits = 64 - t1sz;
         let va_mask = (1u64 << va_bits) - 1;
         let input_addr = va & va_mask;
-        
+
         // Calculate starting level based on VA bits:
         // 48-bit VA (T1SZ=16): start at level 0 (4 levels)
         // 39-bit VA (T1SZ=25): start at level 1 (3 levels)
@@ -1318,31 +1444,31 @@ impl VmInstance {
         } else {
             0u64
         };
-        
+
         let mut table_addr = table_base;
-        
+
         for level in start_level..4 {
             let shift = (3 - level) * 9 + 12; // L3=12, L2=21, L1=30, L0=39
             let index = (input_addr >> shift) & 0x1FF;
             let entry_addr = table_addr + index * 8;
-            
+
             // Read entry from guest memory
             if entry_addr < RAM_BASE || entry_addr + 8 > RAM_BASE + self.memory_size as u64 {
                 return None;
             }
-            
+
             let offset = (entry_addr - RAM_BASE) as usize;
             if offset + 8 > self.memory_size {
                 return None;
             }
-            
-            let entry = u64::from_le_bytes(self.memory[offset..offset+8].try_into().ok()?);
-            
+
+            let entry = u64::from_le_bytes(self.memory[offset..offset + 8].try_into().ok()?);
+
             // Check if entry is valid
             if entry & 1 == 0 {
                 return None;
             }
-            
+
             if level < 3 {
                 // Check if it's a block entry (bit 1 = 0 for block, 1 for table)
                 if entry & 2 == 0 {
@@ -1361,10 +1487,10 @@ impl VmInstance {
                 return Some(page_base | page_offset);
             }
         }
-        
+
         None
     }
-    
+
     /// Dump CPU register state for debugging
     fn dump_registers(&self, vcpu: &Vcpu) -> Result<()> {
         error!("Register dump:");
@@ -1378,14 +1504,14 @@ impl VmInstance {
         let cpsr = vcpu.read_register(HvReg::Cpsr)?;
         error!("  PC   = 0x{:016x}", pc);
         error!("  CPSR = 0x{:016x} (EL{})", cpsr, cpsr & 0xF);
-        
+
         let sctlr = vcpu.read_sys_register(HvSysReg::SctlrEl1).unwrap_or(0);
         let elr = vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0);
         let vbar = vcpu.read_sys_register(HvSysReg::VbarEl1).unwrap_or(0);
         error!("  SCTLR_EL1 = 0x{:x}", sctlr);
         error!("  ELR_EL1   = 0x{:x}", elr);
         error!("  VBAR_EL1  = 0x{:x}", vbar);
-        
+
         Ok(())
     }
 }
@@ -1394,7 +1520,11 @@ impl VmInstance {
 /// then two levels up (for target/release/sandal -> project root), then CWD.
 fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.canonicalize().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(exe_dir) = exe
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             let path = exe_dir.join(relative);
             if path.exists() {
                 return Some(path);
@@ -1409,7 +1539,11 @@ fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
         }
     }
     let path = std::path::PathBuf::from(relative);
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -1417,12 +1551,12 @@ pub fn run(args: Args) -> Result<()> {
     debug!("Command: {:?}", args.command);
 
     let network_enabled = !args.no_network;
-    
+
     // Create and set up VM
     let mut vm = VmInstance::new(args.memory)?;
     vm.network_enabled = network_enabled;
     vm.setup()?;
-    
+
     // Set up networking (enabled by default)
     if network_enabled {
         use crate::net::NetworkFilter;
@@ -1433,8 +1567,10 @@ pub fn run(args: Args) -> Result<()> {
         let backend = UserNet::new().context("Failed to create user-space network")?;
 
         let mac = backend.mac_address();
-        debug!("Guest MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        debug!(
+            "Guest MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
 
         // Build the network filter from CLI args
         let filter = {
@@ -1449,29 +1585,30 @@ pub fn run(args: Args) -> Result<()> {
         let device = VirtioNetDevice::new(backend, filter, VIRTIO_NET_SPI);
         vm.virtio_net = Some(device);
     }
-    
+
     // Resolve kernel path (default: kernels/vmlinux)
     let kernel_path = match &args.kernel {
         Some(p) => p.clone(),
-        None => resolve_data_path("kernels/vmlinux")
-            .ok_or_else(|| anyhow::anyhow!(
-                "No kernel found. Use --kernel or run: scripts/setup-image.sh"
-            ))?,
+        None => resolve_data_path("kernels/vmlinux").ok_or_else(|| {
+            anyhow::anyhow!("No kernel found. Use --kernel or run: scripts/setup-image.sh")
+        })?,
     };
 
     // Detect UART type from kernel (needed for initramfs device nodes)
     vm.detect_uart_type(&kernel_path)?;
-    
+
     // Check kernel capabilities to decide rootfs strategy
     let kernel_path = &kernel_path;
     let kernel_data = std::fs::read(kernel_path)?;
     let has_virtio_blk = kernel_data.windows(10).any(|w| w == b"virtio_blk");
     // Check if the kernel explicitly lacks initramfs support
     // (only the Firecracker kernel is known to lack it — detected by having virtio_blk but no initrd strings)
-    let has_initrd_strings = kernel_data.windows(18).any(|w| w == b"BLK_DEV_INITRD=y\r\n" || w == b"BLK_DEV_INITRD=y\n\x00")
-                     || kernel_data.windows(17).any(|w| w == b"BLK_DEV_INITRD=y\n")
-                     || kernel_data.windows(14).any(|w| w == b"initramfs_data")
-                     || kernel_data.windows(9).any(|w| w == b"cpio_data");
+    let has_initrd_strings = kernel_data
+        .windows(18)
+        .any(|w| w == b"BLK_DEV_INITRD=y\r\n" || w == b"BLK_DEV_INITRD=y\n\x00")
+        || kernel_data.windows(17).any(|w| w == b"BLK_DEV_INITRD=y\n")
+        || kernel_data.windows(14).any(|w| w == b"initramfs_data")
+        || kernel_data.windows(9).any(|w| w == b"cpio_data");
     // Default to initramfs support (most kernels have it); only use virtio-blk if we can
     // confirm virtio-blk support AND cannot confirm initramfs support
     let prefer_virtio_blk = has_virtio_blk && !has_initrd_strings;
@@ -1493,36 +1630,53 @@ pub fn run(args: Args) -> Result<()> {
 
         if prefer_virtio_blk {
             // Kernel supports virtio-blk but NOT initramfs — use ext2 image on virtio-blk
-            info!("Packing host directory {:?} as ext2 on virtio-blk...", rootfs_path);
-            let disk_image = crate::ext2::build_ext2_from_directory(rootfs_path, &args.command, network_enabled, use_8250)
-                .context("Failed to build ext2 filesystem image")?;
-            debug!("ext2 image: {} bytes ({} KB)", disk_image.len(), disk_image.len() / 1024);
+            info!(
+                "Packing host directory {:?} as ext2 on virtio-blk...",
+                rootfs_path
+            );
+            let disk_image = crate::ext2::build_ext2_from_directory(
+                rootfs_path,
+                &args.command,
+                network_enabled,
+                use_8250,
+            )
+            .context("Failed to build ext2 filesystem image")?;
+            debug!(
+                "ext2 image: {} bytes ({} KB)",
+                disk_image.len(),
+                disk_image.len() / 1024
+            );
             vm.virtio_blk = Some(VirtioBlkDevice::new(disk_image, VIRTIO_BLK_SPI));
             vm.use_virtio_blk = true;
         } else {
             // Default: use initramfs (cpio archive) — works with most kernels
             info!("Packing host directory {:?} as initramfs...", rootfs_path);
-            let initrd_data = crate::initramfs::build_from_directory(rootfs_path, &args.command, network_enabled, use_8250)
-                .context("Failed to build initramfs from directory")?;
+            let initrd_data = crate::initramfs::build_from_directory(
+                rootfs_path,
+                &args.command,
+                network_enabled,
+                use_8250,
+            )
+            .context("Failed to build initramfs from directory")?;
             vm.load_initrd(&initrd_data)?;
         }
     } else if let Some(initrd_path) = &args.initrd {
         info!("Loading initrd from {:?}...", initrd_path);
-        let initrd_data = crate::initramfs::load_initrd(initrd_path)
-            .context("Failed to load initrd")?;
+        let initrd_data =
+            crate::initramfs::load_initrd(initrd_path).context("Failed to load initrd")?;
         vm.load_initrd(&initrd_data)?;
     }
-    
+
     // Always provide a virtio-rng device for guest entropy
     vm.virtio_rng = Some(VirtioRngDevice::new());
 
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(kernel_path)?;
-    
+
     // Run the VM
     let exit_code = vm.run_command(&args.command)?;
-    
+
     debug!("VM exited with code: {}", exit_code);
-    
+
     std::process::exit(exit_code);
 }

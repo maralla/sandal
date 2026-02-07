@@ -4,9 +4,9 @@ pub mod vm;
 
 use anyhow::Result;
 
+pub use ffi::{HvReg, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE};
 pub use vcpu::Vcpu;
 pub use vm::Vm;
-pub use ffi::{HvReg, HV_MEMORY_READ, HV_MEMORY_WRITE, HV_MEMORY_EXEC};
 
 #[cfg(target_arch = "aarch64")]
 pub use ffi::HvSysReg;
@@ -17,7 +17,7 @@ pub fn check_hypervisor_support() -> Result<()> {
     {
         Ok(())
     }
-    
+
     #[cfg(not(target_os = "macos"))]
     {
         anyhow::bail!("Hypervisor framework is only available on macOS")

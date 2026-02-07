@@ -1,12 +1,12 @@
 mod cli;
-mod hypervisor;
-mod vm;
-mod virtio;
-mod net;
 mod devicetree;
-mod initramfs;
-mod unet;
 mod ext2;
+mod hypervisor;
+mod initramfs;
+mod net;
+mod unet;
+mod virtio;
+mod vm;
 
 use anyhow::Result;
 use clap::Parser;
@@ -30,11 +30,11 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("sandal only supports macOS");
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         vm::run(args)?;
     }
-    
+
     Ok(())
 }

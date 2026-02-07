@@ -14,7 +14,6 @@
 ///   Block 3: Inode bitmap
 ///   Blocks 4..4+N: Inode table
 ///   Blocks 4+N+1..: Data blocks
-
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,7 +48,7 @@ struct FsEntry {
     ino: u32,
     mode: u16,
     size: u32,
-    data: Vec<u8>,       // File content or symlink target
+    data: Vec<u8>, // File content or symlink target
     links: u16,
     dev_major: u8,
     dev_minor: u8,
@@ -89,7 +88,12 @@ pub fn build_ext2_from_directory(
     if network {
         if let Some(ca_data) = crate::initramfs::load_host_ca_certificates() {
             builder.ensure_dir(ROOT_INO, "etc/ssl/certs");
-            builder.add_file_data(ROOT_INO, "etc/ssl/certs/ca-certificates.crt", &ca_data, 0o644);
+            builder.add_file_data(
+                ROOT_INO,
+                "etc/ssl/certs/ca-certificates.crt",
+                &ca_data,
+                0o644,
+            );
         }
     }
 
@@ -116,16 +120,19 @@ impl Ext2Builder {
         let mut entries = BTreeMap::new();
 
         // Create root directory (inode 2)
-        entries.insert(ROOT_INO, FsEntry {
-            ino: ROOT_INO,
-            mode: S_IFDIR | 0o755,
-            size: 0,
-            data: Vec::new(),
-            links: 2, // . and parent
-            dev_major: 0,
-            dev_minor: 0,
-            children: BTreeMap::new(),
-        });
+        entries.insert(
+            ROOT_INO,
+            FsEntry {
+                ino: ROOT_INO,
+                mode: S_IFDIR | 0o755,
+                size: 0,
+                data: Vec::new(),
+                links: 2, // . and parent
+                dev_major: 0,
+                dev_minor: 0,
+                children: BTreeMap::new(),
+            },
+        );
 
         Ext2Builder {
             next_ino: FIRST_FREE_INO,
@@ -146,22 +153,27 @@ impl Ext2Builder {
         let parts: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
         let mut current_ino = parent_ino;
         for part in parts {
-            let existing = self.entries.get(&current_ino)
+            let existing = self
+                .entries
+                .get(&current_ino)
                 .and_then(|e| e.children.get(part).copied());
             if let Some(child_ino) = existing {
                 current_ino = child_ino;
             } else {
                 let new_ino = self.alloc_ino();
-                self.entries.insert(new_ino, FsEntry {
-                    ino: new_ino,
-                    mode: S_IFDIR | 0o755,
-                    size: 0,
-                    data: Vec::new(),
-                    links: 2,
-                    dev_major: 0,
-                    dev_minor: 0,
-                    children: BTreeMap::new(),
-                });
+                self.entries.insert(
+                    new_ino,
+                    FsEntry {
+                        ino: new_ino,
+                        mode: S_IFDIR | 0o755,
+                        size: 0,
+                        data: Vec::new(),
+                        links: 2,
+                        dev_major: 0,
+                        dev_minor: 0,
+                        children: BTreeMap::new(),
+                    },
+                );
                 // Add to parent
                 if let Some(parent) = self.entries.get_mut(&current_ino) {
                     parent.children.insert(part.to_string(), new_ino);
@@ -184,21 +196,28 @@ impl Ext2Builder {
         }
 
         // Check if already exists
-        if self.entries.get(&dir_ino).map_or(false, |e| e.children.contains_key(name)) {
+        if self
+            .entries
+            .get(&dir_ino)
+            .map_or(false, |e| e.children.contains_key(name))
+        {
             return;
         }
 
         let ino = self.alloc_ino();
-        self.entries.insert(ino, FsEntry {
+        self.entries.insert(
             ino,
-            mode: S_IFCHR | perm,
-            size: 0,
-            data: Vec::new(),
-            links: 1,
-            dev_major: major,
-            dev_minor: minor,
-            children: BTreeMap::new(),
-        });
+            FsEntry {
+                ino,
+                mode: S_IFCHR | perm,
+                size: 0,
+                data: Vec::new(),
+                links: 1,
+                dev_major: major,
+                dev_minor: minor,
+                children: BTreeMap::new(),
+            },
+        );
         if let Some(dir) = self.entries.get_mut(&dir_ino) {
             dir.children.insert(name.to_string(), ino);
         }
@@ -221,22 +240,30 @@ impl Ext2Builder {
         }
 
         let ino = self.alloc_ino();
-        self.entries.insert(ino, FsEntry {
+        self.entries.insert(
             ino,
-            mode: S_IFREG | perm,
-            size: data.len() as u32,
-            data: data.to_vec(),
-            links: 1,
-            dev_major: 0,
-            dev_minor: 0,
-            children: BTreeMap::new(),
-        });
+            FsEntry {
+                ino,
+                mode: S_IFREG | perm,
+                size: data.len() as u32,
+                data: data.to_vec(),
+                links: 1,
+                dev_major: 0,
+                dev_minor: 0,
+                children: BTreeMap::new(),
+            },
+        );
         if let Some(dir) = self.entries.get_mut(&dir_ino) {
             dir.children.insert(name.to_string(), ino);
         }
     }
 
-    fn add_directory_recursive(&mut self, base: &Path, current: &Path, parent_ino: u32) -> Result<()> {
+    fn add_directory_recursive(
+        &mut self,
+        base: &Path,
+        current: &Path,
+        parent_ino: u32,
+    ) -> Result<()> {
         let read_dir = fs::read_dir(current)
             .with_context(|| format!("Failed to read directory {:?}", current))?;
 
@@ -257,16 +284,19 @@ impl Ext2Builder {
                 let target = fs::read_link(&path)?;
                 let target_str = target.to_string_lossy().to_string();
                 let ino = self.alloc_ino();
-                self.entries.insert(ino, FsEntry {
+                self.entries.insert(
                     ino,
-                    mode: S_IFLNK | 0o777,
-                    size: target_str.len() as u32,
-                    data: target_str.into_bytes(),
-                    links: 1,
-                    dev_major: 0,
-                    dev_minor: 0,
-                    children: BTreeMap::new(),
-                });
+                    FsEntry {
+                        ino,
+                        mode: S_IFLNK | 0o777,
+                        size: target_str.len() as u32,
+                        data: target_str.into_bytes(),
+                        links: 1,
+                        dev_major: 0,
+                        dev_minor: 0,
+                        children: BTreeMap::new(),
+                    },
+                );
                 if let Some(parent) = self.entries.get_mut(&parent_ino) {
                     parent.children.insert(name, ino);
                 }
@@ -364,10 +394,22 @@ impl Ext2Builder {
         let used_blocks = next_block as usize;
 
         // Write superblock
-        self.write_superblock(&mut image, total_blocks, num_inodes, used_blocks, first_data_block);
+        self.write_superblock(
+            &mut image,
+            total_blocks,
+            num_inodes,
+            used_blocks,
+            first_data_block,
+        );
 
         // Write block group descriptor
-        self.write_bgdt(&mut image, num_inodes, used_blocks, first_data_block, inode_table_blocks);
+        self.write_bgdt(
+            &mut image,
+            num_inodes,
+            used_blocks,
+            first_data_block,
+            inode_table_blocks,
+        );
 
         // Write block bitmap
         self.write_block_bitmap(&mut image, used_blocks, total_blocks);
@@ -383,8 +425,14 @@ impl Ext2Builder {
         Ok(image)
     }
 
-    fn write_superblock(&self, image: &mut [u8], total_blocks: usize, num_inodes: usize,
-                        used_blocks: usize, _first_data_block: usize) {
+    fn write_superblock(
+        &self,
+        image: &mut [u8],
+        total_blocks: usize,
+        num_inodes: usize,
+        used_blocks: usize,
+        _first_data_block: usize,
+    ) {
         let sb = &mut image[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + 1024];
 
         let free_blocks = total_blocks - used_blocks;
@@ -457,13 +505,23 @@ impl Ext2Builder {
         sb[120..128].copy_from_slice(b"sandal\0\0");
     }
 
-    fn write_bgdt(&self, image: &mut [u8], num_inodes: usize, used_blocks: usize,
-                   _first_data_block: usize, _inode_table_blocks: usize) {
+    fn write_bgdt(
+        &self,
+        image: &mut [u8],
+        num_inodes: usize,
+        used_blocks: usize,
+        _first_data_block: usize,
+        _inode_table_blocks: usize,
+    ) {
         let bgdt_offset = BLOCK_SIZE; // Block 1
         let total_blocks = image.len() / BLOCK_SIZE;
         let free_blocks = total_blocks - used_blocks;
         let free_inodes = num_inodes - (self.next_ino as usize - 1);
-        let dir_count = self.entries.values().filter(|e| e.mode & 0xF000 == S_IFDIR).count();
+        let dir_count = self
+            .entries
+            .values()
+            .filter(|e| e.mode & 0xF000 == S_IFDIR)
+            .count();
 
         let bg = &mut image[bgdt_offset..bgdt_offset + 64]; // Use 64 bytes for ext4 compat
 
@@ -525,8 +583,12 @@ impl Ext2Builder {
         }
     }
 
-    fn write_inodes(&self, image: &mut [u8], block_map: &BTreeMap<u32, Vec<u32>>,
-                    indirect_map: &BTreeMap<u32, Vec<u32>>) {
+    fn write_inodes(
+        &self,
+        image: &mut [u8],
+        block_map: &BTreeMap<u32, Vec<u32>>,
+        indirect_map: &BTreeMap<u32, Vec<u32>>,
+    ) {
         let inode_table_offset = 4 * BLOCK_SIZE;
         let ptrs_per_block = BLOCK_SIZE / 4; // 1024
 
@@ -552,7 +614,11 @@ impl Ext2Builder {
             // i_blocks (512-byte blocks) — includes both data and indirect blocks
             let data_count = block_map.get(&ino).map_or(0, |b| b.len());
             let ind_count = indirect_map.get(&ino).map_or(0, |b| b.len());
-            write_le32(image, inode_off + 28, ((data_count + ind_count) * (BLOCK_SIZE / 512)) as u32);
+            write_le32(
+                image,
+                inode_off + 28,
+                ((data_count + ind_count) * (BLOCK_SIZE / 512)) as u32,
+            );
             // i_flags, i_osd1
             write_le32(image, inode_off + 32, 0);
             write_le32(image, inode_off + 36, 0);
@@ -567,7 +633,9 @@ impl Ext2Builder {
 
                 if n > 12 {
                     // Need indirect blocks
-                    let ind_blocks = indirect_map.get(&ino).expect("indirect_map missing for large file");
+                    let ind_blocks = indirect_map
+                        .get(&ino)
+                        .expect("indirect_map missing for large file");
                     let mut ind_idx = 0;
 
                     // i_block[12] — single indirect block
@@ -611,14 +679,17 @@ impl Ext2Builder {
                 write_le32(image, inode_off + 40, dev);
             } else if entry.mode & 0xF000 == S_IFLNK && entry.data.len() < 60 {
                 // Short symlinks stored inline in i_block
-                image[inode_off + 40..inode_off + 40 + entry.data.len()].copy_from_slice(&entry.data);
+                image[inode_off + 40..inode_off + 40 + entry.data.len()]
+                    .copy_from_slice(&entry.data);
             }
         }
     }
 
     fn write_directory_data(&self, image: &mut [u8], block_map: &BTreeMap<u32, Vec<u32>>) {
         for (&ino, entry) in &self.entries {
-            if entry.mode & 0xF000 != S_IFDIR { continue; }
+            if entry.mode & 0xF000 != S_IFDIR {
+                continue;
+            }
 
             let blocks = match block_map.get(&ino) {
                 Some(b) => b,
@@ -633,7 +704,9 @@ impl Ext2Builder {
             offset += write_dirent(dir_block, offset, ino, ".", EXT2_FT_DIR, false);
 
             // .. entry (parent = self for root)
-            let parent_ino = if ino == ROOT_INO { ROOT_INO } else {
+            let parent_ino = if ino == ROOT_INO {
+                ROOT_INO
+            } else {
                 // Find parent by searching all directories
                 self.find_parent(ino).unwrap_or(ROOT_INO)
             };
@@ -672,8 +745,12 @@ impl Ext2Builder {
 
     fn write_file_data(&self, image: &mut [u8], block_map: &BTreeMap<u32, Vec<u32>>) {
         for (&ino, entry) in &self.entries {
-            if entry.mode & 0xF000 != S_IFREG { continue; }
-            if entry.data.is_empty() { continue; }
+            if entry.mode & 0xF000 != S_IFREG {
+                continue;
+            }
+            if entry.data.is_empty() {
+                continue;
+            }
 
             let blocks = match block_map.get(&ino) {
                 Some(b) => b,
@@ -684,7 +761,8 @@ impl Ext2Builder {
             for &blk in blocks {
                 let block_offset = blk as usize * BLOCK_SIZE;
                 let to_write = remaining.len().min(BLOCK_SIZE);
-                image[block_offset..block_offset + to_write].copy_from_slice(&remaining[..to_write]);
+                image[block_offset..block_offset + to_write]
+                    .copy_from_slice(&remaining[..to_write]);
                 remaining = &remaining[to_write..];
             }
         }
@@ -701,7 +779,14 @@ impl Ext2Builder {
 }
 
 /// Write a directory entry. Returns the number of bytes written.
-fn write_dirent(block: &mut [u8], offset: usize, ino: u32, name: &str, ft: u8, is_last: bool) -> usize {
+fn write_dirent(
+    block: &mut [u8],
+    offset: usize,
+    ino: u32,
+    name: &str,
+    ft: u8,
+    is_last: bool,
+) -> usize {
     let name_bytes = name.as_bytes();
     let name_len = name_bytes.len();
     // rec_len must be 4-byte aligned, minimum 8 + name_len
@@ -713,7 +798,9 @@ fn write_dirent(block: &mut [u8], offset: usize, ino: u32, name: &str, ft: u8, i
         (base_len + 3) & !3
     };
 
-    if offset + rec_len > BLOCK_SIZE { return 0; }
+    if offset + rec_len > BLOCK_SIZE {
+        return 0;
+    }
 
     let ent = &mut block[offset..offset + rec_len];
     // d_inode

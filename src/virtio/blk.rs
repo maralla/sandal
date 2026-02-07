@@ -2,7 +2,6 @@
 ///
 /// Provides a paravirtualized block device to the guest using
 /// the virtio MMIO transport. Backed by an in-memory disk image.
-
 use super::*;
 
 // Virtio-blk device ID
@@ -14,10 +13,10 @@ const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 
 // Virtio-blk request types
-const VIRTIO_BLK_T_IN: u32 = 0;      // Read
-const VIRTIO_BLK_T_OUT: u32 = 1;     // Write
-const VIRTIO_BLK_T_FLUSH: u32 = 4;   // Flush
-const VIRTIO_BLK_T_GET_ID: u32 = 8;  // Get device ID
+const VIRTIO_BLK_T_IN: u32 = 0; // Read
+const VIRTIO_BLK_T_OUT: u32 = 1; // Write
+const VIRTIO_BLK_T_FLUSH: u32 = 4; // Flush
+const VIRTIO_BLK_T_GET_ID: u32 = 8; // Get device ID
 
 // Virtio-blk status codes
 const VIRTIO_BLK_S_OK: u8 = 0;
@@ -69,13 +68,15 @@ impl VirtioBlkDevice {
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         match offset {
-            REG_MAGIC_VALUE     => VIRTIO_MMIO_MAGIC,
-            REG_VERSION         => VIRTIO_MMIO_VERSION,
-            REG_DEVICE_ID       => VIRTIO_ID_BLOCK,
-            REG_VENDOR_ID       => VIRTIO_MMIO_VENDOR,
+            REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
+            REG_VERSION => VIRTIO_MMIO_VERSION,
+            REG_DEVICE_ID => VIRTIO_ID_BLOCK,
+            REG_VENDOR_ID => VIRTIO_MMIO_VENDOR,
             REG_DEVICE_FEATURES => {
-                let features = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX
-                             | VIRTIO_BLK_F_FLUSH | VIRTIO_F_VERSION_1;
+                let features = VIRTIO_BLK_F_SIZE_MAX
+                    | VIRTIO_BLK_F_SEG_MAX
+                    | VIRTIO_BLK_F_FLUSH
+                    | VIRTIO_F_VERSION_1;
                 if self.device_features_sel == 0 {
                     (features & 0xFFFFFFFF) as u32
                 } else {
@@ -97,7 +98,7 @@ impl VirtioBlkDevice {
                 }
             }
             REG_INTERRUPT_STATUS => self.interrupt_status,
-            REG_STATUS           => self.status,
+            REG_STATUS => self.status,
             REG_CONFIG_GENERATION => self.config_generation,
 
             // Config space: virtio_blk_config
@@ -109,8 +110,8 @@ impl VirtioBlkDevice {
                 match config_off {
                     0 => (self.capacity_sectors & 0xFFFFFFFF) as u32,
                     4 => ((self.capacity_sectors >> 32) & 0xFFFFFFFF) as u32,
-                    8 => SECTOR_SIZE as u32,  // size_max
-                    12 => 128,                // seg_max
+                    8 => SECTOR_SIZE as u32, // size_max
+                    12 => 128,               // seg_max
                     _ => 0,
                 }
             }
@@ -123,16 +124,24 @@ impl VirtioBlkDevice {
     /// Returns Some(queue_index) if QueueNotify was written.
     pub fn mmio_write(&mut self, offset: u64, value: u32) -> Option<u32> {
         match offset {
-            REG_DEVICE_FEATURES_SEL => { self.device_features_sel = value; }
+            REG_DEVICE_FEATURES_SEL => {
+                self.device_features_sel = value;
+            }
             REG_DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
-                    self.driver_features = (self.driver_features & 0xFFFFFFFF00000000) | value as u64;
+                    self.driver_features =
+                        (self.driver_features & 0xFFFFFFFF00000000) | value as u64;
                 } else {
-                    self.driver_features = (self.driver_features & 0x00000000FFFFFFFF) | ((value as u64) << 32);
+                    self.driver_features =
+                        (self.driver_features & 0x00000000FFFFFFFF) | ((value as u64) << 32);
                 }
             }
-            REG_DRIVER_FEATURES_SEL => { self.driver_features_sel = value; }
-            REG_QUEUE_SEL => { self.queue_sel = value; }
+            REG_DRIVER_FEATURES_SEL => {
+                self.driver_features_sel = value;
+            }
+            REG_QUEUE_SEL => {
+                self.queue_sel = value;
+            }
             REG_QUEUE_NUM => {
                 if (self.queue_sel as usize) < NUM_QUEUES {
                     self.queues[self.queue_sel as usize].num = value;
@@ -151,7 +160,9 @@ impl VirtioBlkDevice {
             }
             REG_STATUS => {
                 self.status = value;
-                if value == 0 { self.reset(); }
+                if value == 0 {
+                    self.reset();
+                }
             }
             REG_QUEUE_DESC_LOW => {
                 if (self.queue_sel as usize) < NUM_QUEUES {
@@ -207,7 +218,9 @@ impl VirtioBlkDevice {
     /// Returns true if the used ring was updated (interrupt needed).
     pub fn process_queue(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
         let q = self.queues[0].clone();
-        if !q.ready || q.num == 0 { return false; }
+        if !q.ready || q.num == 0 {
+            return false;
+        }
 
         let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
             Some(idx) => idx,
@@ -219,16 +232,23 @@ impl VirtioBlkDevice {
         let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
 
         while last_avail != avail_idx {
-            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num) {
+            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
+            {
                 Some(d) => d,
                 None => break,
             };
 
             let total_len = self.handle_request(memory, ram_base, &q, desc_head);
 
-            write_used_ring(memory, ram_base, q.used_addr,
-                           used_idx_start.wrapping_add(used_count), q.num,
-                           desc_head as u32, total_len);
+            write_used_ring(
+                memory,
+                ram_base,
+                q.used_addr,
+                used_idx_start.wrapping_add(used_count),
+                q.num,
+                desc_head as u32,
+                total_len,
+            );
             used_count += 1;
             last_avail = last_avail.wrapping_add(1);
         }
@@ -236,8 +256,12 @@ impl VirtioBlkDevice {
         self.queues[0].last_avail_idx = last_avail;
 
         if used_count > 0 {
-            write_used_idx(memory, ram_base, q.used_addr,
-                          used_idx_start.wrapping_add(used_count));
+            write_used_idx(
+                memory,
+                ram_base,
+                q.used_addr,
+                used_idx_start.wrapping_add(used_count),
+            );
             self.interrupt_status |= 1;
             true
         } else {
@@ -247,18 +271,26 @@ impl VirtioBlkDevice {
 
     /// Handle a single virtio-blk request (descriptor chain).
     /// Returns total bytes written to device-writable descriptors.
-    fn handle_request(&mut self, memory: &mut [u8], ram_base: u64,
-                      q: &VirtqState, head: u16) -> u32 {
+    fn handle_request(
+        &mut self,
+        memory: &mut [u8],
+        ram_base: u64,
+        q: &VirtqState,
+        head: u16,
+    ) -> u32 {
         // Collect all descriptors in the chain
         let mut descs: Vec<(u64, u32, u16)> = Vec::new(); // (addr, len, flags)
         let mut idx = head;
         loop {
-            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx) {
+            let (addr, len, flags, next) = match read_descriptor(memory, ram_base, q.desc_addr, idx)
+            {
                 Some(d) => d,
                 None => break,
             };
             descs.push((addr, len, flags));
-            if flags & VIRTQ_DESC_F_NEXT == 0 { break; }
+            if flags & VIRTQ_DESC_F_NEXT == 0 {
+                break;
+            }
             idx = next;
         }
 
@@ -269,17 +301,21 @@ impl VirtioBlkDevice {
 
         // First descriptor: request header (device-readable)
         let (hdr_addr, hdr_len, _) = descs[0];
-        if hdr_len < 16 { return 0; }
+        if hdr_len < 16 {
+            return 0;
+        }
 
         let hdr_off = match hdr_addr.checked_sub(ram_base) {
             Some(o) => o as usize,
             None => return 0,
         };
-        if hdr_off + 16 > memory.len() { return 0; }
+        if hdr_off + 16 > memory.len() {
+            return 0;
+        }
 
-        let req_type = u32::from_le_bytes(memory[hdr_off..hdr_off+4].try_into().unwrap());
-        let _reserved = u32::from_le_bytes(memory[hdr_off+4..hdr_off+8].try_into().unwrap());
-        let sector = u64::from_le_bytes(memory[hdr_off+8..hdr_off+16].try_into().unwrap());
+        let req_type = u32::from_le_bytes(memory[hdr_off..hdr_off + 4].try_into().unwrap());
+        let _reserved = u32::from_le_bytes(memory[hdr_off + 4..hdr_off + 8].try_into().unwrap());
+        let sector = u64::from_le_bytes(memory[hdr_off + 8..hdr_off + 16].try_into().unwrap());
 
         // Last descriptor: status byte (device-writable)
         let (status_addr, _, _) = descs[descs.len() - 1];
@@ -287,10 +323,12 @@ impl VirtioBlkDevice {
             Some(o) => o as usize,
             None => return 0,
         };
-        if status_off >= memory.len() { return 0; }
+        if status_off >= memory.len() {
+            return 0;
+        }
 
         // Middle descriptors: data buffers
-        let data_descs = &descs[1..descs.len()-1];
+        let data_descs = &descs[1..descs.len() - 1];
         let mut total_written = 0u32;
 
         let status = match req_type {
@@ -302,29 +340,40 @@ impl VirtioBlkDevice {
                 for &(addr, len, _flags) in data_descs {
                     let guest_off = match addr.checked_sub(ram_base) {
                         Some(o) => o as usize,
-                        None => { ok = false; break; },
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     };
                     let len = len as usize;
-                    if guest_off + len > memory.len() { ok = false; break; }
+                    if guest_off + len > memory.len() {
+                        ok = false;
+                        break;
+                    }
                     if disk_offset + len > self.disk_image.len() {
                         // Read past end — zero-fill
                         let avail = self.disk_image.len().saturating_sub(disk_offset);
                         if avail > 0 {
-                            memory[guest_off..guest_off+avail]
-                                .copy_from_slice(&self.disk_image[disk_offset..disk_offset+avail]);
+                            memory[guest_off..guest_off + avail].copy_from_slice(
+                                &self.disk_image[disk_offset..disk_offset + avail],
+                            );
                         }
                         if avail < len {
-                            memory[guest_off+avail..guest_off+len].fill(0);
+                            memory[guest_off + avail..guest_off + len].fill(0);
                         }
                     } else {
-                        memory[guest_off..guest_off+len]
-                            .copy_from_slice(&self.disk_image[disk_offset..disk_offset+len]);
+                        memory[guest_off..guest_off + len]
+                            .copy_from_slice(&self.disk_image[disk_offset..disk_offset + len]);
                     }
                     disk_offset += len;
                     total_written += len as u32;
                 }
 
-                if ok { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR }
+                if ok {
+                    VIRTIO_BLK_S_OK
+                } else {
+                    VIRTIO_BLK_S_IOERR
+                }
             }
 
             VIRTIO_BLK_T_OUT => {
@@ -335,10 +384,16 @@ impl VirtioBlkDevice {
                 for &(addr, len, _flags) in data_descs {
                     let guest_off = match addr.checked_sub(ram_base) {
                         Some(o) => o as usize,
-                        None => { ok = false; break; },
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     };
                     let len = len as usize;
-                    if guest_off + len > memory.len() { ok = false; break; }
+                    if guest_off + len > memory.len() {
+                        ok = false;
+                        break;
+                    }
 
                     // Grow image if needed
                     let needed = disk_offset + len;
@@ -346,12 +401,16 @@ impl VirtioBlkDevice {
                         self.disk_image.resize(needed, 0);
                     }
 
-                    self.disk_image[disk_offset..disk_offset+len]
-                        .copy_from_slice(&memory[guest_off..guest_off+len]);
+                    self.disk_image[disk_offset..disk_offset + len]
+                        .copy_from_slice(&memory[guest_off..guest_off + len]);
                     disk_offset += len;
                 }
 
-                if ok { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR }
+                if ok {
+                    VIRTIO_BLK_S_OK
+                } else {
+                    VIRTIO_BLK_S_IOERR
+                }
             }
 
             VIRTIO_BLK_T_FLUSH => {
@@ -369,7 +428,7 @@ impl VirtioBlkDevice {
                     let id = b"sandal-blk\0";
                     let copy_len = id.len().min(len as usize);
                     if guest_off + copy_len <= memory.len() {
-                        memory[guest_off..guest_off+copy_len].copy_from_slice(&id[..copy_len]);
+                        memory[guest_off..guest_off + copy_len].copy_from_slice(&id[..copy_len]);
                         total_written += copy_len as u32;
                     }
                 }

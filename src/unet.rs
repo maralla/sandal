@@ -1,3 +1,4 @@
+use anyhow::Result;
 /// User-space network stack (SLIRP-style NAT).
 ///
 /// Provides VM networking **without root privileges** by proxying
@@ -8,13 +9,11 @@
 ///   Gateway: 10.0.2.2
 ///   DNS:     10.0.2.3
 ///   Netmask: 255.255.255.0
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc;
-use anyhow::Result;
 
 // ============= NETWORK CONFIGURATION =============
 
@@ -57,19 +56,24 @@ extern "C" {
     fn libc_socket(domain: i32, ty: i32, protocol: i32) -> i32;
     #[link_name = "sendto"]
     fn libc_sendto(
-        fd: i32, buf: *const u8, len: usize, flags: i32,
-        addr: *const u8, addrlen: u32,
+        fd: i32,
+        buf: *const u8,
+        len: usize,
+        flags: i32,
+        addr: *const u8,
+        addrlen: u32,
     ) -> isize;
     #[link_name = "recvfrom"]
     fn libc_recvfrom(
-        fd: i32, buf: *mut u8, len: usize, flags: i32,
-        addr: *mut u8, addrlen: *mut u32,
+        fd: i32,
+        buf: *mut u8,
+        len: usize,
+        flags: i32,
+        addr: *mut u8,
+        addrlen: *mut u32,
     ) -> isize;
     #[link_name = "setsockopt"]
-    fn libc_setsockopt(
-        fd: i32, level: i32, optname: i32,
-        optval: *const u8, optlen: u32,
-    ) -> i32;
+    fn libc_setsockopt(fd: i32, level: i32, optname: i32, optval: *const u8, optlen: u32) -> i32;
 }
 
 // ============= PROTOCOL CONSTANTS =============
@@ -245,7 +249,9 @@ impl UserNet {
     // ======== ARP ========
 
     fn handle_arp(&mut self, data: &[u8]) {
-        if data.len() < 28 { return; }
+        if data.len() < 28 {
+            return;
+        }
 
         let hw_type = u16::from_be_bytes([data[0], data[1]]);
         let proto_type = u16::from_be_bytes([data[2], data[3]]);
@@ -257,14 +263,18 @@ impl UserNet {
             return;
         }
 
-        if opcode != 1 { return; } // Not a REQUEST
+        if opcode != 1 {
+            return;
+        } // Not a REQUEST
 
         let sender_mac: [u8; 6] = data[8..14].try_into().unwrap();
         let sender_ip: [u8; 4] = data[14..18].try_into().unwrap();
         let target_ip: [u8; 4] = data[24..28].try_into().unwrap();
 
         // Don't respond to ARP for guest's own IP
-        if target_ip == GUEST_IP { return; }
+        if target_ip == GUEST_IP {
+            return;
+        }
 
         // Respond with gateway MAC for any other IP (proxy ARP)
         let reply = build_arp_reply(&target_ip, &sender_mac, &sender_ip);
@@ -274,10 +284,14 @@ impl UserNet {
     // ======== IPv4 ========
 
     fn handle_ipv4(&mut self, data: &[u8]) {
-        if data.len() < 20 { return; }
+        if data.len() < 20 {
+            return;
+        }
 
         let ihl = (data[0] & 0x0F) as usize * 4;
-        if data.len() < ihl { return; }
+        if data.len() < ihl {
+            return;
+        }
 
         let protocol = data[9];
         let src_ip: [u8; 4] = data[12..16].try_into().unwrap();
@@ -295,8 +309,12 @@ impl UserNet {
     // ======== ICMP ========
 
     fn handle_icmp(&mut self, src_ip: [u8; 4], dst_ip: [u8; 4], data: &[u8]) {
-        if data.len() < 8 { return; }
-        if data[0] != 8 || data[1] != 0 { return; } // Not Echo Request
+        if data.len() < 8 {
+            return;
+        }
+        if data[0] != 8 || data[1] != 0 {
+            return;
+        } // Not Echo Request
 
         if dst_ip == GATEWAY_IP || dst_ip == DNS_IP {
             // Pings to our virtual IPs — reply locally.
@@ -332,16 +350,13 @@ impl UserNet {
     }
 
     /// Send an ICMP echo request to a real host and relay the reply back.
-    fn proxy_icmp_echo(
-        dst_ip: [u8; 4],
-        data: &[u8],
-        tx: &mpsc::Sender<Vec<u8>>,
-        ip_id: &mut u16,
-    ) {
+    fn proxy_icmp_echo(dst_ip: [u8; 4], data: &[u8], tx: &mpsc::Sender<Vec<u8>>, ip_id: &mut u16) {
         // Create a non-privileged ICMP socket (macOS SOCK_DGRAM + IPPROTO_ICMP).
         let sock = unsafe {
             let fd = libc_socket(ICMP_AF_INET, ICMP_SOCK_DGRAM, ICMP_IPPROTO_ICMP);
-            if fd < 0 { return; }
+            if fd < 0 {
+                return;
+            }
             fd
         };
 
@@ -357,9 +372,14 @@ impl UserNet {
 
         unsafe {
             // Set a 3-second receive timeout.
-            let tv = libc_timeval { tv_sec: 3, tv_usec: 0 };
+            let tv = libc_timeval {
+                tv_sec: 3,
+                tv_usec: 0,
+            };
             libc_setsockopt(
-                sock, ICMP_SOL_SOCKET, ICMP_SO_RCVTIMEO,
+                sock,
+                ICMP_SOL_SOCKET,
+                ICMP_SO_RCVTIMEO,
                 &tv as *const _ as *const u8,
                 std::mem::size_of::<libc_timeval>() as u32,
             );
@@ -377,13 +397,19 @@ impl UserNet {
             // Receive the echo reply.
             let mut buf = [0u8; 2048];
             let n = libc_recvfrom(
-                sock, buf.as_mut_ptr(), buf.len(), 0,
-                std::ptr::null_mut(), std::ptr::null_mut(),
+                sock,
+                buf.as_mut_ptr(),
+                buf.len(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
 
             kq::close(sock);
 
-            if n <= 0 { return; }
+            if n <= 0 {
+                return;
+            }
 
             let received = &buf[..n as usize];
 
@@ -391,7 +417,9 @@ impl UserNet {
             // sockets. Strip the IP header to get the ICMP payload.
             let icmp_payload = if received.len() >= 20 && (received[0] >> 4) == 4 {
                 let ihl = ((received[0] & 0x0F) as usize) * 4;
-                if received.len() <= ihl { return; }
+                if received.len() <= ihl {
+                    return;
+                }
                 &received[ihl..]
             } else {
                 received
@@ -413,13 +441,17 @@ impl UserNet {
     // ======== UDP ========
 
     fn handle_udp(&mut self, src_ip: [u8; 4], _dst_ip: [u8; 4], data: &[u8]) {
-        if data.len() < 8 { return; }
+        if data.len() < 8 {
+            return;
+        }
 
         let src_port = u16::from_be_bytes([data[0], data[1]]);
         let dst_port = u16::from_be_bytes([data[2], data[3]]);
         let udp_len = u16::from_be_bytes([data[4], data[5]]) as usize;
 
-        if data.len() < udp_len { return; }
+        if data.len() < udp_len {
+            return;
+        }
         let payload = &data[8..udp_len.min(data.len())];
 
         if dst_port == 67 {
@@ -434,13 +466,19 @@ impl UserNet {
     // ======== DHCP ========
 
     fn handle_dhcp(&mut self, data: &[u8]) {
-        if data.len() < 244 { return; }
+        if data.len() < 244 {
+            return;
+        }
 
         let op = data[0];
-        if op != 1 { return; } // Not a BOOTREQUEST
+        if op != 1 {
+            return;
+        } // Not a BOOTREQUEST
 
         // Verify magic cookie
-        if data[236..240] != [99, 130, 83, 99] { return; }
+        if data[236..240] != [99, 130, 83, 99] {
+            return;
+        }
 
         let xid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let chaddr: [u8; 6] = data[28..34].try_into().unwrap();
@@ -484,31 +522,38 @@ impl UserNet {
         let mut p = 240;
 
         // 53: DHCP Message Type
-        dhcp[p] = 53; dhcp[p + 1] = 1; dhcp[p + 2] = msg_type;
+        dhcp[p] = 53;
+        dhcp[p + 1] = 1;
+        dhcp[p + 2] = msg_type;
         p += 3;
 
         // 54: Server Identifier
-        dhcp[p] = 54; dhcp[p + 1] = 4;
+        dhcp[p] = 54;
+        dhcp[p + 1] = 4;
         dhcp[p + 2..p + 6].copy_from_slice(&GATEWAY_IP);
         p += 6;
 
         // 1: Subnet Mask
-        dhcp[p] = 1; dhcp[p + 1] = 4;
+        dhcp[p] = 1;
+        dhcp[p + 1] = 4;
         dhcp[p + 2..p + 6].copy_from_slice(&NETMASK);
         p += 6;
 
         // 3: Router
-        dhcp[p] = 3; dhcp[p + 1] = 4;
+        dhcp[p] = 3;
+        dhcp[p + 1] = 4;
         dhcp[p + 2..p + 6].copy_from_slice(&GATEWAY_IP);
         p += 6;
 
         // 6: DNS Server
-        dhcp[p] = 6; dhcp[p + 1] = 4;
+        dhcp[p] = 6;
+        dhcp[p + 1] = 4;
         dhcp[p + 2..p + 6].copy_from_slice(&DNS_IP);
         p += 6;
 
         // 51: Lease Time (1 day)
-        dhcp[p] = 51; dhcp[p + 1] = 4;
+        dhcp[p] = 51;
+        dhcp[p + 1] = 4;
         dhcp[p + 2..p + 6].copy_from_slice(&86400u32.to_be_bytes());
         p += 6;
 
@@ -520,23 +565,34 @@ impl UserNet {
 
         // Wrap in UDP/IP/Ethernet (broadcast)
         let udp = build_udp(67, 68, &dhcp);
-        let ip = build_ipv4_packet(GATEWAY_IP, [255, 255, 255, 255], IP_UDP, &udp, &mut self.ip_id);
+        let ip = build_ipv4_packet(
+            GATEWAY_IP,
+            [255, 255, 255, 255],
+            IP_UDP,
+            &udp,
+            &mut self.ip_id,
+        );
         build_eth_frame(&[0xFF; 6], &GATEWAY_MAC, ETH_IPV4, &ip)
     }
 
     // ======== DNS ========
 
     fn handle_dns(&mut self, src_port: u16, src_ip: [u8; 4], payload: &[u8]) {
-        if payload.len() < 12 { return; }
+        if payload.len() < 12 {
+            return;
+        }
 
         let dns_id = u16::from_be_bytes([payload[0], payload[1]]);
 
         // Forward DNS query to host DNS server
         if self.dns_socket.send_to(payload, self.host_dns).is_ok() {
-            self.pending_dns.insert(dns_id, PendingDns {
-                guest_port: src_port,
-                guest_ip: src_ip,
-            });
+            self.pending_dns.insert(
+                dns_id,
+                PendingDns {
+                    guest_port: src_port,
+                    guest_ip: src_ip,
+                },
+            );
         }
     }
 
@@ -545,14 +601,20 @@ impl UserNet {
         loop {
             match self.dns_socket.recv_from(&mut buf) {
                 Ok((len, _addr)) => {
-                    if len < 2 { continue; }
+                    if len < 2 {
+                        continue;
+                    }
                     let dns_id = u16::from_be_bytes([buf[0], buf[1]]);
 
                     if let Some(pending) = self.pending_dns.remove(&dns_id) {
                         let dns_data = &buf[..len];
                         let udp = build_udp(53, pending.guest_port, dns_data);
                         let ip = build_ipv4_packet(
-                            DNS_IP, pending.guest_ip, IP_UDP, &udp, &mut self.ip_id,
+                            DNS_IP,
+                            pending.guest_ip,
+                            IP_UDP,
+                            &udp,
+                            &mut self.ip_id,
                         );
                         let frame = build_eth_frame(&GUEST_MAC, &GATEWAY_MAC, ETH_IPV4, &ip);
                         self.rx_queue.push_back(frame);
@@ -566,7 +628,9 @@ impl UserNet {
     // ======== TCP ========
 
     fn handle_tcp(&mut self, src_ip: [u8; 4], dst_ip: [u8; 4], data: &[u8]) {
-        if data.len() < 20 { return; }
+        if data.len() < 20 {
+            return;
+        }
 
         let src_port = u16::from_be_bytes([data[0], data[1]]);
         let dst_port = u16::from_be_bytes([data[2], data[3]]);
@@ -606,12 +670,16 @@ impl UserNet {
             None => {
                 // Unknown connection — send RST
                 let rst = make_tcp_packet(
-                    dst_ip, dst_port, src_ip, src_port,
+                    dst_ip,
+                    dst_port,
+                    src_ip,
+                    src_port,
                     ack_num,
                     seq.wrapping_add(payload.len() as u32)
                         .wrapping_add(if flags & TCP_SYN != 0 { 1 } else { 0 }),
                     TCP_RST | TCP_ACK,
-                    &[], &[],
+                    &[],
+                    &[],
                     &mut self.ip_id,
                 );
                 self.rx_queue.push_back(rst);
@@ -638,9 +706,15 @@ impl UserNet {
             }
             // Always ACK (handles retransmits)
             let ack_pkt = make_tcp_packet(
-                dst_ip, dst_port, src_ip, src_port,
-                conn.our_seq, conn.their_seq,
-                TCP_ACK, &[], &[],
+                dst_ip,
+                dst_port,
+                src_ip,
+                src_port,
+                conn.our_seq,
+                conn.their_seq,
+                TCP_ACK,
+                &[],
+                &[],
                 &mut self.ip_id,
             );
             self.rx_queue.push_back(ack_pkt);
@@ -650,9 +724,15 @@ impl UserNet {
         if flags & TCP_FIN != 0 {
             conn.their_seq = conn.their_seq.wrapping_add(1);
             let fin_ack = make_tcp_packet(
-                dst_ip, dst_port, src_ip, src_port,
-                conn.our_seq, conn.their_seq,
-                TCP_ACK | TCP_FIN, &[], &[],
+                dst_ip,
+                dst_port,
+                src_ip,
+                src_port,
+                conn.our_seq,
+                conn.their_seq,
+                TCP_ACK | TCP_FIN,
+                &[],
+                &[],
                 &mut self.ip_id,
             );
             self.rx_queue.push_back(fin_ack);
@@ -685,10 +765,7 @@ impl UserNet {
         let key_clone = key.clone();
 
         std::thread::spawn(move || {
-            let result = TcpStream::connect_timeout(
-                &dst_addr,
-                std::time::Duration::from_secs(10),
-            );
+            let result = TcpStream::connect_timeout(&dst_addr, std::time::Duration::from_secs(10));
             if let Ok(ref stream) = result {
                 stream.set_nonblocking(true).ok();
                 stream.set_nodelay(true).ok();
@@ -741,12 +818,7 @@ impl UserNet {
                     };
 
                     // Build SYN-ACK with MSS option
-                    let mss_option = [
-                        2,
-                        4,
-                        (TCP_MSS >> 8) as u8,
-                        (TCP_MSS & 0xFF) as u8,
-                    ];
+                    let mss_option = [2, 4, (TCP_MSS >> 8) as u8, (TCP_MSS & 0xFF) as u8];
                     let syn_ack = make_tcp_packet(
                         cr.key.dst_ip,
                         cr.key.dst_port,
@@ -819,10 +891,15 @@ impl UserNet {
                     Ok(0) => {
                         // EOF — send FIN
                         let pkt = make_tcp_packet(
-                            key.dst_ip, key.dst_port,
-                            GUEST_IP, key.guest_port,
-                            conn.our_seq, conn.their_seq,
-                            TCP_FIN | TCP_ACK, &[], &[],
+                            key.dst_ip,
+                            key.dst_port,
+                            GUEST_IP,
+                            key.guest_port,
+                            conn.our_seq,
+                            conn.their_seq,
+                            TCP_FIN | TCP_ACK,
+                            &[],
+                            &[],
                             &mut self.ip_id,
                         );
                         self.rx_queue.push_back(pkt);
@@ -833,10 +910,15 @@ impl UserNet {
                     }
                     Ok(n) => {
                         let pkt = make_tcp_packet(
-                            key.dst_ip, key.dst_port,
-                            GUEST_IP, key.guest_port,
-                            conn.our_seq, conn.their_seq,
-                            TCP_PSH | TCP_ACK, &buf[..n], &[],
+                            key.dst_ip,
+                            key.dst_port,
+                            GUEST_IP,
+                            key.guest_port,
+                            conn.our_seq,
+                            conn.their_seq,
+                            TCP_PSH | TCP_ACK,
+                            &buf[..n],
+                            &[],
                             &mut self.ip_id,
                         );
                         self.rx_queue.push_back(pkt);
@@ -848,10 +930,15 @@ impl UserNet {
                     Err(_) => {
                         // Error — send RST
                         let pkt = make_tcp_packet(
-                            key.dst_ip, key.dst_port,
-                            GUEST_IP, key.guest_port,
-                            conn.our_seq, conn.their_seq,
-                            TCP_RST | TCP_ACK, &[], &[],
+                            key.dst_ip,
+                            key.dst_port,
+                            GUEST_IP,
+                            key.guest_port,
+                            conn.our_seq,
+                            conn.their_seq,
+                            TCP_RST | TCP_ACK,
+                            &[],
+                            &[],
                             &mut self.ip_id,
                         );
                         self.rx_queue.push_back(pkt);
@@ -906,7 +993,11 @@ fn build_eth_frame(dst: &[u8; 6], src: &[u8; 6], ethertype: u16, payload: &[u8])
 }
 
 fn build_ipv4_packet(
-    src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8], ip_id: &mut u16,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    payload: &[u8],
+    ip_id: &mut u16,
 ) -> Vec<u8> {
     let total_len = 20 + payload.len();
     let id = *ip_id;
@@ -934,8 +1025,14 @@ fn build_ipv4_packet(
 }
 
 fn build_tcp_segment(
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, window: u16, payload: &[u8], options: &[u8],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    options: &[u8],
 ) -> Vec<u8> {
     let options_padded_len = (options.len() + 3) & !3;
     let header_len = 20 + options_padded_len;
@@ -976,15 +1073,19 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp_segment: &[u8]) -> u16 {
 
 /// Build a complete Ethernet frame containing a TCP segment.
 fn make_tcp_packet(
-    src_ip: [u8; 4], src_port: u16,
-    dst_ip: [u8; 4], dst_port: u16,
-    seq: u32, ack: u32, flags: u8,
-    payload: &[u8], options: &[u8],
+    src_ip: [u8; 4],
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    options: &[u8],
     ip_id: &mut u16,
 ) -> Vec<u8> {
-    let mut tcp_seg = build_tcp_segment(
-        src_port, dst_port, seq, ack, flags, 65535, payload, options,
-    );
+    let mut tcp_seg =
+        build_tcp_segment(src_port, dst_port, seq, ack, flags, 65535, payload, options);
 
     // Compute TCP checksum
     let cksum = tcp_checksum(src_ip, dst_ip, &tcp_seg);
@@ -1025,11 +1126,20 @@ fn build_udp(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
 fn parse_dhcp_msg_type(options: &[u8]) -> Option<u8> {
     let mut pos = 0;
     loop {
-        if pos >= options.len() { return None; }
+        if pos >= options.len() {
+            return None;
+        }
         let opt = options[pos];
-        if opt == 255 { return None; } // End
-        if opt == 0 { pos += 1; continue; } // Pad
-        if pos + 1 >= options.len() { return None; }
+        if opt == 255 {
+            return None;
+        } // End
+        if opt == 0 {
+            pos += 1;
+            continue;
+        } // Pad
+        if pos + 1 >= options.len() {
+            return None;
+        }
         let len = options[pos + 1] as usize;
         if opt == 53 && len == 1 && pos + 2 < options.len() {
             return Some(options[pos + 2]);
@@ -1213,9 +1323,7 @@ impl NetPoller {
                 if ev.ident == self.wakeup_read as usize {
                     // Drain the pipe and check for the shutdown sentinel (0xFF).
                     let mut buf = [0u8; 64];
-                    let nread = unsafe {
-                        kq::read(self.wakeup_read, buf.as_mut_ptr(), buf.len())
-                    };
+                    let nread = unsafe { kq::read(self.wakeup_read, buf.as_mut_ptr(), buf.len()) };
                     if nread > 0 && buf[..nread as usize].contains(&0xFF) {
                         shutdown = true;
                     }

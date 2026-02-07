@@ -6,7 +6,6 @@
 /// 2. Memory reservation map (8-byte aligned entries, terminated by {0,0})
 /// 3. Structure block (tokens: BEGIN_NODE, END_NODE, PROP, END)
 /// 4. Strings block (null-terminated property name strings)
-
 use anyhow::Result;
 
 const FDT_MAGIC: u32 = 0xd00dfeed;
@@ -29,7 +28,20 @@ impl DeviceTree {
     }
 
     /// Build a complete device tree for QEMU-virt-like ARM64 machine
-    pub fn build(memory_size: u64, uart_base: u64, gic_dist_base: u64, gic_dist_size: usize, gic_redist_base: u64, gic_redist_size: usize, initrd: Option<(u64, u64)>, virtio_net: Option<(u64, u32)>, virtio_blk: Option<(u64, u32)>, virtio_rng: Option<(u64, u32)>, use_8250_uart: bool, verbose: bool) -> Result<Vec<u8>> {
+    pub fn build(
+        memory_size: u64,
+        uart_base: u64,
+        gic_dist_base: u64,
+        gic_dist_size: usize,
+        gic_redist_base: u64,
+        gic_redist_size: usize,
+        initrd: Option<(u64, u64)>,
+        virtio_net: Option<(u64, u32)>,
+        virtio_blk: Option<(u64, u32)>,
+        virtio_rng: Option<(u64, u32)>,
+        use_8250_uart: bool,
+        verbose: bool,
+    ) -> Result<Vec<u8>> {
         let mut dt = Self::new();
 
         // Root node
@@ -44,11 +56,18 @@ impl DeviceTree {
         // Chosen node (boot arguments)
         dt.begin_node("chosen");
         {
-            let earlycon = if use_8250_uart { "earlycon=uart8250,mmio32,0x9000000 console=ttyS0" }
-                           else { "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0" };
-            let rootfs = if virtio_blk.is_some() { " root=/dev/vda rw init=/init" }
-                         else if initrd.is_some() { " rdinit=/init" }
-                         else { "" };
+            let earlycon = if use_8250_uart {
+                "earlycon=uart8250,mmio32,0x9000000 console=ttyS0"
+            } else {
+                "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0"
+            };
+            let rootfs = if virtio_blk.is_some() {
+                " root=/dev/vda rw init=/init"
+            } else if initrd.is_some() {
+                " rdinit=/init"
+            } else {
+                ""
+            };
             // "quiet" suppresses kernel console messages above KERN_WARNING,
             // preventing printk from cluttering the interactive terminal.
             // In verbose mode we omit it so all kernel output is visible.
@@ -132,9 +151,9 @@ impl DeviceTree {
         // Timer IRQs: S_EL1=29→PPI13, NS_EL1=30→PPI14, VIRT=27→PPI11, NS_EL2=26→PPI10
         let mut interrupts = Vec::new();
         for irq in &[13u32, 14, 11, 10] {
-            interrupts.extend_from_slice(&1u32.to_be_bytes());   // GIC_FDT_IRQ_TYPE_PPI
-            interrupts.extend_from_slice(&irq.to_be_bytes());     // PPI number
-            interrupts.extend_from_slice(&4u32.to_be_bytes());    // GIC_FDT_IRQ_FLAGS_LEVEL_HI
+            interrupts.extend_from_slice(&1u32.to_be_bytes()); // GIC_FDT_IRQ_TYPE_PPI
+            interrupts.extend_from_slice(&irq.to_be_bytes()); // PPI number
+            interrupts.extend_from_slice(&4u32.to_be_bytes()); // GIC_FDT_IRQ_FLAGS_LEVEL_HI
         }
         dt.prop_bytes("interrupts", &interrupts);
         dt.end_node();
@@ -147,9 +166,9 @@ impl DeviceTree {
             uart_reg.extend_from_slice(&uart_base.to_be_bytes());
             uart_reg.extend_from_slice(&0x1000u64.to_be_bytes());
             dt.prop_bytes("reg", &uart_reg);
-            dt.prop_u32("reg-shift", 2);      // Registers are 4-byte aligned
-            dt.prop_u32("reg-io-width", 4);   // 32-bit MMIO access
-            // UART interrupt: SPI 1, level triggered
+            dt.prop_u32("reg-shift", 2); // Registers are 4-byte aligned
+            dt.prop_u32("reg-io-width", 4); // 32-bit MMIO access
+                                            // UART interrupt: SPI 1, level triggered
             let mut uart_irq = Vec::new();
             uart_irq.extend_from_slice(&0u32.to_be_bytes()); // SPI
             uart_irq.extend_from_slice(&1u32.to_be_bytes()); // IRQ 1
@@ -308,7 +327,9 @@ impl DeviceTree {
         let mut offset = 0;
         while offset < self.dt_strings.len() {
             // Find the end of the current string
-            let end = self.dt_strings[offset..].iter().position(|&b| b == 0)
+            let end = self.dt_strings[offset..]
+                .iter()
+                .position(|&b| b == 0)
                 .map(|p| offset + p)
                 .unwrap_or(self.dt_strings.len());
 

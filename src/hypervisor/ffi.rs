@@ -47,9 +47,9 @@ pub enum HvReg {
     X26 = 26,
     X27 = 27,
     X28 = 28,
-    Fp = 29,  // Frame pointer (X29)
-    Lr = 30,  // Link register (X30)
-    Pc = 31,  // Program counter
+    Fp = 29,   // Frame pointer (X29)
+    Lr = 30,   // Link register (X30)
+    Pc = 31,   // Program counter
     Fpcr = 32, // Floating-point control register
     Fpsr = 33, // Floating-point status register
     Cpsr = 34, // Current Program Status Register
@@ -114,15 +114,19 @@ extern "C" {
     pub fn hv_vcpu_run_wrapper(vcpu: HvVcpu) -> HvReturn;
     pub fn hv_vcpu_read_register_wrapper(vcpu: HvVcpu, reg: u32, value: *mut u64) -> HvReturn;
     pub fn hv_vcpu_write_register_wrapper(vcpu: HvVcpu, reg: u32, value: u64) -> HvReturn;
-    
+
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_read_sys_reg_wrapper(vcpu: HvVcpu, reg: u32, value: *mut u64) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_write_sys_reg_wrapper(vcpu: HvVcpu, reg: u32, value: u64) -> HvReturn;
-    
+
     #[cfg(target_arch = "aarch64")]
-    pub fn hv_vcpu_set_pending_interrupt_wrapper(vcpu: HvVcpu, int_type: u32, pending: bool) -> HvReturn;
-    
+    pub fn hv_vcpu_set_pending_interrupt_wrapper(
+        vcpu: HvVcpu,
+        int_type: u32,
+        pending: bool,
+    ) -> HvReturn;
+
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_set_vtimer_mask_wrapper(vcpu: HvVcpu, vtimer_is_masked: bool) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
@@ -135,19 +139,25 @@ extern "C" {
     pub fn hv_vcpus_exit_wrapper(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_set_trap_debug_exceptions_wrapper(vcpu: HvVcpu, value: bool) -> HvReturn;
-    
+
     // GIC functions
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_config_create_wrapper() -> *mut std::ffi::c_void;
     #[cfg(target_arch = "aarch64")]
-    pub fn hv_gic_config_set_distributor_base_wrapper(config: *mut std::ffi::c_void, addr: u64) -> HvReturn;
+    pub fn hv_gic_config_set_distributor_base_wrapper(
+        config: *mut std::ffi::c_void,
+        addr: u64,
+    ) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
-    pub fn hv_gic_config_set_redistributor_base_wrapper(config: *mut std::ffi::c_void, addr: u64) -> HvReturn;
+    pub fn hv_gic_config_set_redistributor_base_wrapper(
+        config: *mut std::ffi::c_void,
+        addr: u64,
+    ) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_create_wrapper(config: *mut std::ffi::c_void) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_config_release_wrapper(config: *mut std::ffi::c_void);
-    
+
     // GIC parameter query functions
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_get_distributor_size_wrapper(size: *mut usize) -> HvReturn;
@@ -174,27 +184,27 @@ extern "C" {
 #[cfg(target_arch = "aarch64")]
 pub enum HvSysReg {
     // System info
-    MidrEl1 = 0xc000,       // Main ID Register
-    MpidrEl1 = 0xc005,      // Multiprocessor Affinity Register
+    MidrEl1 = 0xc000,  // Main ID Register
+    MpidrEl1 = 0xc005, // Multiprocessor Affinity Register
 
     // Memory management
-    SctlrEl1 = 0xc080,      // System Control Register
-    Ttbr0El1 = 0xc100,      // Translation Table Base Register 0
-    Ttbr1El1 = 0xc101,      // Translation Table Base Register 1
-    TcrEl1 = 0xc102,        // Translation Control Register
-    MairEl1 = 0xc510,       // Memory Attribute Indirection Register
-    
+    SctlrEl1 = 0xc080, // System Control Register
+    Ttbr0El1 = 0xc100, // Translation Table Base Register 0
+    Ttbr1El1 = 0xc101, // Translation Table Base Register 1
+    TcrEl1 = 0xc102,   // Translation Control Register
+    MairEl1 = 0xc510,  // Memory Attribute Indirection Register
+
     // Exception handling
-    SpsrEl1 = 0xc200,       // Saved Program Status Register (EL1)
-    ElrEl1 = 0xc201,        // Exception Link Register (EL1)
-    SpEl0 = 0xc208,         // Stack Pointer (EL0)
-    EsrEl1 = 0xc290,        // Exception Syndrome Register (EL1)
-    FarEl1 = 0xc300,        // Fault Address Register (EL1)
-    VbarEl1 = 0xc600,       // Vector Base Address Register
+    SpsrEl1 = 0xc200, // Saved Program Status Register (EL1)
+    ElrEl1 = 0xc201,  // Exception Link Register (EL1)
+    SpEl0 = 0xc208,   // Stack Pointer (EL0)
+    EsrEl1 = 0xc290,  // Exception Syndrome Register (EL1)
+    FarEl1 = 0xc300,  // Fault Address Register (EL1)
+    VbarEl1 = 0xc600, // Vector Base Address Register
 
     // Stack pointers
-    SpEl1 = 0xe208,         // Stack Pointer (EL1)
-    
+    SpEl1 = 0xe208, // Stack Pointer (EL1)
+
     // Debug
-    MdscrEl1 = 0x8012,      // Monitor Debug System Control Register
+    MdscrEl1 = 0x8012, // Monitor Debug System Control Register
 }
