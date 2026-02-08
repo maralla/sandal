@@ -161,81 +161,19 @@ fn poll_stdin_once(fd: RawFd) -> i32 {
 }
 
 impl VmInstance {
-    /// Helper to write to guest register by number (0-31)
+    /// Write to a guest general-purpose register by index (0-30 = X0-LR, 31 = XZR).
     fn write_guest_register(vcpu: &Vcpu, rt: u8, value: u64) -> Result<()> {
-        match rt {
-            0 => vcpu.write_register(HvReg::X0, value),
-            1 => vcpu.write_register(HvReg::X1, value),
-            2 => vcpu.write_register(HvReg::X2, value),
-            3 => vcpu.write_register(HvReg::X3, value),
-            4 => vcpu.write_register(HvReg::X4, value),
-            5 => vcpu.write_register(HvReg::X5, value),
-            6 => vcpu.write_register(HvReg::X6, value),
-            7 => vcpu.write_register(HvReg::X7, value),
-            8 => vcpu.write_register(HvReg::X8, value),
-            9 => vcpu.write_register(HvReg::X9, value),
-            10 => vcpu.write_register(HvReg::X10, value),
-            11 => vcpu.write_register(HvReg::X11, value),
-            12 => vcpu.write_register(HvReg::X12, value),
-            13 => vcpu.write_register(HvReg::X13, value),
-            14 => vcpu.write_register(HvReg::X14, value),
-            15 => vcpu.write_register(HvReg::X15, value),
-            16 => vcpu.write_register(HvReg::X16, value),
-            17 => vcpu.write_register(HvReg::X17, value),
-            18 => vcpu.write_register(HvReg::X18, value),
-            19 => vcpu.write_register(HvReg::X19, value),
-            20 => vcpu.write_register(HvReg::X20, value),
-            21 => vcpu.write_register(HvReg::X21, value),
-            22 => vcpu.write_register(HvReg::X22, value),
-            23 => vcpu.write_register(HvReg::X23, value),
-            24 => vcpu.write_register(HvReg::X24, value),
-            25 => vcpu.write_register(HvReg::X25, value),
-            26 => vcpu.write_register(HvReg::X26, value),
-            27 => vcpu.write_register(HvReg::X27, value),
-            28 => vcpu.write_register(HvReg::X28, value),
-            29 => vcpu.write_register(HvReg::Fp, value),
-            30 => vcpu.write_register(HvReg::Lr, value),
-            31 => Ok(()), // XZR (zero register) - writes are discarded
-            _ => Ok(()),
+        match HvReg::from_gpr(rt) {
+            Some(reg) => vcpu.write_register(reg, value),
+            None => Ok(()), // XZR (zero register) - writes are discarded
         }
     }
 
-    /// Helper to read from guest register by number (0-31)
+    /// Read from a guest general-purpose register by index (0-30 = X0-LR, 31 = XZR).
     fn read_guest_register(vcpu: &Vcpu, rt: u8) -> Result<u64> {
-        match rt {
-            0 => vcpu.read_register(HvReg::X0),
-            1 => vcpu.read_register(HvReg::X1),
-            2 => vcpu.read_register(HvReg::X2),
-            3 => vcpu.read_register(HvReg::X3),
-            4 => vcpu.read_register(HvReg::X4),
-            5 => vcpu.read_register(HvReg::X5),
-            6 => vcpu.read_register(HvReg::X6),
-            7 => vcpu.read_register(HvReg::X7),
-            8 => vcpu.read_register(HvReg::X8),
-            9 => vcpu.read_register(HvReg::X9),
-            10 => vcpu.read_register(HvReg::X10),
-            11 => vcpu.read_register(HvReg::X11),
-            12 => vcpu.read_register(HvReg::X12),
-            13 => vcpu.read_register(HvReg::X13),
-            14 => vcpu.read_register(HvReg::X14),
-            15 => vcpu.read_register(HvReg::X15),
-            16 => vcpu.read_register(HvReg::X16),
-            17 => vcpu.read_register(HvReg::X17),
-            18 => vcpu.read_register(HvReg::X18),
-            19 => vcpu.read_register(HvReg::X19),
-            20 => vcpu.read_register(HvReg::X20),
-            21 => vcpu.read_register(HvReg::X21),
-            22 => vcpu.read_register(HvReg::X22),
-            23 => vcpu.read_register(HvReg::X23),
-            24 => vcpu.read_register(HvReg::X24),
-            25 => vcpu.read_register(HvReg::X25),
-            26 => vcpu.read_register(HvReg::X26),
-            27 => vcpu.read_register(HvReg::X27),
-            28 => vcpu.read_register(HvReg::X28),
-            29 => vcpu.read_register(HvReg::Fp),
-            30 => vcpu.read_register(HvReg::Lr),
-            31 => Ok(0), // XZR (zero register) - always reads 0
-            _ => Ok(0),
+        match HvReg::from_gpr(rt) {
+            Some(reg) => vcpu.read_register(reg),
+            None => Ok(0), // XZR (zero register) - always reads 0
         }
     }
 
@@ -275,10 +213,9 @@ impl VmInstance {
         })
     }
 
-    /// Detect the UART type from the kernel binary.
+    /// Detect the UART type from the kernel binary data.
     /// Must be called before building the initramfs if using rootfs.
-    pub fn detect_uart_type(&mut self, kernel_path: &std::path::Path) -> Result<()> {
-        let kernel_data = std::fs::read(kernel_path)?;
+    pub fn detect_uart_type(&mut self, kernel_data: &[u8]) {
         let has_pl011 = kernel_data.windows(5).any(|w| w == b"pl011");
         let has_8250 = kernel_data.windows(4).any(|w| w == b"8250")
             || kernel_data.windows(10).any(|w| w == b"serial8250");
@@ -293,7 +230,6 @@ impl VmInstance {
             "UART type: {:?} (pl011={}, 8250={})",
             self.uart_type, has_pl011, has_8250
         );
-        Ok(())
     }
 
     pub fn setup(&mut self) -> Result<()> {
@@ -317,22 +253,32 @@ impl VmInstance {
         Ok(())
     }
 
-    pub fn load_kernel(&mut self, kernel_path: &std::path::Path) -> Result<()> {
-        // Write bootloader stub at RAM_BASE
-        // Sets up X0 (DTB pointer), clears X1-X3, then jumps to kernel
+    pub fn load_kernel(&mut self, kernel_data: &[u8]) -> Result<()> {
+        // Bootloader trampoline at RAM_BASE.
+        //
+        // The Linux ARM64 boot protocol requires X0 = DTB address, X1-X3 = 0, and
+        // PC = kernel entry. Since we can't atomically set all registers before the
+        // vCPU starts, this small stub runs first: it loads the DTB and kernel
+        // addresses from its embedded data section, sets up registers, then jumps
+        // to the kernel.
+        const DTB_GPA: u64 = RAM_BASE + DTB_OFFSET;
+        const KERNEL_ENTRY_GPA: u64 = RAM_BASE + KERNEL_OFFSET;
+
         let bootloader: [u32; 10] = [
-            0x580000c0, // ldr x0, [pc, #0x18]  → load DTB address
+            0x580000c0, // ldr x0, [pc, #0x18]  → load DTB address into X0
             0xaa1f03e1, // mov x1, xzr
             0xaa1f03e2, // mov x2, xzr
             0xaa1f03e3, // mov x3, xzr
-            0x58000084, // ldr x4, [pc, #0x10]  → load kernel entry
-            0xd61f0080, // br x4                 → jump to kernel
-            // Data section (filled in step 4):
-            0x00000000, // [6] DTB address low 32 bits
-            0x00000000, // [7] DTB address high 32 bits
-            0x00000000, // [8] Kernel entry low 32 bits
-            0x00000000, // [9] Kernel entry high 32 bits
+            0x58000084, // ldr x4, [pc, #0x10]  → load kernel entry into X4
+            0xd61f0080, // br x4                → jump to kernel
+            // Embedded data: guest physical addresses
+            (DTB_GPA & 0xFFFFFFFF) as u32,
+            ((DTB_GPA >> 32) & 0xFFFFFFFF) as u32,
+            (KERNEL_ENTRY_GPA & 0xFFFFFFFF) as u32,
+            ((KERNEL_ENTRY_GPA >> 32) & 0xFFFFFFFF) as u32,
         ];
+
+        self.kernel_entry = KERNEL_ENTRY_GPA;
 
         unsafe {
             let ptr = self.memory.as_mut_ptr() as *mut u32;
@@ -341,8 +287,7 @@ impl VmInstance {
             }
         }
 
-        // Step 2: Load kernel at offset 0x80000
-        let kernel_data = std::fs::read(kernel_path)?;
+        // Load kernel at RAM_BASE + KERNEL_OFFSET
         let kernel_offset = KERNEL_OFFSET as usize;
 
         if kernel_offset + kernel_data.len() > self.memory_size {
@@ -353,7 +298,7 @@ impl VmInstance {
             );
         }
 
-        self.memory[kernel_offset..kernel_offset + kernel_data.len()].copy_from_slice(&kernel_data);
+        self.memory[kernel_offset..kernel_offset + kernel_data.len()].copy_from_slice(kernel_data);
 
         debug!(
             "Kernel loaded at offset 0x{:x} ({} bytes = {} MB)",
@@ -362,25 +307,12 @@ impl VmInstance {
             kernel_data.len() / (1024 * 1024)
         );
 
-        // Step 3: Load device tree
+        // Load device tree at RAM_BASE + DTB_OFFSET
         self.load_device_tree()?;
 
-        // Step 4: Fix up bootloader with absolute guest physical addresses
-        let dtb_gpa = RAM_BASE + DTB_OFFSET;
-        let kernel_entry_gpa = RAM_BASE + KERNEL_OFFSET;
-        self.kernel_entry = kernel_entry_gpa;
-
-        unsafe {
-            let ptr = self.memory.as_mut_ptr() as *mut u32;
-            *ptr.add(6) = (dtb_gpa & 0xFFFFFFFF) as u32;
-            *ptr.add(7) = ((dtb_gpa >> 32) & 0xFFFFFFFF) as u32;
-            *ptr.add(8) = (kernel_entry_gpa & 0xFFFFFFFF) as u32;
-            *ptr.add(9) = ((kernel_entry_gpa >> 32) & 0xFFFFFFFF) as u32;
-        }
-
         debug!("Bootloader configured:");
-        debug!("   Kernel at GPA: 0x{kernel_entry_gpa:x}");
-        debug!("   DTB at GPA: 0x{dtb_gpa:x}");
+        debug!("   Kernel at GPA: 0x{KERNEL_ENTRY_GPA:x}");
+        debug!("   DTB at GPA: 0x{DTB_GPA:x}");
 
         Ok(())
     }
@@ -416,22 +348,26 @@ impl VmInstance {
     fn load_device_tree(&mut self) -> Result<()> {
         // Query GIC parameters from HVF for accurate device tree
         let (gic_dist_base, gic_dist_size, gic_redist_base, gic_redist_size) =
-            crate::hypervisor::vm::Vm::query_gic_params();
+            Vm::query_gic_params();
+
         let virtio_net_dt = if self.network_enabled {
             Some((VIRTIO_NET_BASE, VIRTIO_NET_SPI))
         } else {
             None
         };
+
         let virtio_blk_dt = if self.use_virtio_blk {
             Some((VIRTIO_BLK_BASE, VIRTIO_BLK_SPI))
         } else {
             None
         };
+
         let virtio_rng_dt = if self.virtio_rng.is_some() {
             Some((VIRTIO_RNG_BASE, VIRTIO_RNG_SPI))
         } else {
             None
         };
+
         let use_8250 = self.is_uart_8250();
         let dtb = DeviceTree::build(
             self.memory_size as u64,
@@ -1525,12 +1461,13 @@ pub fn run(args: Args) -> Result<()> {
         })?,
     };
 
+    // Read kernel once and reuse for detection and loading
+    let kernel_data = std::fs::read(&kernel_path)?;
+
     // Detect UART type from kernel (needed for initramfs device nodes)
-    vm.detect_uart_type(&kernel_path)?;
+    vm.detect_uart_type(&kernel_data);
 
     // Check kernel capabilities to decide rootfs strategy
-    let kernel_path = &kernel_path;
-    let kernel_data = std::fs::read(kernel_path)?;
     let has_virtio_blk = kernel_data.windows(10).any(|w| w == b"virtio_blk");
     // Check if the kernel explicitly lacks initramfs support
     // (only the Firecracker kernel is known to lack it — detected by having virtio_blk but no initrd strings)
@@ -1599,7 +1536,7 @@ pub fn run(args: Args) -> Result<()> {
     vm.virtio_rng = Some(VirtioRngDevice::new());
 
     // Load kernel (this also builds the device tree, which needs initrd info)
-    vm.load_kernel(kernel_path)?;
+    vm.load_kernel(&kernel_data)?;
 
     // Run the VM
     let exit_code = vm.run_command(&args.command)?;

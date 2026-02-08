@@ -55,6 +55,19 @@ pub enum HvReg {
     Cpsr = 34, // Current Program Status Register
 }
 
+impl HvReg {
+    /// Convert a general-purpose register index (0-30) to the corresponding HvReg.
+    /// Returns None for index 31 (XZR / zero register) or out-of-range values.
+    pub fn from_gpr(index: u8) -> Option<Self> {
+        if index <= 30 {
+            // Safety: HvReg is #[repr(u32)] with values 0-30 mapping to X0-Lr sequentially.
+            Some(unsafe { std::mem::transmute::<u32, HvReg>(index as u32) })
+        } else {
+            None
+        }
+    }
+}
+
 // CPU registers - x86_64 architecture
 #[repr(u32)]
 #[allow(dead_code)]
