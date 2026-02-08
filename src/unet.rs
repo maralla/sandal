@@ -4,7 +4,7 @@ use anyhow::Result;
 /// Provides VM networking **without root privileges** by proxying
 /// guest TCP/UDP/ICMP through host-side BSD sockets.
 ///
-/// Virtual network layout (matches QEMU SLIRP defaults):
+/// Virtual network layout:
 ///   Guest:   10.0.2.15
 ///   Gateway: 10.0.2.2
 ///   DNS:     10.0.2.3

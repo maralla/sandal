@@ -27,7 +27,7 @@ impl DeviceTree {
         }
     }
 
-    /// Build a complete device tree for QEMU-virt-like ARM64 machine
+    /// Build a complete device tree for ARM64 virtual machine
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         memory_size: u64,

@@ -50,7 +50,7 @@ impl Vm {
             hv_gic_get_redistributor_base_alignment_wrapper(&mut redist_align);
         }
 
-        // Use QEMU-compatible addresses, aligned to HVF requirements
+        // GIC addresses, aligned to HVF requirements
         let gic_dist_base: u64 = 0x08000000;
         // Align redistributor base to HVF's required alignment
         let redist_base_unaligned = gic_dist_base + dist_size as u64;

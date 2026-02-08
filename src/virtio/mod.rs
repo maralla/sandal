@@ -11,7 +11,8 @@ pub mod rng;
 // Virtio MMIO magic value ("virt")
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
 pub const VIRTIO_MMIO_VERSION: u32 = 2;
-pub const VIRTIO_MMIO_VENDOR: u32 = 0x554D4551; // QEMU vendor ID
+// "QEMU" in ASCII — the de-facto standard vendor ID recognized by Linux virtio drivers.
+pub const VIRTIO_MMIO_VENDOR: u32 = 0x554D4551;
 
 // Virtio MMIO register offsets
 pub const REG_MAGIC_VALUE: u64 = 0x000;
@@ -59,9 +60,9 @@ pub struct VirtqState {
     pub num_max: u32, // Max queue size
     pub num: u32,     // Current queue size (set by driver)
     pub ready: bool,
-    pub desc_addr: u64,  // GPA of descriptor table
-    pub avail_addr: u64, // GPA of available ring
-    pub used_addr: u64,  // GPA of used ring
+    pub desc_addr: u64,  // Guest physical address of descriptor table
+    pub avail_addr: u64, // Guest physical address of available ring
+    pub used_addr: u64,  // Guest physical address of used ring
     pub last_avail_idx: u16,
 }
 

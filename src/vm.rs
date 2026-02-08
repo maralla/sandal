@@ -13,35 +13,76 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 
-const RAM_BASE: u64 = 0x40000000; // Match QEMU virt machine
-const KERNEL_OFFSET: u64 = 0x80000; // Kernel at RAM + 512KB (standard ARM64 load addr)
-const DTB_OFFSET: u64 = 0x8000000; // DTB at RAM + 128MB (well after kernel)
-const INITRD_OFFSET: u64 = 0x8100000; // Initrd at RAM + 129MB (after DTB)
-const UART_BASE: u64 = 0x09000000; // UART base (PL011 or 8250, auto-detected)
+// ARM64 guest physical memory layout.
+// All addresses are GPAs (Guest Physical Addresses) — the address space as seen by the
+// guest VM. Addresses below RAM_BASE are reserved for MMIO (Memory-Mapped I/O) device
+// registers (GIC, UART, virtio), and guest RAM is placed above them. The device tree
+// describes this layout to the kernel.
+#[cfg(target_arch = "aarch64")]
+mod mem_layout {
+    // Guest RAM base address, placed above the MMIO region.
+    pub const RAM_BASE: u64 = 0x40000000;
+    // Default text_offset from the Linux ARM64 boot protocol, specifying the kernel
+    // entry point offset from the start of RAM.
+    // See: https://www.kernel.org/doc/Documentation/arm64/booting.txt
+    pub const KERNEL_OFFSET: u64 = 0x80000;
+    // DTB (Device Tree Blob) describes the VM hardware to the kernel, loaded at
+    // RAM_BASE + DTB_OFFSET, well past the kernel to avoid overlap.
+    pub const DTB_OFFSET: u64 = 0x8000000;
+    // Initial ramdisk (initramfs) loaded at RAM_BASE + INITRD_OFFSET. Contains the
+    // root filesystem packed as a cpio archive, immediately after the DTB region.
+    pub const INITRD_OFFSET: u64 = 0x8100000;
+    // UART (Universal Asynchronous Receiver-Transmitter) MMIO absolute address (not
+    // an offset from RAM_BASE). Guest
+    // writes here are intercepted and forwarded to the host terminal for all guest I/O.
+    pub const UART_BASE: u64 = 0x09000000;
 
-// Virtio-net MMIO region (follows QEMU virt convention)
-const VIRTIO_NET_BASE: u64 = 0x0A000000;
-const VIRTIO_NET_SIZE: u64 = 0x200;
-const VIRTIO_NET_SPI: u32 = 16; // GIC SPI 16 (GIC intid = 48)
+    // Virtio MMIO device regions (absolute addresses, not offsets from RAM_BASE).
+    // Each device gets a 512-byte register region for control/data and a unique
+    // GIC (Generic Interrupt Controller) SPI (Shared Peripheral Interrupt) number so
+    // the kernel can identify which device triggered an interrupt.
+    // The base addresses and SPI numbers are arbitrary as long as they don't overlap
+    // with each other or other devices, and match the device tree. The 0x200 size is
+    // the minimum required to cover all virtio MMIO registers per the virtio spec.
+    pub const VIRTIO_NET_BASE: u64 = 0x0A000000;
+    pub const VIRTIO_NET_SIZE: u64 = 0x200;
+    pub const VIRTIO_NET_SPI: u32 = 16;
 
-// Virtio-blk MMIO region
-const VIRTIO_BLK_BASE: u64 = 0x0A000200;
-const VIRTIO_BLK_SIZE: u64 = 0x200;
-const VIRTIO_BLK_SPI: u32 = 17; // GIC SPI 17
+    pub const VIRTIO_BLK_BASE: u64 = 0x0A000200;
+    pub const VIRTIO_BLK_SIZE: u64 = 0x200;
+    pub const VIRTIO_BLK_SPI: u32 = 17;
 
-// Virtio-rng MMIO region
-const VIRTIO_RNG_BASE: u64 = 0x0A000400;
-const VIRTIO_RNG_SIZE: u64 = 0x200;
-const VIRTIO_RNG_SPI: u32 = 18; // GIC SPI 18
+    pub const VIRTIO_RNG_BASE: u64 = 0x0A000400;
+    pub const VIRTIO_RNG_SIZE: u64 = 0x200;
+    pub const VIRTIO_RNG_SPI: u32 = 18;
 
-// UART 8250 interrupt (SPI 1 in DTB → GIC SPI 1)
-const UART_SPI: u32 = 1;
+    pub const UART_SPI: u32 = 1;
+}
+
+use mem_layout::*;
+
+/// Interrupt state for the 8250/16550 UART emulation.
+#[derive(Debug, Default)]
+pub(crate) struct Uart8250State {
+    /// Interrupt Enable Register: bit 0 = receive data available, bit 1 = THRE.
+    ier: u8,
+    /// Transmit Holding Register (THR) was written; a THRE (Transmit Holding Register
+    /// Empty) interrupt will be raised after the ISR exits.
+    thr_written: bool,
+    /// THRE interrupt is pending, ready to be reported via IIR (Interrupt Identification
+    /// Register).
+    thre_pending: bool,
+    /// SPI has been asserted to the GIC, waiting for the ISR to acknowledge by reading IIR.
+    irq_asserted: bool,
+}
 
 /// UART type detected from the kernel binary
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug)]
 pub enum UartType {
-    PL011,    // ARM PL011 (used by Debian/Ubuntu kernels, QEMU default)
-    Uart8250, // 8250/16550 (used by Firecracker, minimal kernels)
+    /// ARM PL011 UART, the standard ARM serial controller.
+    PL011,
+    /// 8250/16550-compatible UART, the legacy PC serial standard.
+    Uart8250(Uart8250State),
 }
 
 pub struct VmInstance {
@@ -50,141 +91,73 @@ pub struct VmInstance {
     memory_size: usize,
     uart_type: UartType,
     kernel_entry: u64,
-    initrd_info: Option<(u64, u64)>, // (start_gpa, end_gpa)
+    initrd_info: Option<(u64, u64)>, // (start GPA, end GPA)
     exit_code: Option<i32>,          // Set when guest signals exit via UART marker
     boot_complete: bool,             // Set once kernel finishes booting and init runs
     uart_line_buf: String,           // Buffer for current line being received
+    uart_suppress_line: bool,        // True if rest of line is suppressed (kernel/marker)
+    uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read (shared by both UART types)
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
     virtio_rng: Option<VirtioRngDevice>,
     use_virtio_blk: bool,
-    uart_ier: u8,              // 8250 IER: bit 1 = THRE interrupt enable
-    uart_thr_written: bool,    // 8250: THR was written, THRE will be raised after ISR exits
-    uart_thre_pending: bool,   // 8250: THRE interrupt needs to be delivered (ready for IIR)
-    uart_irq_asserted: bool,   // 8250: SPI has been asserted, waiting for ISR to read IIR
-    uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read
-    uart_suppress_line: bool,  // True if rest of line is suppressed (kernel/marker)
 }
 
 // ============= Terminal raw mode =============
 
 mod termios {
-    use std::os::fd::RawFd;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct Termios {
-        pub c_iflag: u64,
-        pub c_oflag: u64,
-        pub c_cflag: u64,
-        pub c_lflag: u64,
-        pub c_cc: [u8; 20],
-        pub c_ispeed: u64,
-        pub c_ospeed: u64,
-    }
-
-    // macOS ioctl constants
-    // TIOCGETA = _IOR('t', 19, struct termios) = 0x40487413
-    // TIOCSETA = _IOW('t', 20, struct termios) = 0x80487414
-    const TIOCGETA: u64 = 0x40487413;
-    const TIOCSETA: u64 = 0x80487414;
-
-    // c_lflag bits
-    pub const ECHO: u64 = 0x00000008;
-    pub const ICANON: u64 = 0x00000100;
-    pub const ISIG: u64 = 0x00000080;
-    pub const IEXTEN: u64 = 0x00000400;
-
-    // c_iflag bits
-    pub const ICRNL: u64 = 0x00000100;
-    pub const IXON: u64 = 0x00000200;
-
-    // c_cc indices
-    pub const VMIN: usize = 16;
-    pub const VTIME: usize = 17;
-
-    extern "C" {
-        fn ioctl(fd: RawFd, request: u64, ...) -> i32;
-    }
-
-    pub fn get_termios(fd: RawFd) -> Option<Termios> {
-        unsafe {
-            let mut t: Termios = std::mem::zeroed();
-            if ioctl(fd, TIOCGETA, &mut t as *mut Termios) == 0 {
-                Some(t)
-            } else {
-                None
-            }
-        }
-    }
-
-    pub fn set_termios(fd: RawFd, t: &Termios) -> bool {
-        unsafe { ioctl(fd, TIOCSETA, t as *const Termios) == 0 }
-    }
+    use super::RawFd;
 
     /// Put the terminal in raw mode: disable echo, canonical mode, signals.
     /// Returns the original termios for restoring later.
-    pub fn enable_raw_mode(fd: RawFd) -> Option<Termios> {
-        let orig = get_termios(fd)?;
-        let mut raw = orig;
-        raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
-        raw.c_iflag &= !(ICRNL | IXON);
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        set_termios(fd, &raw);
-        Some(orig)
+    pub fn enable_raw_mode(fd: RawFd) -> Option<libc::termios> {
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut orig) != 0 {
+                return None;
+            }
+            let mut raw = orig;
+            raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN);
+            raw.c_iflag &= !(libc::ICRNL | libc::IXON);
+            raw.c_cc[libc::VMIN] = 1;
+            raw.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            Some(orig)
+        }
     }
 
-    pub fn restore_mode(fd: RawFd, orig: &Termios) {
-        set_termios(fd, orig);
+    pub fn restore_mode(fd: RawFd, orig: &libc::termios) {
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, orig);
+        }
     }
 }
-
-extern "C" {
-    fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
-    fn isatty(fd: RawFd) -> i32;
-    fn read(fd: RawFd, buf: *mut u8, count: usize) -> isize;
-    fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
-}
-
-#[repr(C)]
-struct PollFd {
-    fd: RawFd,
-    events: i16,
-    revents: i16,
-}
-
-const POLLIN: i16 = 0x0001;
-
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-const O_NONBLOCK: i32 = 0x0004;
 
 fn set_nonblocking(fd: RawFd) {
     unsafe {
-        let flags = fcntl(fd, F_GETFL);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 }
 
 fn set_blocking(fd: RawFd) {
     unsafe {
-        let flags = fcntl(fd, F_GETFL);
-        fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
     }
 }
 
 /// Block until stdin has data available (or error/hangup).
 /// Returns > 0 if data ready, 0 on timeout (shouldn't happen), < 0 on error.
 fn poll_stdin_once(fd: RawFd) -> i32 {
-    let mut pfd = PollFd {
+    let mut pfd = libc::pollfd {
         fd,
-        events: POLLIN,
+        events: libc::POLLIN,
         revents: 0,
     };
     // Block up to 1 second then re-check (allows thread to notice shutdown)
-    unsafe { poll(&mut pfd, 1, 1000) }
+    unsafe { libc::poll(&mut pfd, 1, 1000) }
 }
 
 impl VmInstance {
@@ -266,6 +239,11 @@ impl VmInstance {
         }
     }
 
+    /// Returns true if using the 8250 UART.
+    fn is_uart_8250(&self) -> bool {
+        matches!(self.uart_type, UartType::Uart8250(_))
+    }
+
     pub fn new(memory_mb: usize) -> Result<Self> {
         // Initialize hypervisor
         hypervisor::init().context("Failed to initialize hypervisor")?;
@@ -281,23 +259,19 @@ impl VmInstance {
             vm,
             memory,
             memory_size,
-            uart_type: UartType::PL011, // Default, auto-detected in load_kernel
+            uart_type: UartType::PL011, // Default, auto-detected in detect_uart_type
             kernel_entry: 0,
             initrd_info: None,
             exit_code: None,
             boot_complete: false,
             uart_line_buf: String::new(),
+            uart_suppress_line: false,
+            uart_rx_buf: VecDeque::new(),
             network_enabled: false,
             virtio_net: None,
             virtio_blk: None,
             virtio_rng: None,
             use_virtio_blk: false,
-            uart_ier: 0,
-            uart_thr_written: false,
-            uart_thre_pending: false,
-            uart_irq_asserted: false,
-            uart_rx_buf: VecDeque::new(),
-            uart_suppress_line: false,
         })
     }
 
@@ -310,7 +284,7 @@ impl VmInstance {
             || kernel_data.windows(10).any(|w| w == b"serial8250");
 
         if has_8250 && !has_pl011 {
-            self.uart_type = UartType::Uart8250;
+            self.uart_type = UartType::Uart8250(Uart8250State::default());
         } else {
             self.uart_type = UartType::PL011;
         }
@@ -325,7 +299,7 @@ impl VmInstance {
     pub fn setup(&mut self) -> Result<()> {
         let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
 
-        // Map main memory at 0x40000000 (QEMU virt machine layout)
+        // Map main memory
         self.vm
             .map_memory(
                 self.memory.as_mut_ptr() as *mut std::ffi::c_void,
@@ -344,15 +318,8 @@ impl VmInstance {
     }
 
     pub fn load_kernel(&mut self, kernel_path: &std::path::Path) -> Result<()> {
-        // === QEMU-style boot sequence ===
-        // 1. Write bootloader stub at RAM_BASE (offset 0)
-        // 2. Load kernel at RAM_BASE + 0x80000
-        // 3. Load DTB at RAM_BASE + DTB_OFFSET
-        // 4. Fix up bootloader with absolute addresses
-
-        // Step 1: Write QEMU's bootloader at offset 0
-        // This bootloader sets up X0 (DTB), clears X1-X3, jumps to kernel
-        // From QEMU hw/arm/boot.c bootloader_aarch64[]
+        // Write bootloader stub at RAM_BASE
+        // Sets up X0 (DTB pointer), clears X1-X3, then jumps to kernel
         let bootloader: [u32; 10] = [
             0x580000c0, // ldr x0, [pc, #0x18]  → load DTB address
             0xaa1f03e1, // mov x1, xzr
@@ -465,7 +432,7 @@ impl VmInstance {
         } else {
             None
         };
-        let use_8250 = self.uart_type == UartType::Uart8250;
+        let use_8250 = self.is_uart_8250();
         let dtb = DeviceTree::build(
             self.memory_size as u64,
             UART_BASE,
@@ -507,7 +474,7 @@ impl VmInstance {
         let vcpu = Vcpu::new().context("Failed to create vCPU")?;
         debug!("vCPU created (ID: {})", vcpu.id());
 
-        // === Configure VCPU state (matching QEMU's boot sequence) ===
+        // Configure VCPU state
 
         // PC → bootloader at RAM_BASE
         let bootloader_gpa = RAM_BASE;
@@ -563,7 +530,7 @@ impl VmInstance {
         // Put the terminal in raw mode so we can forward stdin to the guest
         // character-by-character (needed for interactive programs like Python REPL).
         let stdin_fd = std::io::stdin().as_raw_fd();
-        let stdin_is_tty = unsafe { isatty(stdin_fd) } != 0;
+        let stdin_is_tty = unsafe { libc::isatty(stdin_fd) } != 0;
         let orig_termios = if stdin_is_tty {
             let orig = termios::enable_raw_mode(stdin_fd);
             set_nonblocking(stdin_fd);
@@ -890,14 +857,13 @@ impl VmInstance {
             self.poll_stdin(stdin_fd, &mut stdin_eof);
 
             // Fire UART interrupt if any source is pending
-            if self.uart_type == UartType::Uart8250 {
-                let rx_pending = !self.uart_rx_buf.is_empty() && (self.uart_ier & 0x01) != 0;
-                let tx_pending = self.uart_thre_pending
-                    && (self.uart_ier & 0x02) != 0
-                    && !self.uart_irq_asserted;
+            if let UartType::Uart8250(ref mut state) = self.uart_type {
+                let rx_pending = !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0;
+                let tx_pending =
+                    state.thre_pending && (state.ier & 0x02) != 0 && !state.irq_asserted;
                 if rx_pending || tx_pending {
                     if tx_pending {
-                        self.uart_irq_asserted = true;
+                        state.irq_asserted = true;
                     }
                     Vm::set_gic_spi(UART_SPI, true);
                 }
@@ -978,7 +944,7 @@ impl VmInstance {
             return;
         }
         let mut buf = [0u8; 256];
-        let n = unsafe { read(stdin_fd, buf.as_mut_ptr(), buf.len()) };
+        let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n > 0 {
             for &b in &buf[..n as usize] {
                 self.uart_rx_buf.push_back(b);
@@ -1153,24 +1119,26 @@ impl VmInstance {
                         }
                     }
                     // Mark that THR was written; THRE will fire after the ISR exits
-                    if self.uart_type == UartType::Uart8250 {
-                        self.uart_thr_written = true;
+                    if let UartType::Uart8250(ref mut state) = self.uart_type {
+                        state.thr_written = true;
                     }
-                } else if reg_offset == 0x04 && self.uart_type == UartType::Uart8250 {
-                    // IER write — track interrupt enable state
-                    let old_ier = self.uart_ier;
-                    self.uart_ier = value as u8;
-                    // If THRE interrupt just enabled, set pending immediately
-                    // (TX holding register is always empty in our emulation)
-                    if (old_ier & 0x02) == 0 && (self.uart_ier & 0x02) != 0 {
-                        self.uart_thre_pending = true;
+                } else if reg_offset == 0x04 {
+                    if let UartType::Uart8250(ref mut state) = self.uart_type {
+                        // IER write — track interrupt enable state
+                        let old_ier = state.ier;
+                        state.ier = value as u8;
+                        // If THRE interrupt just enabled, set pending immediately
+                        // (TX holding register is always empty in our emulation)
+                        if (old_ier & 0x02) == 0 && (state.ier & 0x02) != 0 {
+                            state.thre_pending = true;
+                        }
                     }
                 }
                 // Other UART registers (control, baud rate, etc.) - ignored
             } else {
                 // UART read — handle both PL011 and 8250 register layouts
                 let has_rx_data = !self.uart_rx_buf.is_empty();
-                let value = if self.uart_type == UartType::Uart8250 {
+                let value = if let UartType::Uart8250(ref mut state) = self.uart_type {
                     // 8250/16550 registers (reg-shift=2, so 4-byte aligned)
                     match reg_offset {
                         0x00 => {
@@ -1179,30 +1147,30 @@ impl VmInstance {
                             // is drained (checked via is_empty() in the IIR path).
                             self.uart_rx_buf.pop_front().unwrap_or(0) as u64
                         }
-                        0x04 => self.uart_ier as u64, // IER: return current state
+                        0x04 => state.ier as u64, // IER: return current state
                         0x08 => {
                             // IIR (Interrupt Identification Register)
                             // Priority: RX data ready > THRE
-                            if !self.uart_rx_buf.is_empty() && (self.uart_ier & 0x01) != 0 {
+                            if !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0 {
                                 // RX data available (ID bits = 10, highest priority).
                                 // Reading IIR does NOT clear this — reading RBR does.
                                 0xC4u64 // FIFO enabled + RX data available
-                            } else if self.uart_thre_pending && (self.uart_ier & 0x02) != 0 {
+                            } else if state.thre_pending && (state.ier & 0x02) != 0 {
                                 // THRE interrupt pending → report it, clear, and deassert SPI
-                                self.uart_thre_pending = false;
-                                self.uart_irq_asserted = false;
+                                state.thre_pending = false;
+                                state.irq_asserted = false;
                                 Vm::set_gic_spi(UART_SPI, false);
                                 0xC2u64 // FIFO enabled + THRE (ID bits = 01)
                             } else {
                                 // No interrupt pending — deassert the SPI line so
                                 // the GIC doesn't re-trigger after EOI.
                                 Vm::set_gic_spi(UART_SPI, false);
-                                self.uart_irq_asserted = false;
+                                state.irq_asserted = false;
                                 // If a THR was written, promote it to THRE pending
                                 // for the NEXT interrupt cycle.
-                                if self.uart_thr_written {
-                                    self.uart_thr_written = false;
-                                    self.uart_thre_pending = true;
+                                if state.thr_written {
+                                    state.thr_written = false;
+                                    state.thre_pending = true;
                                 }
                                 0xC1u64 // FIFO enabled + no interrupt pending
                             }
@@ -1585,7 +1553,7 @@ pub fn run(args: Args) -> Result<()> {
     };
     let rootfs_arg = args.rootfs.as_ref().or(default_rootfs.as_ref());
 
-    let use_8250 = vm.uart_type == UartType::Uart8250;
+    let use_8250 = vm.is_uart_8250();
     if let Some(rootfs_path) = rootfs_arg {
         if !rootfs_path.is_dir() {
             anyhow::bail!("--rootfs path {rootfs_path:?} is not a directory");
