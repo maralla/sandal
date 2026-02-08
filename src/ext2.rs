@@ -62,6 +62,7 @@ pub fn build_ext2_from_directory(
     command: &[String],
     network: bool,
     use_8250_uart: bool,
+    shares: &[(String, String)],
 ) -> Result<Vec<u8>> {
     let mut builder = Ext2Builder::new();
 
@@ -102,8 +103,12 @@ pub fn build_ext2_from_directory(
     builder.ensure_dir(ROOT_INO, "usr/sbin");
     builder.add_file_data(ROOT_INO, "usr/sbin/seed-entropy", &seeder_bin, 0o755);
 
+    // Inject ctty helper binary (sets up controlling terminal for interactive shells)
+    let ctty_bin = crate::initramfs::generate_ctty_helper();
+    builder.add_file_data(ROOT_INO, "usr/sbin/sandal-ctty", &ctty_bin, 0o755);
+
     // Generate and inject /init script
-    let init_script = crate::initramfs::generate_init_script_ext(command, network);
+    let init_script = crate::initramfs::generate_init_script_ext(command, network, shares);
     builder.add_file_data(ROOT_INO, "init", init_script.as_bytes(), 0o755);
 
     // Build the image

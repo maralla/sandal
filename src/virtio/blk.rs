@@ -99,6 +99,9 @@ impl VirtioBlkDevice {
             }
             REG_INTERRUPT_STATUS => self.interrupt_status,
             REG_STATUS => self.status,
+            // Shared memory region: length = ~0 means no SHM available
+            REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
+            REG_SHM_BASE_LOW | REG_SHM_BASE_HIGH => 0,
             REG_CONFIG_GENERATION => self.config_generation,
 
             // Config space: virtio_blk_config

@@ -40,6 +40,7 @@ impl DeviceTree {
         virtio_net: Option<(u64, u32)>,
         virtio_blk: Option<(u64, u32)>,
         virtio_rng: Option<(u64, u32)>,
+        virtiofs: &[(u64, u32)],
         use_8250_uart: bool,
         verbose: bool,
     ) -> Result<Vec<u8>> {
@@ -250,6 +251,24 @@ impl DeviceTree {
             let mut virq = Vec::new();
             virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
             virq.extend_from_slice(&rng_spi.to_be_bytes());
+            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
+            dt.prop_bytes("interrupts", &virq);
+            dt.prop_empty("dma-coherent");
+            dt.end_node();
+        }
+
+        // Virtiofs MMIO nodes (shared filesystem devices)
+        for &(fs_base, fs_spi) in virtiofs {
+            let node_name = format!("virtio_mmio@{fs_base:x}");
+            dt.begin_node(&node_name);
+            dt.prop_string("compatible", "virtio,mmio");
+            let mut vreg = Vec::new();
+            vreg.extend_from_slice(&fs_base.to_be_bytes());
+            vreg.extend_from_slice(&0x200u64.to_be_bytes());
+            dt.prop_bytes("reg", &vreg);
+            let mut virq = Vec::new();
+            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
+            virq.extend_from_slice(&fs_spi.to_be_bytes());
             virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
             dt.prop_bytes("interrupts", &virq);
             dt.prop_empty("dma-coherent");

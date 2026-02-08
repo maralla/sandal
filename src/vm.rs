@@ -4,6 +4,7 @@ use crate::hypervisor::{
     self, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
 };
 use crate::virtio::blk::VirtioBlkDevice;
+use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 use anyhow::{Context, Result};
@@ -56,6 +57,13 @@ mod mem_layout {
     pub const VIRTIO_RNG_SIZE: u64 = 0x200;
     pub const VIRTIO_RNG_SPI: u32 = 18;
 
+    // Virtiofs (FUSE over virtio) MMIO regions. Up to MAX_FS_DEVICES shared
+    // directories can be mounted, each getting its own virtio device.
+    pub const VIRTIOFS_BASE_START: u64 = 0x0A000600;
+    pub const VIRTIOFS_SIZE: u64 = 0x200;
+    pub const VIRTIOFS_SPI_START: u32 = 19;
+    pub const MAX_FS_DEVICES: usize = 8;
+
     pub const UART_SPI: u32 = 1;
 }
 
@@ -76,11 +84,21 @@ pub(crate) struct Uart8250State {
     irq_asserted: bool,
 }
 
+/// Interrupt state for the PL011 UART emulation.
+#[derive(Debug, Default)]
+pub(crate) struct Pl011State {
+    /// IMSC (Interrupt Mask Set/Clear): bits set here enable the corresponding interrupt.
+    ///   Bit 4: RXIM (receive)
+    ///   Bit 5: TXIM (transmit)
+    ///   Bit 6: RTIM (receive timeout)
+    imsc: u32,
+}
+
 /// UART type detected from the kernel binary
 #[derive(Debug)]
 pub enum UartType {
     /// ARM PL011 UART, the standard ARM serial controller.
-    PL011,
+    PL011(Pl011State),
     /// 8250/16550-compatible UART, the legacy PC serial standard.
     Uart8250(Uart8250State),
 }
@@ -101,6 +119,7 @@ pub struct VmInstance {
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
     virtio_rng: Option<VirtioRngDevice>,
+    virtiofs: Vec<VirtioFsDevice>,
     use_virtio_blk: bool,
 }
 
@@ -148,16 +167,23 @@ fn set_blocking(fd: RawFd) {
     }
 }
 
-/// Block until stdin has data available (or error/hangup).
-/// Returns > 0 if data ready, 0 on timeout (shouldn't happen), < 0 on error.
-fn poll_stdin_once(fd: RawFd) -> i32 {
+/// Poll stdin for data or hangup.
+/// Returns (ready, hungup) — `ready` is true if POLLIN is set,
+/// `hungup` is true if POLLHUP is set (pipe write-end closed).
+fn poll_stdin_once(fd: RawFd) -> (bool, bool) {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
     // Block up to 1 second then re-check (allows thread to notice shutdown)
-    unsafe { libc::poll(&mut pfd, 1, 1000) }
+    let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+    if n < 0 {
+        return (false, true); // error → treat as hangup
+    }
+    let ready = (pfd.revents & libc::POLLIN) != 0;
+    let hungup = (pfd.revents & libc::POLLHUP) != 0;
+    (ready, hungup)
 }
 
 impl VmInstance {
@@ -182,6 +208,26 @@ impl VmInstance {
         matches!(self.uart_type, UartType::Uart8250(_))
     }
 
+    /// Compute PL011 raw interrupt status from current hardware state.
+    ///   Bit 4: RXIS — RX FIFO has data
+    ///   Bit 5: TXIS — TX FIFO ready (always true — we process TX instantly)
+    fn pl011_ris(&self) -> u32 {
+        let mut ris = 1u32 << 5; // TXIS: TX always ready
+        if !self.uart_rx_buf.is_empty() {
+            ris |= 1 << 4; // RXIS: data available
+        }
+        ris
+    }
+
+    /// Update the GIC SPI level for PL011 based on current MIS.
+    /// Must be called whenever RIS or IMSC changes.
+    fn pl011_update_irq(&self) {
+        if let UartType::PL011(ref state) = self.uart_type {
+            let mis = self.pl011_ris() & state.imsc;
+            Vm::set_gic_spi(UART_SPI, mis != 0);
+        }
+    }
+
     pub fn new(memory_mb: usize) -> Result<Self> {
         // Initialize hypervisor
         hypervisor::init().context("Failed to initialize hypervisor")?;
@@ -197,7 +243,7 @@ impl VmInstance {
             vm,
             memory,
             memory_size,
-            uart_type: UartType::PL011, // Default, auto-detected in detect_uart_type
+            uart_type: UartType::PL011(Pl011State::default()), // Default, auto-detected in detect_uart_type
             kernel_entry: 0,
             initrd_info: None,
             exit_code: None,
@@ -209,6 +255,7 @@ impl VmInstance {
             virtio_net: None,
             virtio_blk: None,
             virtio_rng: None,
+            virtiofs: Vec::new(),
             use_virtio_blk: false,
         })
     }
@@ -223,7 +270,7 @@ impl VmInstance {
         if has_8250 && !has_pl011 {
             self.uart_type = UartType::Uart8250(Uart8250State::default());
         } else {
-            self.uart_type = UartType::PL011;
+            self.uart_type = UartType::PL011(Pl011State::default());
         }
 
         debug!(
@@ -368,6 +415,19 @@ impl VmInstance {
             None
         };
 
+        // Collect virtiofs device tree entries
+        let virtiofs_dt: Vec<(u64, u32)> = self
+            .virtiofs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (
+                    VIRTIOFS_BASE_START + (i as u64) * VIRTIOFS_SIZE,
+                    VIRTIOFS_SPI_START + i as u32,
+                )
+            })
+            .collect();
+
         let use_8250 = self.is_uart_8250();
         let dtb = DeviceTree::build(
             self.memory_size as u64,
@@ -380,6 +440,7 @@ impl VmInstance {
             virtio_net_dt,
             virtio_blk_dt,
             virtio_rng_dt,
+            &virtiofs_dt,
             use_8250,
             log::log_enabled!(log::Level::Debug),
         )?;
@@ -479,29 +540,42 @@ impl VmInstance {
         // Spawn an event-driven I/O poller thread. It monitors host-side
         // sockets (and stdin) via kqueue and kicks the vcpu (hv_vcpus_exit)
         // only when data actually arrives.  Without this, a tickless kernel
-        // (NO_HZ) may idle the vtimer for seconds, stalling network I/O and
-        // interactive input.
+        // (NO_HZ) may idle the vcpu in WFI indefinitely, stalling network
+        // I/O and interactive input.
         //
         // When networking is enabled we use the NetPoller (which already has
         // kqueue set up for network sockets).  Otherwise we create a minimal
         // stdin-only poller.
+        //
+        // The stdin poller is always created (TTY or pipe) so that the vcpu
+        // wakes from WFI when input arrives.  For pipes the poller exits
+        // cleanly on POLLHUP; for TTYs it runs until the process ends.
+        // Spawn a stdin poller thread that kicks the vcpu when stdin has
+        // data.  Without this, a tickless kernel (NO_HZ_FULL) may park the
+        // vcpu in WFI indefinitely, stalling interactive input.
+        //
+        // For TTYs registered with the NetPoller's kqueue this is
+        // redundant but harmless (two wakeup sources for the same event).
+        // For pipes/redirects the kqueue-based NetPoller can spin (the
+        // pipe fd reports always-readable on macOS kqueue), so a
+        // poll()-based poller is the only reliable approach.
+        let stdin_poller_thread = {
+            let vcpu_id = vcpu.id();
+            Some(std::thread::spawn(move || {
+                Self::stdin_poller(vcpu_id, stdin_fd);
+            }))
+        };
+
         let net_poller_thread = if let Some(ref mut net) = self.virtio_net {
             let poller = net.create_poller(vcpu.id());
-            // Register stdin so keypresses kick the vcpu (TTY only —
-            // /dev/null and closed pipes report as always-readable which
-            // would spin the poller and starve the vcpu).
+            // Register stdin with kqueue so keypresses kick the vcpu
+            // (TTY only — pipes report as always-readable on kqueue
+            // which would spin the poller).
             if stdin_is_tty {
                 let fd_tx = poller.fd_sender();
                 fd_tx.send(stdin_fd).ok();
             }
             Some(std::thread::spawn(move || poller.run()))
-        } else if stdin_is_tty {
-            // No networking — create a minimal stdin poller that kicks the
-            // vcpu when the user types (TTY only).
-            let vcpu_id = vcpu.id();
-            Some(std::thread::spawn(move || {
-                Self::stdin_poller(vcpu_id, stdin_fd);
-            }))
         } else {
             None
         };
@@ -789,8 +863,13 @@ impl VmInstance {
                 }
             }
 
-            // Poll stdin for input and buffer it for the guest UART
-            self.poll_stdin(stdin_fd, &mut stdin_eof);
+            // Poll stdin for input and buffer it for the guest UART.
+            // Delay until boot completes so piped data isn't consumed by
+            // the kernel's console driver during init (PL011 polls DR
+            // during probe, draining any buffered characters).
+            if self.boot_complete {
+                self.poll_stdin(stdin_fd, &mut stdin_eof);
+            }
 
             // Fire UART interrupt if any source is pending
             if let UartType::Uart8250(ref mut state) = self.uart_type {
@@ -803,6 +882,10 @@ impl VmInstance {
                     }
                     Vm::set_gic_spi(UART_SPI, true);
                 }
+            } else {
+                // PL011: update IRQ level based on current state.
+                // Asserts SPI when MIS != 0, deasserts when MIS == 0.
+                self.pl011_update_irq();
             }
 
             // Poll network backend and deliver incoming packets to guest RX queue
@@ -836,6 +919,10 @@ impl VmInstance {
         if let Some(t) = net_poller_thread {
             t.join().ok();
         }
+        // The stdin poller thread exits on POLLHUP (pipe closed) or when
+        // the process is exiting. We don't join it — it's harmless to
+        // let it be cleaned up on process exit.
+        drop(stdin_poller_thread);
 
         // Flush any remaining partial line in the UART buffer
         if !self.uart_line_buf.is_empty() {
@@ -857,18 +944,17 @@ impl VmInstance {
 
     /// Minimal poller for stdin when networking is disabled.
     /// Uses poll() to block until stdin has data, then kicks the vcpu.
-    /// Exits when stdin reaches EOF or an error occurs.
+    /// Exits when stdin reaches EOF/POLLHUP or an error occurs.
     fn stdin_poller(vcpu_id: u32, stdin_fd: RawFd) {
         use crate::hypervisor::Vcpu;
         loop {
-            let n = poll_stdin_once(stdin_fd);
-            if n < 0 {
-                break; // error
-            }
-            if n > 0 {
+            let (ready, hungup) = poll_stdin_once(stdin_fd);
+            if ready || hungup {
                 Vcpu::force_exit(&[vcpu_id]).ok();
             }
-            // n == 0 → timeout, loop again
+            if hungup {
+                break;
+            }
         }
     }
 
@@ -1069,6 +1155,32 @@ impl VmInstance {
                             state.thre_pending = true;
                         }
                     }
+                } else if matches!(self.uart_type, UartType::PL011(_)) {
+                    let mut update_irq = false;
+                    if let UartType::PL011(ref mut state) = self.uart_type {
+                        match reg_offset {
+                            // IMSC (Interrupt Mask Set/Clear): enable/disable interrupt
+                            // sources.  Changing the mask can make MIS transition
+                            // to/from zero, so update the IRQ level afterward.
+                            0x38 => {
+                                state.imsc = value as u32;
+                                update_irq = true;
+                            }
+                            // ICR (Interrupt Clear Register): on real hardware,
+                            // write-1-to-clear latches in RIS.  Our RIS is purely
+                            // combinational (derived from buffer state), so ICR is
+                            // effectively a no-op.  We still update the IRQ level
+                            // in case the driver expects the SPI to deassert.
+                            0x44 => {
+                                update_irq = true;
+                            }
+                            // Other PL011 registers (LCR_H, CR, IFLS, etc.) - ignored
+                            _ => {}
+                        }
+                    }
+                    if update_irq {
+                        self.pl011_update_irq();
+                    }
                 }
                 // Other UART registers (control, baud rate, etc.) - ignored
             } else {
@@ -1128,15 +1240,30 @@ impl VmInstance {
                         0x1C => 0x00, // SCR: scratch
                         _ => 0x00,
                     }
-                } else {
-                    // PL011 registers
+                } else if let UartType::PL011(ref state) = self.uart_type {
+                    // PL011 registers (ARM PrimeCell UART)
+                    // RIS and MIS are computed dynamically from hardware state:
+                    //   Bit 4: RXIS — RX FIFO has data
+                    //   Bit 5: TXIS — TX FIFO ready (always true)
+                    let ris = self.pl011_ris();
+                    let mis = ris & state.imsc;
+
                     match reg_offset {
                         0x00 => {
-                            // DR: read the next byte from the input buffer
-                            self.uart_rx_buf.pop_front().unwrap_or(0) as u64
+                            // DR: read the next byte from the input buffer.
+                            // After popping, update IRQ level since RXIS may clear.
+                            let byte = self.uart_rx_buf.pop_front().unwrap_or(0) as u64;
+                            // Deassert SPI immediately if buffer is now empty and
+                            // no other masked interrupts remain, preventing an
+                            // interrupt storm between the ISR exit and main loop.
+                            if self.uart_rx_buf.is_empty() {
+                                self.pl011_update_irq();
+                            }
+                            byte
                         }
                         // FR (Flags Register):
                         //   Bit 4: RXFE (RX FIFO Empty)
+                        //   Bit 5: TXFF (TX FIFO Full) — never set
                         //   Bit 7: TXFE (TX FIFO Empty) — always set
                         0x18 => {
                             let mut fr = 0x80u64; // TXFE
@@ -1145,22 +1272,27 @@ impl VmInstance {
                             } // RXFE
                             fr
                         }
-                        0x2C => 0x00,   // LCR_H: line control
-                        0x30 => 0x0301, // CR: UART enabled, TX enabled, RX enabled
-                        0x38 => 0x00,   // IMSC: interrupt mask
-                        0x40 => 0x00,   // RIS: raw interrupt status
-                        0x44 => 0x00,   // MIS: masked interrupt status
-                        0x48 => 0x00,   // ICR: interrupt clear
-                        0xFE0 => 0x11,  // PeriphID0: PL011 identification
-                        0xFE4 => 0x10,  // PeriphID1
-                        0xFE8 => 0x34,  // PeriphID2: revision 3, PL011
-                        0xFEC => 0x00,  // PeriphID3
-                        0xFF0 => 0x0D,  // CellID0 (PrimeCell component ID)
-                        0xFF4 => 0xF0,  // CellID1
-                        0xFF8 => 0x05,  // CellID2
-                        0xFFC => 0xB1,  // CellID3
+                        0x24 => 0x00,              // IBRD: integer baud rate
+                        0x28 => 0x00,              // FBRD: fractional baud rate
+                        0x2C => 0x00,              // LCR_H: line control
+                        0x30 => 0x0301,            // CR: UART enabled, TX enabled, RX enabled
+                        0x34 => 0x12,              // IFLS: interrupt FIFO level (default 1/2)
+                        0x38 => state.imsc as u64, // IMSC: interrupt mask
+                        0x3C => ris as u64,        // RIS: raw interrupt status
+                        0x40 => mis as u64,        // MIS: masked interrupt status
+                        0x44 => 0x00,              // ICR: write-only, reads as 0
+                        0xFE0 => 0x11,             // PeriphID0: PL011 identification
+                        0xFE4 => 0x10,             // PeriphID1
+                        0xFE8 => 0x34,             // PeriphID2: revision 3, PL011
+                        0xFEC => 0x00,             // PeriphID3
+                        0xFF0 => 0x0D,             // CellID0 (PrimeCell component ID)
+                        0xFF4 => 0xF0,             // CellID1
+                        0xFF8 => 0x05,             // CellID2
+                        0xFFC => 0xB1,             // CellID3
                         _ => 0x00,
                     }
+                } else {
+                    0x00
                 };
                 Self::write_guest_register(vcpu, rt, value)?;
             }
@@ -1235,6 +1367,35 @@ impl VmInstance {
                     }
                 } else {
                     let value = rng.mmio_read(offset);
+                    Self::write_guest_register(vcpu, rt, value as u64)?;
+                }
+            } else if !is_write {
+                Self::write_guest_register(vcpu, rt, 0)?;
+            }
+        }
+        // Virtiofs MMIO regions (shared filesystem devices)
+        else if fault_addr >= VIRTIOFS_BASE_START
+            && fault_addr < VIRTIOFS_BASE_START + (MAX_FS_DEVICES as u64) * VIRTIOFS_SIZE
+        {
+            let dev_idx = ((fault_addr - VIRTIOFS_BASE_START) / VIRTIOFS_SIZE) as usize;
+            let dev_base = VIRTIOFS_BASE_START + (dev_idx as u64) * VIRTIOFS_SIZE;
+            let offset = fault_addr - dev_base;
+
+            if dev_idx < self.virtiofs.len() {
+                let spi = VIRTIOFS_SPI_START + dev_idx as u32;
+                let dev = &mut self.virtiofs[dev_idx];
+                if is_write {
+                    let value = Self::read_guest_register(vcpu, rt)? as u32;
+                    if let Some(queue_idx) = dev.mmio_write(offset, value) {
+                        if dev.process_queue(queue_idx, &mut self.memory, RAM_BASE) {
+                            Vm::set_gic_spi(spi, true);
+                        }
+                    }
+                    if offset == crate::virtio::REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
+                        Vm::set_gic_spi(spi, false);
+                    }
+                } else {
+                    let value = dev.mmio_read(offset);
                     Self::write_guest_register(vcpu, rt, value as u64)?;
                 }
             } else if !is_write {
@@ -1481,6 +1642,35 @@ pub fn run(args: Args) -> Result<()> {
     // confirm virtio-blk support AND cannot confirm initramfs support
     let prefer_virtio_blk = has_virtio_blk && !has_initrd_strings;
 
+    // Parse and set up shared directories (virtiofs)
+    let mut shares: Vec<(String, String)> = Vec::new(); // (mount_tag, guest_path)
+    for (i, share_spec) in args.shared_dirs.iter().enumerate() {
+        if i >= MAX_FS_DEVICES {
+            anyhow::bail!("Too many shared directories (max {})", MAX_FS_DEVICES);
+        }
+        let (host_str, guest_str) = share_spec.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid --share format: {share_spec:?} (expected host_path:guest_path)"
+            )
+        })?;
+        let host_path = std::path::PathBuf::from(host_str);
+        if !host_path.exists() {
+            anyhow::bail!("Shared path does not exist: {host_str:?}");
+        }
+        if !host_path.is_dir() {
+            anyhow::bail!(
+                "Shared path is not a directory: {host_str:?} (only directories are supported)"
+            );
+        }
+        let mount_tag = format!("share{i}");
+        let guest_path = guest_str.to_string();
+        let spi = VIRTIOFS_SPI_START + i as u32;
+        info!("Sharing {host_str:?} -> {guest_str} (tag={mount_tag})");
+        vm.virtiofs
+            .push(VirtioFsDevice::new(host_path, mount_tag.clone(), spi));
+        shares.push((mount_tag, guest_path));
+    }
+
     // Load initrd/rootfs (must be done before load_kernel, because load_kernel builds DTB)
     // Resolve rootfs path (default: rootfs)
     let default_rootfs = if args.rootfs.is_none() {
@@ -1504,6 +1694,7 @@ pub fn run(args: Args) -> Result<()> {
                 &args.command,
                 network_enabled,
                 use_8250,
+                &shares,
             )
             .context("Failed to build ext2 filesystem image")?;
             debug!(
@@ -1521,6 +1712,7 @@ pub fn run(args: Args) -> Result<()> {
                 &args.command,
                 network_enabled,
                 use_8250,
+                &shares,
             )
             .context("Failed to build initramfs from directory")?;
             vm.load_initrd(&initrd_data)?;

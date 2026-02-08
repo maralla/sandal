@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod blk;
+pub mod fs;
 /// Virtio MMIO transport implementation (virtio v2 / modern).
 ///
 /// Implements the virtio over MMIO transport as defined in the virtio spec §4.2.
@@ -37,6 +38,11 @@ pub const REG_QUEUE_DRIVER_LOW: u64 = 0x090;
 pub const REG_QUEUE_DRIVER_HIGH: u64 = 0x094;
 pub const REG_QUEUE_DEVICE_LOW: u64 = 0x0A0;
 pub const REG_QUEUE_DEVICE_HIGH: u64 = 0x0A4;
+pub const REG_SHM_SEL: u64 = 0x0AC; // Write: select shared memory region
+pub const REG_SHM_LEN_LOW: u64 = 0x0B0; // Read: shared memory region length (low 32 bits)
+pub const REG_SHM_LEN_HIGH: u64 = 0x0B4; // Read: shared memory region length (high 32 bits)
+pub const REG_SHM_BASE_LOW: u64 = 0x0B8; // Read: shared memory region base (low 32 bits)
+pub const REG_SHM_BASE_HIGH: u64 = 0x0BC; // Read: shared memory region base (high 32 bits)
 pub const REG_CONFIG_GENERATION: u64 = 0x0FC;
 pub const REG_CONFIG_BASE: u64 = 0x100;
 
