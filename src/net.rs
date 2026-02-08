@@ -90,6 +90,12 @@ impl NetworkFilter {
             return false;
         }
 
+        // Allow all traffic to the gateway IP (host-local services like proxies)
+        let dst_ip: [u8; 4] = ip_data[16..20].try_into().unwrap_or([0; 4]);
+        if dst_ip == crate::unet::GATEWAY_IP {
+            return true;
+        }
+
         let protocol = ip_data[9];
         let transport = &ip_data[ihl..];
 

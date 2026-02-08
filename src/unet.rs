@@ -747,10 +747,14 @@ impl UserNet {
         // Spawn a thread to connect (non-blocking from the VM loop's perspective)
         let tx = self.connect_tx.clone();
         let wakeup_fd = self.poller_wakeup_fd;
-        let dst_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])),
-            dst_port,
-        );
+        // Map the virtual gateway IP (10.0.2.2) to localhost so the guest
+        // can reach host-local services (e.g. HTTP proxies).
+        let host_ip = if dst_ip == GATEWAY_IP {
+            Ipv4Addr::LOCALHOST
+        } else {
+            Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])
+        };
+        let dst_addr = SocketAddr::new(IpAddr::V4(host_ip), dst_port);
         let key_clone = key.clone();
 
         std::thread::spawn(move || {
