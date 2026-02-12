@@ -12,9 +12,14 @@
 ///   [Memory]           — raw guest RAM (sparse on disk via seek-over-zeros)
 use anyhow::{Context, Result};
 use log::debug;
+use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::mem;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::ptr;
 
 use crate::hypervisor::{HvGicIccReg, HvReg, HvSysReg, Vcpu};
 use crate::virtio::blk::VirtioBlkDevice;
@@ -161,7 +166,7 @@ pub fn save_snapshot(
     let device_bytes = serialize_device_state(device_state);
 
     let memory_size = memory.len() as u64;
-    let cpu_state_offset = std::mem::size_of::<SnapshotHeader>() as u64;
+    let cpu_state_offset = mem::size_of::<SnapshotHeader>() as u64;
     let device_state_offset = cpu_state_offset + cpu_bytes.len() as u64;
     let memory_offset = device_state_offset + device_bytes.len() as u64;
     // Align memory_offset to page boundary for efficient mmap
@@ -187,7 +192,7 @@ pub fn save_snapshot(
     let header_bytes = unsafe {
         std::slice::from_raw_parts(
             &header as *const _ as *const u8,
-            std::mem::size_of::<SnapshotHeader>(),
+            mem::size_of::<SnapshotHeader>(),
         )
     };
     file.write_all(header_bytes)?;
@@ -251,22 +256,20 @@ pub struct SnapshotRestore {
 /// Load a snapshot file for restore.  Returns the parsed state and a
 /// COW mmap of the memory region (no memcpy — pages are faulted lazily).
 pub fn load_snapshot(path: &Path, expected_fingerprint: u64) -> Result<SnapshotRestore> {
-    use std::os::unix::fs::FileExt;
-
     let file = File::open(path).context("Failed to open snapshot file")?;
     let file_len = file.metadata()?.len() as usize;
 
     // Read header via pread() — avoids creating a full read-only mmap
     // just to parse ~1KB of metadata (eliminates an mmap+munmap pair
     // and their page-table setup/teardown overhead).
-    let header_size = std::mem::size_of::<SnapshotHeader>();
+    let header_size = mem::size_of::<SnapshotHeader>();
     if file_len < header_size {
         anyhow::bail!("Snapshot file too small");
     }
-    let mut header_buf = [0u8; std::mem::size_of::<SnapshotHeader>()];
+    let mut header_buf = [0u8; mem::size_of::<SnapshotHeader>()];
     file.read_at(&mut header_buf, 0)
         .context("Failed to read snapshot header")?;
-    let header: SnapshotHeader = unsafe { std::ptr::read(header_buf.as_ptr() as *const _) };
+    let header: SnapshotHeader = unsafe { ptr::read(header_buf.as_ptr() as *const _) };
 
     if header.magic != SNAPSHOT_MAGIC {
         anyhow::bail!(
@@ -458,10 +461,6 @@ pub fn restore_cpu_state(vcpu: &Vcpu, state: &CpuState) -> Result<()> {
 /// Fast, stable, and deterministic.  Only reads 8KB from disk regardless
 /// of file size.
 pub fn hash_file_content(path: &Path) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::io::{Read, Seek, SeekFrom};
-
     let mut hasher = DefaultHasher::new();
 
     let Ok(mut file) = File::open(path) else {
@@ -497,9 +496,6 @@ pub fn hash_file_content(path: &Path) -> u64 {
 /// Hash in-memory bytes for fingerprinting (same approach: size + first/last 4KB).
 /// Used for the built-in rootfs which is already in memory.
 pub fn hash_bytes(data: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut hasher = DefaultHasher::new();
     data.len().hash(&mut hasher);
 
@@ -529,9 +525,6 @@ pub fn compute_fingerprint(
     memory_mb: usize,
     network_enabled: bool,
 ) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut hasher = DefaultHasher::new();
 
     kernel_fingerprint.hash(&mut hasher);

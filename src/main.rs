@@ -14,12 +14,14 @@ mod vm;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Args, Cli, Command, PackArgs};
+use std::fs;
+use std::time::Instant;
 
 /// Check if a valid snapshot exists and try to restore from it.
 /// Returns None if no snapshot is available, Some(Ok(())) if restore succeeded
 /// (note: process exits inside), or Some(Err) if restore failed.
 fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
 
     // Resolve kernel and rootfs paths.
     let kernel_path = match &args.kernel {
@@ -71,7 +73,7 @@ fn run_pack(pack_args: &PackArgs) -> Result<()> {
 
     let image = ext2::pack_directory(&pack_args.dir)?;
 
-    std::fs::write(&pack_args.output, &image)?;
+    fs::write(&pack_args.output, &image)?;
     eprintln!(
         "Wrote {} bytes ({} KB) to {:?}",
         image.len(),

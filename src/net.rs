@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use crate::unet;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     Http,
@@ -81,7 +83,7 @@ impl NetworkFilter {
 
         // Allow all traffic to the gateway IP (host-local services like proxies)
         let dst_ip: [u8; 4] = ip_data[16..20].try_into().unwrap_or([0; 4]);
-        if dst_ip == crate::unet::GATEWAY_IP {
+        if dst_ip == unet::GATEWAY_IP {
             return true;
         }
 

@@ -20,6 +20,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use crate::initramfs;
+
 const BLOCK_SIZE: usize = 4096;
 const INODE_SIZE: usize = 128;
 const SUPERBLOCK_OFFSET: usize = 1024;
@@ -1588,7 +1590,7 @@ pub fn inject_runtime_files(
 
     // CA certificates
     if network {
-        if let Some(ca_data) = crate::initramfs::load_host_ca_certificates() {
+        if let Some(ca_data) = initramfs::load_host_ca_certificates() {
             inject_file(
                 image,
                 &sb,
@@ -1601,11 +1603,11 @@ pub fn inject_runtime_files(
     }
 
     // Ctty helper binary
-    let ctty_bin = crate::initramfs::generate_ctty_helper();
+    let ctty_bin = initramfs::generate_ctty_helper();
     inject_file(image, &sb, &bgd, "usr/sbin/sandal-ctty", &ctty_bin, 0o755)?;
 
     // /init script
-    let init_script = crate::initramfs::generate_init_script_ext(command, network);
+    let init_script = initramfs::generate_init_script_ext(command, network);
     inject_file(image, &sb, &bgd, "init", init_script.as_bytes(), 0o755)?;
 
     Ok(())
@@ -1629,7 +1631,7 @@ pub fn ext2_to_cpio(image: &[u8]) -> Result<Vec<u8>> {
         let nlink = entry.nlink;
         let (devmajor, devminor) = (entry.dev_major, entry.dev_minor);
 
-        crate::initramfs::write_cpio_entry(
+        initramfs::write_cpio_entry(
             &mut archive,
             &entry.path,
             ino,
@@ -1646,7 +1648,7 @@ pub fn ext2_to_cpio(image: &[u8]) -> Result<Vec<u8>> {
     }
 
     // Trailer
-    crate::initramfs::write_cpio_entry(&mut archive, "TRAILER!!!", 0, 0, 0, 0, 1, 0, &[], 0, 0)?;
+    initramfs::write_cpio_entry(&mut archive, "TRAILER!!!", 0, 0, 0, 0, 1, 0, &[], 0, 0)?;
 
     // Pad to 512-byte boundary
     while archive.len() % 512 != 0 {

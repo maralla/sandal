@@ -10,10 +10,14 @@ use anyhow::Result;
 ///   DNS:     10.0.2.3
 ///   Netmask: 255.255.255.0
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::ptr;
 use std::sync::mpsc;
+use std::time::Duration;
+
+use crate::hypervisor::Vcpu;
 
 // ============= NETWORK CONFIGURATION =============
 
@@ -401,8 +405,8 @@ impl UserNet {
                 buf.as_mut_ptr(),
                 buf.len(),
                 0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
             );
 
             kq::close(sock);
@@ -758,7 +762,7 @@ impl UserNet {
         let key_clone = key.clone();
 
         std::thread::spawn(move || {
-            let result = TcpStream::connect_timeout(&dst_addr, std::time::Duration::from_secs(10));
+            let result = TcpStream::connect_timeout(&dst_addr, Duration::from_secs(10));
             if let Ok(ref stream) = result {
                 stream.set_nonblocking(true).ok();
                 stream.set_nodelay(true).ok();
@@ -917,7 +921,7 @@ impl UserNet {
                         self.rx_queue.push_back(pkt);
                         conn.our_seq = conn.our_seq.wrapping_add(n as u32);
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         break; // No more data
                     }
                     Err(_) => {
@@ -1179,7 +1183,9 @@ pub struct NetPoller {
 
 // kqueue / kevent FFI — just the handful of definitions we need.
 mod kq {
+    use std::ffi::c_void;
     use std::os::fd::RawFd;
+    use std::ptr;
 
     pub const EVFILT_READ: i16 = -1;
     pub const EV_ADD: u16 = 0x0001;
@@ -1193,7 +1199,7 @@ mod kq {
         pub flags: u16,
         pub fflags: u32,
         pub data: isize,
-        pub udata: *mut std::ffi::c_void,
+        pub udata: *mut c_void,
     }
 
     // Safety: Kevent contains a raw pointer field (udata) which we always
@@ -1201,7 +1207,7 @@ mod kq {
     unsafe impl Send for Kevent {}
 
     // We always pass null for the timeout (block forever), so we just
-    // declare it as *const std::ffi::c_void to avoid a libc dependency.
+    // declare it as *const c_void to avoid a libc dependency.
     extern "C" {
         pub fn kqueue() -> RawFd;
         pub fn kevent(
@@ -1210,7 +1216,7 @@ mod kq {
             nchanges: i32,
             eventlist: *mut Kevent,
             nevents: i32,
-            timeout: *const std::ffi::c_void,
+            timeout: *const c_void,
         ) -> i32;
         pub fn pipe(fds: *mut [RawFd; 2]) -> i32;
         pub fn close(fd: RawFd) -> i32;
@@ -1226,10 +1232,10 @@ mod kq {
             flags: EV_ADD | EV_ENABLE,
             fflags: 0,
             data: 0,
-            udata: std::ptr::null_mut(),
+            udata: ptr::null_mut(),
         };
         unsafe {
-            kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+            kevent(kq, &change, 1, ptr::null_mut(), 0, ptr::null());
         }
     }
 }
@@ -1279,15 +1285,13 @@ impl NetPoller {
     /// Blocks on kevent() until a monitored socket becomes readable,
     /// then kicks the vcpu. Exits when a byte is read from the wakeup pipe.
     pub fn run(self) {
-        use crate::hypervisor::Vcpu;
-
         let mut events: [kq::Kevent; 32] = [kq::Kevent {
             ident: 0,
             filter: 0,
             flags: 0,
             fflags: 0,
             data: 0,
-            udata: std::ptr::null_mut(),
+            udata: ptr::null_mut(),
         }; 32];
 
         loop {
@@ -1300,11 +1304,11 @@ impl NetPoller {
             let n = unsafe {
                 kq::kevent(
                     self.kq,
-                    std::ptr::null(),
+                    ptr::null(),
                     0,
                     events.as_mut_ptr(),
                     events.len() as i32,
-                    std::ptr::null(), // block indefinitely
+                    ptr::null(), // block indefinitely
                 )
             };
 

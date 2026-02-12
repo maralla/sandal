@@ -8,7 +8,9 @@
 use super::*;
 use log::{debug, warn};
 use std::collections::HashMap;
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::fs::{self, Metadata, OpenOptions, Permissions};
+use std::io;
+use std::os::unix::fs::{symlink, FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -222,7 +224,7 @@ fn make_error(unique: u64, errno: i32) -> Vec<u8> {
 }
 
 /// Write a fuse_attr (88 bytes) into a WriteBuf from filesystem metadata.
-fn write_fuse_attr(wb: &mut WriteBuf, ino: u64, meta: &std::fs::Metadata) {
+fn write_fuse_attr(wb: &mut WriteBuf, ino: u64, meta: &Metadata) {
     wb.write_u64(ino); // ino
     wb.write_u64(meta.size()); // size
     wb.write_u64(meta.blocks()); // blocks
@@ -242,7 +244,7 @@ fn write_fuse_attr(wb: &mut WriteBuf, ino: u64, meta: &std::fs::Metadata) {
 }
 
 /// Write a fuse_entry_out (128 bytes) into a WriteBuf.
-fn write_entry_out(wb: &mut WriteBuf, ino: u64, meta: &std::fs::Metadata) {
+fn write_entry_out(wb: &mut WriteBuf, ino: u64, meta: &Metadata) {
     wb.write_u64(ino); // nodeid
     wb.write_u64(0); // generation
     wb.write_u64(ENTRY_TIMEOUT); // entry_valid
@@ -253,7 +255,7 @@ fn write_entry_out(wb: &mut WriteBuf, ino: u64, meta: &std::fs::Metadata) {
 }
 
 /// Write a fuse_attr_out (104 bytes) into a WriteBuf.
-fn write_attr_out(wb: &mut WriteBuf, ino: u64, meta: &std::fs::Metadata) {
+fn write_attr_out(wb: &mut WriteBuf, ino: u64, meta: &Metadata) {
     wb.write_u64(ATTR_TIMEOUT); // attr_valid
     wb.write_u32(0); // attr_valid_nsec
     wb.write_u32(0); // dummy
@@ -823,7 +825,7 @@ impl VirtioFsDevice {
         };
 
         let child_path = parent_path.join(&name);
-        let meta = match std::fs::symlink_metadata(&child_path) {
+        let meta = match fs::symlink_metadata(&child_path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -850,7 +852,7 @@ impl VirtioFsDevice {
             None => return make_error(unique, ENOENT),
         };
 
-        let meta = match std::fs::symlink_metadata(path) {
+        let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -884,14 +886,14 @@ impl VirtioFsDevice {
         };
 
         if valid & FATTR_MODE != 0 {
-            let perm = std::fs::Permissions::from_mode(mode);
-            if let Err(e) = std::fs::set_permissions(&path, perm) {
+            let perm = Permissions::from_mode(mode);
+            if let Err(e) = fs::set_permissions(&path, perm) {
                 return make_error(unique, io_error_to_errno(&e));
             }
         }
 
         if valid & FATTR_SIZE != 0 {
-            let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            let file = match OpenOptions::new().write(true).open(&path) {
                 Ok(f) => f,
                 Err(e) => return make_error(unique, io_error_to_errno(&e)),
             };
@@ -901,7 +903,7 @@ impl VirtioFsDevice {
         }
 
         // Re-stat after modifications
-        let meta = match std::fs::symlink_metadata(&path) {
+        let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -920,7 +922,7 @@ impl VirtioFsDevice {
             None => return make_error(unique, ENOENT),
         };
 
-        let mut opts = std::fs::OpenOptions::new();
+        let mut opts = OpenOptions::new();
         let access = flags & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
         match access {
             1 => {
@@ -1066,7 +1068,7 @@ impl VirtioFsDevice {
         };
 
         // Verify it's a directory
-        match std::fs::symlink_metadata(&path) {
+        match fs::symlink_metadata(&path) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => return make_error(unique, ENOTDIR),
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
@@ -1228,7 +1230,7 @@ impl VirtioFsDevice {
 
         let new_path = parent_path.join(&name);
 
-        let mut opts = std::fs::OpenOptions::new();
+        let mut opts = OpenOptions::new();
         opts.create(true).write(true);
         let access = flags & 3;
         if access == 0 || access == 2 {
@@ -1244,10 +1246,10 @@ impl VirtioFsDevice {
         };
 
         // Set permissions
-        let perm = std::fs::Permissions::from_mode(mode);
-        let _ = std::fs::set_permissions(&new_path, perm);
+        let perm = Permissions::from_mode(mode);
+        let _ = fs::set_permissions(&new_path, perm);
 
-        let meta = match std::fs::symlink_metadata(&new_path) {
+        let meta = match fs::symlink_metadata(&new_path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -1289,14 +1291,14 @@ impl VirtioFsDevice {
         };
 
         let new_dir = parent_path.join(&name);
-        if let Err(e) = std::fs::create_dir(&new_dir) {
+        if let Err(e) = fs::create_dir(&new_dir) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
-        let perm = std::fs::Permissions::from_mode(mode);
-        let _ = std::fs::set_permissions(&new_dir, perm);
+        let perm = Permissions::from_mode(mode);
+        let _ = fs::set_permissions(&new_dir, perm);
 
-        let meta = match std::fs::symlink_metadata(&new_dir) {
+        let meta = match fs::symlink_metadata(&new_dir) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -1323,7 +1325,7 @@ impl VirtioFsDevice {
         };
 
         let target = parent_path.join(&name);
-        if let Err(e) = std::fs::remove_file(&target) {
+        if let Err(e) = fs::remove_file(&target) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
@@ -1342,7 +1344,7 @@ impl VirtioFsDevice {
         };
 
         let target = parent_path.join(&name);
-        if let Err(e) = std::fs::remove_dir(&target) {
+        if let Err(e) = fs::remove_dir(&target) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
@@ -1402,11 +1404,11 @@ impl VirtioFsDevice {
         };
 
         let link_path = parent_path.join(&name);
-        if let Err(e) = std::os::unix::fs::symlink(&target, &link_path) {
+        if let Err(e) = symlink(&target, &link_path) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
-        let meta = match std::fs::symlink_metadata(&link_path) {
+        let meta = match fs::symlink_metadata(&link_path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -1427,7 +1429,7 @@ impl VirtioFsDevice {
             None => return make_error(unique, ENOENT),
         };
 
-        let target = match std::fs::read_link(path) {
+        let target = match fs::read_link(path) {
             Ok(t) => t,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -1462,11 +1464,11 @@ impl VirtioFsDevice {
         };
 
         let link_path = new_parent_path.join(&newname);
-        if let Err(e) = std::fs::hard_link(&old_path, &link_path) {
+        if let Err(e) = fs::hard_link(&old_path, &link_path) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
-        let meta = match std::fs::symlink_metadata(&link_path) {
+        let meta = match fs::symlink_metadata(&link_path) {
             Ok(m) => m,
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
         };
@@ -1543,7 +1545,7 @@ impl VirtioFsDevice {
         let old_path = old_parent_path.join(oldname);
         let new_path = new_parent_path.join(newname);
 
-        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+        if let Err(e) = fs::rename(&old_path, &new_path) {
             return make_error(unique, io_error_to_errno(&e));
         }
 
@@ -1605,11 +1607,11 @@ impl VirtioFsDevice {
             entries.push(("..".to_string(), ino, 4)); // DT_DIR
         }
 
-        if let Ok(rd) = std::fs::read_dir(dir_path) {
+        if let Ok(rd) = fs::read_dir(dir_path) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let entry_path = dir_path.join(&name);
-                if let Ok(meta) = std::fs::symlink_metadata(&entry_path) {
+                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
                     // Use host inode as FUSE inode for readdir (readdir doesn't
                     // create inode references, so we don't allocate here)
                     let ino = meta.ino();
@@ -1629,14 +1631,11 @@ impl VirtioFsDevice {
     }
 
     /// Collect directory entries with full metadata for READDIRPLUS.
-    fn collect_dir_entries_with_meta(
-        &self,
-        dir_path: &Path,
-    ) -> Vec<(String, PathBuf, std::fs::Metadata)> {
+    fn collect_dir_entries_with_meta(&self, dir_path: &Path) -> Vec<(String, PathBuf, Metadata)> {
         let mut entries = Vec::new();
 
         // "." entry
-        if let Ok(meta) = std::fs::symlink_metadata(dir_path) {
+        if let Ok(meta) = fs::symlink_metadata(dir_path) {
             entries.push((".".to_string(), dir_path.to_path_buf(), meta));
         }
 
@@ -1647,15 +1646,15 @@ impl VirtioFsDevice {
         } else {
             self.root_path.clone()
         };
-        if let Ok(meta) = std::fs::symlink_metadata(&parent_path) {
+        if let Ok(meta) = fs::symlink_metadata(&parent_path) {
             entries.push(("..".to_string(), parent_path, meta));
         }
 
-        if let Ok(rd) = std::fs::read_dir(dir_path) {
+        if let Ok(rd) = fs::read_dir(dir_path) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let entry_path = dir_path.join(&name);
-                if let Ok(meta) = std::fs::symlink_metadata(&entry_path) {
+                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
                     entries.push((name, entry_path, meta));
                 }
             }
@@ -1666,13 +1665,13 @@ impl VirtioFsDevice {
 }
 
 /// Convert a Rust I/O error to a Linux errno value.
-fn io_error_to_errno(e: &std::io::Error) -> i32 {
+fn io_error_to_errno(e: &io::Error) -> i32 {
     match e.kind() {
-        std::io::ErrorKind::NotFound => ENOENT,
-        std::io::ErrorKind::PermissionDenied => EACCES,
-        std::io::ErrorKind::AlreadyExists => EEXIST,
-        std::io::ErrorKind::InvalidInput => EINVAL,
-        std::io::ErrorKind::Unsupported => EOPNOTSUPP,
+        io::ErrorKind::NotFound => ENOENT,
+        io::ErrorKind::PermissionDenied => EACCES,
+        io::ErrorKind::AlreadyExists => EEXIST,
+        io::ErrorKind::InvalidInput => EINVAL,
+        io::ErrorKind::Unsupported => EOPNOTSUPP,
         _ => e.raw_os_error().unwrap_or(EIO),
     }
 }

@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+use std::time::SystemTime;
 
 use crate::elf::arm64::*;
 use crate::elf::ElfBuilder;
@@ -37,8 +38,8 @@ fn generate_init_script(_command: &[String], network: bool) -> String {
     let net_setup = if network { include_str!("net.sh") } else { "" };
 
     // Get current time as Unix timestamp for guest clock sync
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
