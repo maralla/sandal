@@ -1566,7 +1566,6 @@ pub fn inject_runtime_files(
     command: &[String],
     network: bool,
     use_8250_uart: bool,
-    shares: &[(String, String)],
 ) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgd = Ext2Bgd::parse(image, &sb)?;
@@ -1617,7 +1616,7 @@ pub fn inject_runtime_files(
     inject_file(image, &sb, &bgd, "usr/sbin/sandal-ctty", &ctty_bin, 0o755)?;
 
     // /init script
-    let init_script = crate::initramfs::generate_init_script_ext(command, network, shares);
+    let init_script = crate::initramfs::generate_init_script_ext(command, network);
     inject_file(image, &sb, &bgd, "init", init_script.as_bytes(), 0o755)?;
 
     Ok(())

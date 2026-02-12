@@ -16,12 +16,8 @@ pub const EXIT_MARKER: &str = "SANDAL_EXIT:";
 pub const BOOT_MARKER: &str = "SANDAL_BOOT_COMPLETE";
 
 /// Public version of init script generator for use by ext2 builder.
-pub fn generate_init_script_ext(
-    command: &[String],
-    network: bool,
-    shares: &[(String, String)],
-) -> String {
-    generate_init_script(command, network, shares)
+pub fn generate_init_script_ext(command: &[String], network: bool) -> String {
+    generate_init_script(command, network)
 }
 
 /// Generate the /init shell script that runs inside the VM.
@@ -34,7 +30,7 @@ pub fn generate_init_script_ext(
 /// into the UART RX buffer after detecting BOOT_MARKER.
 /// This decoupling enables VM snapshots: the same booted state can
 /// run different commands by injecting different UART input on restore.
-fn generate_init_script(_command: &[String], network: bool, shares: &[(String, String)]) -> String {
+fn generate_init_script(_command: &[String], network: bool) -> String {
     let net_setup = if network {
         r#"
 # Network setup
@@ -60,18 +56,9 @@ fi
         ""
     };
 
-    // Build mount commands for shared directories (virtiofs)
-    let mount_setup = if !shares.is_empty() {
-        let mut s = String::from("\n# Mount shared directories (virtiofs)\n");
-        for (tag, guest_path) in shares {
-            s.push_str(&format!(
-                "mkdir -p {guest_path}\nmount -t virtiofs {tag} {guest_path} 2>/dev/null\n"
-            ));
-        }
-        s
-    } else {
-        String::new()
-    };
+    // Mount commands are no longer baked into the init script.
+    // They are injected via UART at runtime (see build_mount_setup_line),
+    // so the same rootfs/snapshot works for any --share combination.
 
     // Get current time as Unix timestamp for guest clock sync
     let now = std::time::SystemTime::now()
@@ -118,7 +105,7 @@ export HOME=/root
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TERM=linux
 cd /
-{net_setup}{mount_setup}
+{net_setup}
 # Determine controlling terminal device before BOOT_MARKER
 # (reading /sys after boot-complete would show on stdout)
 CTTY=/dev/$(cat /sys/class/tty/console/active 2>/dev/null)
@@ -130,9 +117,11 @@ stty -echo 2>/dev/null
 # Signal boot complete to host (triggers direct UART output)
 echo "{BOOT_MARKER}"
 
-# Read the command from the UART.  The host writes a single
-# shell-escaped line to the UART RX buffer after detecting
-# BOOT_MARKER (or after restoring a snapshot).
+# Read mount setup + command from the UART.  The host writes two lines:
+#   1. Mount commands (or empty for no shares)
+#   2. Shell-escaped command line
+IFS= read -r SANDAL_MOUNT_SETUP
+eval "$SANDAL_MOUNT_SETUP"
 IFS= read -r SANDAL_CMD_LINE
 
 # Parse the command line back into positional parameters
@@ -154,7 +143,10 @@ stty echo 2>/dev/null
 # builtin names like `command -v` does).
 SANDAL_CMD=$(which "$1" 2>/dev/null || echo "$1")
 shift
-if [ -c "$CTTY" ]; then
+if [ ! -x "$SANDAL_CMD" ]; then
+    echo "Unknown command: $SANDAL_CMD" >&2
+    SANDAL_RC=127
+elif [ -c "$CTTY" ]; then
     /usr/sbin/sandal-ctty "$CTTY" "$SANDAL_CMD" "$@"
     SANDAL_RC=$?
 else
@@ -175,6 +167,21 @@ devmem 0x09000100 32 "$SANDAL_RC" 2>/dev/null
 exec /sbin/poweroff -f
 "#
     )
+}
+
+/// Build the mount setup line injected via UART before the command.
+/// Returns a single line of shell commands (or empty string for no shares).
+pub fn build_mount_setup_line(shares: &[(String, String)]) -> String {
+    if shares.is_empty() {
+        return String::new();
+    }
+    shares
+        .iter()
+        .map(|(tag, guest_path)| {
+            format!("mkdir -p {guest_path} && mount -t virtiofs {tag} {guest_path} 2>/dev/null")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Build the shell-escaped command line that the host sends to the guest

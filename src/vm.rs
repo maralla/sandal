@@ -109,15 +109,16 @@ pub struct VmInstance {
     memory_size: usize,
     uart_type: UartType,
     kernel_entry: u64,
-    initrd_info: Option<(u64, u64)>, // (start GPA, end GPA)
-    exit_code: Option<i32>,          // Set when guest signals exit via UART marker
-    boot_complete: bool,             // Set once kernel finishes booting and init runs
-    boot_complete_iter: u64,         // Iteration at which boot_complete became true
-    command_injected: bool,          // Set once the command has been sent to the guest via UART
-    pending_command: Option<String>, // Shell-escaped command line to inject after BOOT_MARKER
+    initrd_info: Option<(u64, u64)>,     // (start GPA, end GPA)
+    exit_code: Option<i32>,              // Set when guest signals exit via UART marker
+    boot_complete: bool,                 // Set once kernel finishes booting and init runs
+    boot_complete_iter: u64,             // Iteration at which boot_complete became true
+    command_injected: bool,              // Set once the command has been sent to the guest via UART
+    pending_mount_setup: Option<String>, // Mount setup line to inject before command
+    pending_command: Option<String>,     // Shell-escaped command line to inject after BOOT_MARKER
     snapshot_save_path: Option<std::path::PathBuf>, // If set, save snapshot after boot
-    snapshot_fingerprint: u64,       // Fingerprint for the snapshot file
-    snapshot_pending: u32,           // Countdown: save snapshot when this reaches 0
+    snapshot_fingerprint: u64,           // Fingerprint for the snapshot file
+    snapshot_pending: u32,               // Countdown: save snapshot when this reaches 0
     restored_cpu_state: Option<crate::snapshot::CpuState>, // If set, restore these registers instead of boot state
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
     is_restored: bool,                     // True if VM was restored from a snapshot
@@ -259,6 +260,7 @@ impl VmInstance {
             boot_complete: false,
             boot_complete_iter: 0,
             command_injected: false,
+            pending_mount_setup: None,
             pending_command: None,
             snapshot_save_path: None,
             snapshot_fingerprint: 0,
@@ -450,12 +452,11 @@ impl VmInstance {
             None
         };
 
-        // Collect virtiofs device tree entries
-        let virtiofs_dt: Vec<(u64, u32)> = self
-            .virtiofs
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
+        // Always include ALL MAX_FS_DEVICES virtiofs entries in the DT so
+        // the kernel probes every slot during cold boot.  This lets the same
+        // snapshot be reused regardless of which --share args are supplied.
+        let virtiofs_dt: Vec<(u64, u32)> = (0..MAX_FS_DEVICES)
+            .map(|i| {
                 (
                     VIRTIOFS_BASE_START + (i as u64) * VIRTIOFS_SIZE,
                     VIRTIOFS_SPI_START + i as u32,
@@ -500,16 +501,25 @@ impl VmInstance {
     }
 
     pub fn run_command(&mut self, _command: &[String]) -> Result<i32> {
+        let trc = std::time::Instant::now();
         debug!("=== Starting Linux kernel execution ===");
 
         // Create VCPU
         let vcpu = Vcpu::new().context("Failed to create vCPU")?;
-        debug!("vCPU created (ID: {})", vcpu.id());
+        debug!(
+            "[bench] Vcpu::new: {:.2}ms",
+            trc.elapsed().as_secs_f64() * 1000.0
+        );
 
         // If we have restored CPU state (snapshot restore), apply it.
         // Otherwise set up fresh boot state.
         if let Some(ref cpu_state) = self.restored_cpu_state {
+            let t = std::time::Instant::now();
             crate::snapshot::restore_cpu_state(&vcpu, cpu_state)?;
+            debug!(
+                "[bench] restore_cpu_state: {:.2}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
             debug!(
                 "vCPU state restored from snapshot (PC=0x{:x}, CPSR=0x{:x})",
                 cpu_state.pc, cpu_state.cpsr
@@ -586,6 +596,11 @@ impl VmInstance {
             }
         }
 
+        debug!(
+            "[bench] run_command setup (vcpu+state): {:.2}ms",
+            trc.elapsed().as_secs_f64() * 1000.0
+        );
+
         let mut iteration: u64 = 0;
         let mut stdin_eof = false;
         let max_iterations: u64 = 100_000_000; // 100M iterations for kernel boot
@@ -645,6 +660,11 @@ impl VmInstance {
         } else {
             None
         };
+
+        debug!(
+            "[bench] run_command ready (tty+threads): {:.2}ms",
+            trc.elapsed().as_secs_f64() * 1000.0
+        );
 
         loop {
             iteration += 1;
@@ -1210,12 +1230,21 @@ impl VmInstance {
         if self.command_injected {
             return;
         }
+        if let Some(mount_setup) = self.pending_mount_setup.take() {
+            // Line 1: mount setup commands (may be empty)
+            debug!("Injecting mount setup via UART: {mount_setup}");
+            for byte in mount_setup.as_bytes() {
+                self.uart_rx_buf.push_back(*byte);
+            }
+            self.uart_rx_buf.push_back(b'\n');
+        }
         if let Some(cmd_line) = self.pending_command.take() {
+            // Line 2: the actual command
             debug!("Injecting command via UART: {cmd_line}");
             for byte in cmd_line.as_bytes() {
                 self.uart_rx_buf.push_back(*byte);
             }
-            self.uart_rx_buf.push_back(b'\n'); // Terminate the line
+            self.uart_rx_buf.push_back(b'\n');
             self.command_injected = true;
         }
     }
@@ -1255,6 +1284,12 @@ impl VmInstance {
             warn!("GIC state save not available (macOS 15.0+ required for snapshot restore)");
         }
 
+        let fs_mmio = self
+            .virtiofs
+            .iter()
+            .map(crate::snapshot::VirtioMmioSnapshot::from_fs)
+            .collect();
+
         crate::snapshot::DeviceState {
             uart_is_8250,
             uart_8250_ier,
@@ -1264,6 +1299,7 @@ impl VmInstance {
             rng_mmio,
             blk_mmio,
             use_virtio_blk: self.use_virtio_blk,
+            fs_mmio,
             gic_state,
         }
     }
@@ -1840,11 +1876,11 @@ impl VmInstance {
 /// then two levels up (for target/release/sandal -> project root), then CWD.
 pub fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
+        // Use parent() directly instead of canonicalize() to avoid the
+        // expensive realpath() syscall chain (resolves every symlink
+        // component).  For finding sibling data files, the raw exe
+        // directory is sufficient.
+        if let Some(exe_dir) = exe.parent() {
             let path = exe_dir.join(relative);
             if path.exists() {
                 return Some(path);
@@ -1938,7 +1974,10 @@ pub fn run(args: Args) -> Result<()> {
     // confirm virtio-blk support AND cannot confirm initramfs support
     let prefer_virtio_blk = has_virtio_blk && !has_initrd_strings;
 
-    // Parse and set up shared directories (virtiofs)
+    // Parse and set up shared directories (virtiofs).
+    // We always create MAX_FS_DEVICES VirtioFsDevice instances so the
+    // kernel probes every slot during cold boot, producing a snapshot
+    // that is reusable regardless of --share arguments.
     let mut shares: Vec<(String, String)> = Vec::new(); // (mount_tag, guest_path)
     for (i, share_spec) in args.shared_dirs.iter().enumerate() {
         if i >= MAX_FS_DEVICES {
@@ -1964,6 +2003,16 @@ pub fn run(args: Args) -> Result<()> {
         vm.virtiofs
             .push(VirtioFsDevice::new(host_path, mount_tag.clone()));
         shares.push((mount_tag, guest_path));
+    }
+    // Fill remaining virtiofs slots with stub devices so the kernel
+    // probes all MAX_FS_DEVICES during cold boot.  The stubs use "/"
+    // as root_path but are never mounted, so no files are exposed.
+    for i in args.shared_dirs.len()..MAX_FS_DEVICES {
+        let mount_tag = format!("share{i}");
+        vm.virtiofs.push(VirtioFsDevice::new(
+            std::path::PathBuf::from("/"),
+            mount_tag,
+        ));
     }
 
     // Load initrd/rootfs (must be done before load_kernel, because load_kernel builds DTB)
@@ -1998,7 +2047,6 @@ pub fn run(args: Args) -> Result<()> {
             &args.command,
             network_enabled,
             use_8250,
-            &shares,
         )
         .context("Failed to inject runtime files into ext2 image")?;
 
@@ -2032,34 +2080,33 @@ pub fn run(args: Args) -> Result<()> {
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(&kernel_data)?;
 
-    // Set the command to be injected via UART after BOOT_MARKER.
-    // The init script reads this from stdin instead of having it baked in.
+    // Set mount setup + command to be injected via UART after BOOT_MARKER.
+    // The init script reads two lines: mount setup, then the command.
+    let mount_setup = crate::initramfs::build_mount_setup_line(&shares);
+    vm.pending_mount_setup = Some(mount_setup);
     let cmd_line = crate::initramfs::build_command_line(&args.command);
     vm.pending_command = Some(cmd_line.clone());
 
-    // Compute fingerprint for snapshot caching
+    // Compute fingerprint for snapshot caching.
+    // Uses content-based hashing (first/last 4KB) — same as the fast
+    // path in try_snapshot_restore, so saved snapshots are found on
+    // subsequent runs.
+    let kernel_fp = crate::snapshot::hash_file_content(&kernel_path);
     let rootfs_fp = rootfs_arg
         .map(|p| crate::snapshot::hash_file_content(p))
         .unwrap_or(0);
-    let fingerprint = crate::snapshot::compute_fingerprint(
-        &kernel_data,
-        rootfs_fp,
-        args.memory,
-        network_enabled,
-        &args.shared_dirs,
-    );
+    let fingerprint =
+        crate::snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
     vm.snapshot_fingerprint = fingerprint;
 
     if !args.no_cache {
-        // Only enable snapshot save when:
-        //  - No virtiofs devices (their host-side state can't be snapshotted)
-        //  - Snapshot file doesn't already exist (avoid re-saving on every run)
-        let can_snapshot = vm.virtiofs.is_empty();
-        if can_snapshot {
-            if let Ok(snap_path) = crate::snapshot::snapshot_path(fingerprint) {
-                if !snap_path.exists() {
-                    vm.snapshot_save_path = Some(snap_path);
-                }
+        // Enable snapshot save when the snapshot doesn't already exist.
+        // Virtiofs is supported: the mount is deferred to after BOOT_MARKER,
+        // so no FUSE session is active at snapshot time.  On restore, fresh
+        // VirtioFsDevice instances are created from --share args.
+        if let Ok(snap_path) = crate::snapshot::snapshot_path(fingerprint) {
+            if !snap_path.exists() {
+                vm.snapshot_save_path = Some(snap_path);
             }
         }
     }
@@ -2267,7 +2314,63 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
         t1.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Build the command line to inject
+    // Restore ALL MAX_FS_DEVICES virtiofs slots from snapshot MMIO state.
+    // Real --share args get the actual host path; remaining slots get "/"
+    // as a stub (they are never mounted, so no files are exposed).
+    let mut virtiofs_devices = Vec::new();
+    let mut shares: Vec<(String, String)> = Vec::new();
+    for i in 0..MAX_FS_DEVICES {
+        let mount_tag = format!("share{i}");
+        let host_path = if let Some(share_spec) = args.shared_dirs.get(i) {
+            if let Some((host_str, guest_str)) = share_spec.split_once(':') {
+                let p = std::path::PathBuf::from(host_str);
+                if p.is_dir() {
+                    shares.push((mount_tag.clone(), guest_str.to_string()));
+                    p
+                } else {
+                    log::warn!("Shared path is not a directory (skipped): {host_str:?}");
+                    std::path::PathBuf::from("/")
+                }
+            } else {
+                log::warn!("Invalid --share format (skipped): {share_spec:?}");
+                std::path::PathBuf::from("/")
+            }
+        } else {
+            std::path::PathBuf::from("/")
+        };
+        let mut device = VirtioFsDevice::new(host_path, mount_tag);
+
+        // Restore MMIO state from snapshot
+        if let Some(mmio) = snapshot_device_state.fs_mmio.get(i) {
+            device.device_features_sel = mmio.device_features_sel;
+            device.driver_features = mmio.driver_features;
+            device.driver_features_sel = mmio.driver_features_sel;
+            device.queue_sel = mmio.queue_sel;
+            device.status = mmio.status;
+            device.interrupt_status = mmio.interrupt_status;
+            device.config_generation = mmio.config_generation;
+            for (qi, q) in mmio.queues.iter().enumerate() {
+                if qi < device.queues.len() {
+                    device.queues[qi].num_max = q.num_max;
+                    device.queues[qi].num = q.num;
+                    device.queues[qi].ready = q.ready != 0;
+                    device.queues[qi].desc_addr = q.desc_addr;
+                    device.queues[qi].avail_addr = q.avail_addr;
+                    device.queues[qi].used_addr = q.used_addr;
+                    device.queues[qi].last_avail_idx = q.last_avail_idx;
+                }
+            }
+        }
+        virtiofs_devices.push(device);
+    }
+    debug!(
+        "[bench] restore virtiofs devices ({}): {:.2}ms",
+        virtiofs_devices.len(),
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Build mount setup + command line to inject via UART
+    let mount_setup = crate::initramfs::build_mount_setup_line(&shares);
     let cmd_line = crate::initramfs::build_command_line(&args.command);
 
     // Build the VmInstance struct with restored state
@@ -2282,6 +2385,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
         boot_complete: true, // Already booted
         boot_complete_iter: 0,
         command_injected: false,
+        pending_mount_setup: Some(mount_setup),
         pending_command: Some(cmd_line),
         snapshot_save_path: None,
         snapshot_fingerprint: fingerprint,
@@ -2297,7 +2401,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
         virtio_rng: Some(virtio_rng),
         virtio_blk,
         use_virtio_blk,
-        virtiofs: Vec::new(),
+        virtiofs: virtiofs_devices,
     };
 
     // Inject the command into the UART RX buffer.

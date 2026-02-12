@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::hypervisor::{HvGicIccReg, HvReg, HvSysReg, Vcpu};
 use crate::virtio::blk::VirtioBlkDevice;
+use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 
@@ -141,7 +142,8 @@ pub struct DeviceState {
     pub rng_mmio: Option<VirtioMmioSnapshot>,
     pub blk_mmio: Option<VirtioMmioSnapshot>,
     pub use_virtio_blk: bool,
-    pub gic_state: Option<Vec<u8>>, // Opaque GIC state blob (macOS 15+)
+    pub fs_mmio: Vec<VirtioMmioSnapshot>, // virtiofs device MMIO state (one per --share)
+    pub gic_state: Option<Vec<u8>>,       // Opaque GIC state blob (macOS 15+)
 }
 
 // ── Save ──────────────────────────────────────────────────────────────
@@ -249,17 +251,22 @@ pub struct SnapshotRestore {
 /// Load a snapshot file for restore.  Returns the parsed state and a
 /// COW mmap of the memory region (no memcpy — pages are faulted lazily).
 pub fn load_snapshot(path: &Path, expected_fingerprint: u64) -> Result<SnapshotRestore> {
+    use std::os::unix::fs::FileExt;
+
     let file = File::open(path).context("Failed to open snapshot file")?;
     let file_len = file.metadata()?.len() as usize;
 
-    // Read-only mmap to parse the header + cpu/device state
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-
-    // Parse header
-    if mmap.len() < std::mem::size_of::<SnapshotHeader>() {
+    // Read header via pread() — avoids creating a full read-only mmap
+    // just to parse ~1KB of metadata (eliminates an mmap+munmap pair
+    // and their page-table setup/teardown overhead).
+    let header_size = std::mem::size_of::<SnapshotHeader>();
+    if file_len < header_size {
         anyhow::bail!("Snapshot file too small");
     }
-    let header: SnapshotHeader = unsafe { std::ptr::read(mmap.as_ptr() as *const SnapshotHeader) };
+    let mut header_buf = [0u8; std::mem::size_of::<SnapshotHeader>()];
+    file.read_at(&mut header_buf, 0)
+        .context("Failed to read snapshot header")?;
+    let header: SnapshotHeader = unsafe { std::ptr::read(header_buf.as_ptr() as *const _) };
 
     if header.magic != SNAPSHOT_MAGIC {
         anyhow::bail!(
@@ -277,21 +284,25 @@ pub fn load_snapshot(path: &Path, expected_fingerprint: u64) -> Result<SnapshotR
         anyhow::bail!("Snapshot fingerprint mismatch (stale snapshot)");
     }
 
-    // Parse CPU state
-    let cpu_start = header.cpu_state_offset as usize;
-    let cpu_end = cpu_start + header.cpu_state_size as usize;
-    if cpu_end > mmap.len() {
-        anyhow::bail!("Snapshot CPU state extends past end of file");
+    // Read CPU + device state in a single pread() call — they're
+    // contiguous in the file and together only ~1KB.
+    let state_start = header.cpu_state_offset as usize;
+    let state_end = header.device_state_offset as usize + header.device_state_size as usize;
+    if state_end > file_len {
+        anyhow::bail!("Snapshot state extends past end of file");
     }
-    let cpu_state = deserialize_cpu_state(&mmap[cpu_start..cpu_end])?;
+    let mut state_buf = vec![0u8; state_end - state_start];
+    file.read_at(&mut state_buf, state_start as u64)
+        .context("Failed to read snapshot state")?;
 
-    // Parse device state
-    let dev_start = header.device_state_offset as usize;
-    let dev_end = dev_start + header.device_state_size as usize;
-    if dev_end > mmap.len() {
-        anyhow::bail!("Snapshot device state extends past end of file");
-    }
-    let device_state = deserialize_device_state(&mmap[dev_start..dev_end])?;
+    // Parse CPU state from the combined buffer
+    let cpu_local_end = header.cpu_state_size as usize;
+    let cpu_state = deserialize_cpu_state(&state_buf[..cpu_local_end])?;
+
+    // Parse device state from the combined buffer
+    let dev_local_start = header.device_state_offset as usize - state_start;
+    let dev_local_end = dev_local_start + header.device_state_size as usize;
+    let device_state = deserialize_device_state(&state_buf[dev_local_start..dev_local_end])?;
 
     let memory_offset = header.memory_offset as usize;
     let memory_size = header.memory_size as usize;
@@ -299,9 +310,6 @@ pub fn load_snapshot(path: &Path, expected_fingerprint: u64) -> Result<SnapshotR
     if memory_offset + memory_size > file_len {
         anyhow::bail!("Snapshot memory extends past end of file");
     }
-
-    // Drop the read-only mmap before creating the COW mapping
-    drop(mmap);
 
     // Create a copy-on-write (MAP_PRIVATE) mapping of just the memory
     // region.  This avoids reading/copying 256 MB upfront — pages are
@@ -486,41 +494,32 @@ pub fn hash_file_content(path: &Path) -> u64 {
     hasher.finish()
 }
 
-/// Compute a fingerprint from kernel data, rootfs fingerprint, memory size,
-/// network config, and shared directories.  Changes to any of these
-/// invalidate the snapshot.
+/// Compute a fingerprint from kernel/rootfs content hashes, memory size,
+/// and network config.  Changes to any of these invalidate the snapshot.
+///
+/// Shared directories (`--share`) are NOT included: the device tree
+/// always reserves all MAX_FS_DEVICES virtiofs slots, and mount commands
+/// are injected via UART at runtime, so the same snapshot works for any
+/// combination of `--share` arguments.
+///
+/// Both `kernel_fingerprint` and `rootfs_fingerprint` should be produced
+/// by [`hash_file_content`].
 pub fn compute_fingerprint(
-    kernel_data: &[u8],
+    kernel_fingerprint: u64,
     rootfs_fingerprint: u64,
     memory_mb: usize,
     network_enabled: bool,
-    shared_dirs: &[String],
 ) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
 
-    // Hash kernel contents (fast: hash size + first/last 4KB)
-    kernel_data.len().hash(&mut hasher);
-    let head = kernel_data.len().min(4096);
-    kernel_data[..head].hash(&mut hasher);
-    if kernel_data.len() > 4096 {
-        kernel_data[kernel_data.len() - 4096..].hash(&mut hasher);
-    }
-
-    // Hash rootfs file content (stable, no more fragile dir mtime)
+    kernel_fingerprint.hash(&mut hasher);
     rootfs_fingerprint.hash(&mut hasher);
 
     memory_mb.hash(&mut hasher);
     network_enabled.hash(&mut hasher);
-
-    // Hash shared directory specifications — different --share args
-    // produce a different device tree layout, so the snapshot is invalid.
-    shared_dirs.len().hash(&mut hasher);
-    for dir in shared_dirs {
-        dir.hash(&mut hasher);
-    }
 
     hasher.finish()
 }
@@ -771,6 +770,12 @@ fn serialize_device_state(state: &DeviceState) -> Vec<u8> {
         serialize_virtio_mmio(&mut buf, mmio);
     }
 
+    // Virtiofs MMIO state (one entry per --share device)
+    buf.extend_from_slice(&(state.fs_mmio.len() as u32).to_le_bytes());
+    for mmio in &state.fs_mmio {
+        serialize_virtio_mmio(&mut buf, mmio);
+    }
+
     // GIC state
     if let Some(ref gic) = state.gic_state {
         buf.extend_from_slice(&(gic.len() as u32).to_le_bytes());
@@ -877,6 +882,20 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         (false, None)
     };
 
+    // Virtiofs MMIO state (added later; may be absent in old snapshots)
+    let fs_mmio = if off + 4 <= data.len() {
+        let num_fs = read_u32(data, &mut off)? as usize;
+        let mut fs = Vec::with_capacity(num_fs);
+        for _ in 0..num_fs {
+            fs.push(deserialize_virtio_mmio(
+                data, &mut off, &read_u8, &read_u16, &read_u32, &read_u64,
+            )?);
+        }
+        fs
+    } else {
+        Vec::new()
+    };
+
     // GIC state
     let gic_len = read_u32(data, &mut off)? as usize;
     let gic_state = if gic_len > 0 {
@@ -900,6 +919,7 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         rng_mmio,
         blk_mmio,
         use_virtio_blk,
+        fs_mmio,
         gic_state,
     })
 }
@@ -1008,6 +1028,31 @@ impl VirtioMmioSnapshot {
             status: dev.status,
             interrupt_status: dev.interrupt_status,
             config_generation: 0, // RNG device doesn't have config_generation
+            queues: dev
+                .queues
+                .iter()
+                .map(|q| VirtqSnapshot {
+                    num_max: q.num_max,
+                    num: q.num,
+                    ready: if q.ready { 1 } else { 0 },
+                    desc_addr: q.desc_addr,
+                    avail_addr: q.avail_addr,
+                    used_addr: q.used_addr,
+                    last_avail_idx: q.last_avail_idx,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_fs(dev: &VirtioFsDevice) -> Self {
+        VirtioMmioSnapshot {
+            device_features_sel: dev.device_features_sel,
+            driver_features: dev.driver_features,
+            driver_features_sel: dev.driver_features_sel,
+            queue_sel: dev.queue_sel,
+            status: dev.status,
+            interrupt_status: dev.interrupt_status,
+            config_generation: dev.config_generation,
             queues: dev
                 .queues
                 .iter()

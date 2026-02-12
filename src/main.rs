@@ -19,18 +19,11 @@ use cli::{Args, Cli, Command, PackArgs};
 fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
     let t0 = std::time::Instant::now();
 
-    // We need to read the kernel to compute the fingerprint.
+    // Resolve kernel and rootfs paths.
     let kernel_path = match &args.kernel {
         Some(p) => p.clone(),
         None => vm::resolve_data_path("vmlinux-sandal")?,
     };
-    let kernel_data = std::fs::read(&kernel_path).ok()?;
-    log::debug!(
-        "[bench] read kernel: {:.2}ms",
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
-
-    // Resolve rootfs path
     let default_rootfs = if args.rootfs.is_none() {
         vm::resolve_data_path("rootfs.ext2")
     } else {
@@ -40,23 +33,15 @@ fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
 
     let network_enabled = !args.no_network;
 
-    // Compute rootfs fingerprint from file content (stable hash, only reads 8KB)
-    let t1 = std::time::Instant::now();
+    // Fingerprint from file content (reads only 8KB per file, not the
+    // full kernel).  Reliable across copies, git checkouts, etc.
+    let kernel_fp = snapshot::hash_file_content(&kernel_path);
     let rootfs_fp = rootfs_path
         .map(|p| snapshot::hash_file_content(p))
         .unwrap_or(0);
-    log::debug!(
-        "[bench] hash rootfs: {:.2}ms",
-        t1.elapsed().as_secs_f64() * 1000.0
-    );
 
-    let fingerprint = snapshot::compute_fingerprint(
-        &kernel_data,
-        rootfs_fp,
-        args.memory,
-        network_enabled,
-        &args.shared_dirs,
-    );
+    let fingerprint =
+        snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
 
     let snap_path = snapshot::snapshot_path(fingerprint).ok()?;
     if !snap_path.exists() {
