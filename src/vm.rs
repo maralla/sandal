@@ -1,18 +1,25 @@
 use crate::cli::Args;
 use crate::devicetree::DeviceTree;
 use crate::hypervisor::{
-    self, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
+    self, HvGicIccReg, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
 };
+use crate::net::NetworkFilter;
+use crate::snapshot::{self, CpuState, DeviceState, SnapshotRestore, VirtioMmioSnapshot};
+use crate::unet::UserNet;
 use crate::virtio::blk::VirtioBlkDevice;
 use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
+use crate::{ext2, initramfs, rootfs};
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
 use memmap2::MmapMut;
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 // ARM64 guest physical memory layout.
 // All addresses are GPAs (Guest Physical Addresses) — the address space as seen by the
@@ -109,21 +116,21 @@ pub struct VmInstance {
     memory_size: usize,
     uart_type: UartType,
     kernel_entry: u64,
-    initrd_info: Option<(u64, u64)>,     // (start GPA, end GPA)
-    exit_code: Option<i32>,              // Set when guest signals exit via UART marker
-    boot_complete: bool,                 // Set once kernel finishes booting and init runs
-    boot_complete_iter: u64,             // Iteration at which boot_complete became true
-    command_injected: bool,              // Set once the command has been sent to the guest via UART
+    initrd_info: Option<(u64, u64)>,       // (start GPA, end GPA)
+    exit_code: Option<i32>,                // Set when guest signals exit via UART marker
+    boot_complete: bool,                   // Set once kernel finishes booting and init runs
+    boot_complete_iter: u64,               // Iteration at which boot_complete became true
+    command_injected: bool, // Set once the command has been sent to the guest via UART
     pending_mount_setup: Option<String>, // Mount setup line to inject before command
-    pending_command: Option<String>,     // Shell-escaped command line to inject after BOOT_MARKER
-    snapshot_save_path: Option<std::path::PathBuf>, // If set, save snapshot after boot
-    snapshot_fingerprint: u64,           // Fingerprint for the snapshot file
-    snapshot_pending: u32,               // Countdown: save snapshot when this reaches 0
-    restored_cpu_state: Option<crate::snapshot::CpuState>, // If set, restore these registers instead of boot state
+    pending_command: Option<String>, // Shell-escaped command line to inject after BOOT_MARKER
+    snapshot_save_path: Option<PathBuf>, // If set, save snapshot after boot
+    snapshot_fingerprint: u64, // Fingerprint for the snapshot file
+    snapshot_pending: u32,  // Countdown: save snapshot when this reaches 0
+    restored_cpu_state: Option<CpuState>, // If set, restore these registers instead of boot state
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
-    is_restored: bool,                     // True if VM was restored from a snapshot
-    uart_line_buf: String,                 // Buffer for current line being received
-    uart_suppress_line: bool,              // True if rest of line is suppressed (kernel/marker)
+    is_restored: bool,      // True if VM was restored from a snapshot
+    uart_line_buf: String,  // Buffer for current line being received
+    uart_suppress_line: bool, // True if rest of line is suppressed (kernel/marker)
     uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read (shared by both UART types)
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
@@ -305,7 +312,7 @@ impl VmInstance {
         // Map main memory
         self.vm
             .map_memory(
-                self.memory.as_mut_ptr() as *mut std::ffi::c_void,
+                self.memory.as_mut_ptr() as *mut c_void,
                 RAM_BASE,
                 self.memory_size,
                 flags,
@@ -501,7 +508,7 @@ impl VmInstance {
     }
 
     pub fn run_command(&mut self, _command: &[String]) -> Result<i32> {
-        let trc = std::time::Instant::now();
+        let trc = Instant::now();
         debug!("=== Starting Linux kernel execution ===");
 
         // Create VCPU
@@ -514,8 +521,8 @@ impl VmInstance {
         // If we have restored CPU state (snapshot restore), apply it.
         // Otherwise set up fresh boot state.
         if let Some(ref cpu_state) = self.restored_cpu_state {
-            let t = std::time::Instant::now();
-            crate::snapshot::restore_cpu_state(&vcpu, cpu_state)?;
+            let t = Instant::now();
+            snapshot::restore_cpu_state(&vcpu, cpu_state)?;
             debug!(
                 "[bench] restore_cpu_state: {:.2}ms",
                 t.elapsed().as_secs_f64() * 1000.0
@@ -704,7 +711,6 @@ impl VmInstance {
                     // hv_gic_set_state may have reset the CPU interface to defaults.
                     if let Some(ref cpu_state) = self.restored_cpu_state {
                         if cpu_state.icc_pmr_el1 != 0 || cpu_state.icc_igrpen1_el1 != 0 {
-                            use crate::hypervisor::HvGicIccReg;
                             vcpu.set_icc_reg(HvGicIccReg::SreEl1, cpu_state.icc_sre_el1)?;
                             vcpu.set_icc_reg(HvGicIccReg::PmrEl1, cpu_state.icc_pmr_el1)?;
                             vcpu.set_icc_reg(HvGicIccReg::Bpr0El1, cpu_state.icc_bpr0_el1)?;
@@ -756,7 +762,7 @@ impl VmInstance {
                         if device_state.gic_state.is_none() {
                             warn!("Skipping snapshot save: GIC state not available (macOS 15.0+ required)");
                         } else {
-                            match crate::snapshot::save_snapshot(
+                            match snapshot::save_snapshot(
                                 save_path,
                                 &self.memory,
                                 &vcpu,
@@ -766,9 +772,9 @@ impl VmInstance {
                                 Ok(()) => {
                                     info!("Snapshot saved to {}", save_path.display());
                                     if let Some(ref blk) = self.virtio_blk {
-                                        if let Ok(disk_path) = crate::snapshot::disk_image_path(
-                                            self.snapshot_fingerprint,
-                                        ) {
+                                        if let Ok(disk_path) =
+                                            snapshot::disk_image_path(self.snapshot_fingerprint)
+                                        {
                                             let tmp = disk_path.with_extension("tmp");
                                             match std::fs::write(&tmp, &blk.disk_image) {
                                                 Ok(()) => {
@@ -1143,7 +1149,6 @@ impl VmInstance {
     /// Uses poll() to block until stdin has data, then kicks the vcpu.
     /// Exits when stdin reaches EOF/POLLHUP or an error occurs.
     fn stdin_poller(vcpu_id: u64, stdin_fd: RawFd) {
-        use crate::hypervisor::Vcpu;
         loop {
             let (ready, hungup) = poll_stdin_once(stdin_fd);
             if ready || hungup {
@@ -1182,8 +1187,8 @@ impl VmInstance {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
         // Check for exit marker
-        if let Some(marker_pos) = trimmed.find(crate::initramfs::EXIT_MARKER) {
-            let after = &trimmed[marker_pos + crate::initramfs::EXIT_MARKER.len()..];
+        if let Some(marker_pos) = trimmed.find(initramfs::EXIT_MARKER) {
+            let after = &trimmed[marker_pos + initramfs::EXIT_MARKER.len()..];
             if let Ok(code) = after.trim().parse::<i32>() {
                 self.exit_code = Some(code);
             }
@@ -1196,7 +1201,7 @@ impl VmInstance {
         // has been injected.  Without this guard, user command output that
         // happens to contain BOOT_MARKER would re-trigger inject_command
         // (harmless but wasteful) and log misleading messages.
-        if !self.is_restored && trimmed.contains(crate::initramfs::BOOT_MARKER) {
+        if !self.is_restored && trimmed.contains(initramfs::BOOT_MARKER) {
             self.boot_complete = true;
             // boot_complete_iter is set by the caller (run_command) after calling process_uart_line
             debug!("{trimmed}");
@@ -1250,7 +1255,7 @@ impl VmInstance {
     }
 
     /// Build the device state snapshot from current device states.
-    fn capture_device_state(&self) -> crate::snapshot::DeviceState {
+    fn capture_device_state(&self) -> DeviceState {
         let uart_is_8250 = matches!(self.uart_type, UartType::Uart8250(_));
         let uart_8250_ier = if let UartType::Uart8250(ref state) = self.uart_type {
             state.ier
@@ -1263,18 +1268,9 @@ impl VmInstance {
             0
         };
 
-        let net_mmio = self
-            .virtio_net
-            .as_ref()
-            .map(crate::snapshot::VirtioMmioSnapshot::from_net);
-        let rng_mmio = self
-            .virtio_rng
-            .as_ref()
-            .map(crate::snapshot::VirtioMmioSnapshot::from_rng);
-        let blk_mmio = self
-            .virtio_blk
-            .as_ref()
-            .map(crate::snapshot::VirtioMmioSnapshot::from_blk);
+        let net_mmio = self.virtio_net.as_ref().map(VirtioMmioSnapshot::from_net);
+        let rng_mmio = self.virtio_rng.as_ref().map(VirtioMmioSnapshot::from_rng);
+        let blk_mmio = self.virtio_blk.as_ref().map(VirtioMmioSnapshot::from_blk);
 
         // Save GIC state (macOS 15.0+)
         let gic_state = Vm::save_gic_state();
@@ -1287,10 +1283,10 @@ impl VmInstance {
         let fs_mmio = self
             .virtiofs
             .iter()
-            .map(crate::snapshot::VirtioMmioSnapshot::from_fs)
+            .map(VirtioMmioSnapshot::from_fs)
             .collect();
 
-        crate::snapshot::DeviceState {
+        DeviceState {
             uart_is_8250,
             uart_8250_ier,
             pl011_imsc,
@@ -1415,7 +1411,7 @@ impl VmInstance {
                         // the exit marker here.
                         if self.boot_complete && !self.uart_suppress_line {
                             let buf_len = self.uart_line_buf.len();
-                            let marker = crate::initramfs::EXIT_MARKER.as_bytes();
+                            let marker = initramfs::EXIT_MARKER.as_bytes();
                             if buf_len <= marker.len()
                                 && self.uart_line_buf.as_bytes() == &marker[..buf_len]
                             {
@@ -1874,7 +1870,7 @@ impl VmInstance {
 
 /// Resolve a default data path by searching relative to the executable directory,
 /// then two levels up (for target/release/sandal -> project root), then CWD.
-pub fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
+pub fn resolve_data_path(relative: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         // Use parent() directly instead of canonicalize() to avoid the
         // expensive realpath() syscall chain (resolves every symlink
@@ -1894,7 +1890,7 @@ pub fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
-    let path = std::path::PathBuf::from(relative);
+    let path = PathBuf::from(relative);
     if path.exists() {
         Some(path)
     } else {
@@ -1915,9 +1911,6 @@ pub fn run(args: Args) -> Result<()> {
 
     // Set up networking (enabled by default)
     if network_enabled {
-        use crate::net::NetworkFilter;
-        use crate::unet::UserNet;
-
         info!("Initializing network...");
 
         let backend = UserNet::new().context("Failed to create user-space network")?;
@@ -1988,7 +1981,7 @@ pub fn run(args: Args) -> Result<()> {
                 "Invalid --share format: {share_spec:?} (expected host_path:guest_path)"
             )
         })?;
-        let host_path = std::path::PathBuf::from(host_str);
+        let host_path = PathBuf::from(host_str);
         if !host_path.exists() {
             anyhow::bail!("Shared path does not exist: {host_str:?}");
         }
@@ -2009,14 +2002,12 @@ pub fn run(args: Args) -> Result<()> {
     // as root_path but are never mounted, so no files are exposed.
     for i in args.shared_dirs.len()..MAX_FS_DEVICES {
         let mount_tag = format!("share{i}");
-        vm.virtiofs.push(VirtioFsDevice::new(
-            std::path::PathBuf::from("/"),
-            mount_tag,
-        ));
+        vm.virtiofs
+            .push(VirtioFsDevice::new(PathBuf::from("/"), mount_tag));
     }
 
     // Load initrd/rootfs (must be done before load_kernel, because load_kernel builds DTB)
-    // Resolve rootfs path (default: rootfs.ext2)
+    // Resolution order: --rootfs flag > rootfs.ext2 next to binary > built-in rootfs
     let default_rootfs = if args.rootfs.is_none() {
         resolve_data_path("rootfs.ext2")
     } else {
@@ -2025,30 +2016,29 @@ pub fn run(args: Args) -> Result<()> {
     let rootfs_arg = args.rootfs.as_ref().or(default_rootfs.as_ref());
 
     let use_8250 = vm.is_uart_8250();
-    if let Some(rootfs_path) = rootfs_arg {
+    let mut disk_image = if let Some(rootfs_path) = rootfs_arg {
         if !rootfs_path.is_file() {
             anyhow::bail!(
                 "--rootfs path {rootfs_path:?} is not a file (use `sandal pack <dir>` to create an ext2 image)"
             );
         }
-
         info!("Loading ext2 rootfs from {rootfs_path:?}...");
-        let mut disk_image = std::fs::read(rootfs_path)
-            .with_context(|| format!("Failed to read rootfs image {rootfs_path:?}"))?;
-        debug!(
-            "ext2 image: {} bytes ({} KB)",
-            disk_image.len(),
-            disk_image.len() / 1024
-        );
+        std::fs::read(rootfs_path)
+            .with_context(|| format!("Failed to read rootfs image {rootfs_path:?}"))?
+    } else {
+        info!("Using built-in rootfs");
+        rootfs::load()
+    };
+    debug!(
+        "ext2 image: {} bytes ({} KB)",
+        disk_image.len(),
+        disk_image.len() / 1024
+    );
 
+    {
         // Inject runtime files (/init, device nodes, CA certs, etc.)
-        crate::ext2::inject_runtime_files(
-            &mut disk_image,
-            &args.command,
-            network_enabled,
-            use_8250,
-        )
-        .context("Failed to inject runtime files into ext2 image")?;
+        ext2::inject_runtime_files(&mut disk_image, &args.command, network_enabled, use_8250)
+            .context("Failed to inject runtime files into ext2 image")?;
 
         if prefer_virtio_blk {
             // Fast path: kernel supports virtio-blk — load ext2 directly
@@ -2059,7 +2049,7 @@ pub fn run(args: Args) -> Result<()> {
             // Fallback: kernel only supports initramfs — convert ext2 to cpio
             info!("Converting ext2 to cpio for initramfs...");
             let cpio_data =
-                crate::ext2::ext2_to_cpio(&disk_image).context("Failed to convert ext2 to cpio")?;
+                ext2::ext2_to_cpio(&disk_image).context("Failed to convert ext2 to cpio")?;
             debug!(
                 "cpio archive: {} bytes ({} KB)",
                 cpio_data.len(),
@@ -2067,10 +2057,10 @@ pub fn run(args: Args) -> Result<()> {
             );
             vm.load_initrd(&cpio_data)?;
         }
-    } else if let Some(initrd_path) = &args.initrd {
+    }
+    if let Some(initrd_path) = &args.initrd {
         info!("Loading initrd from {initrd_path:?}...");
-        let initrd_data =
-            crate::initramfs::load_initrd(initrd_path).context("Failed to load initrd")?;
+        let initrd_data = initramfs::load_initrd(initrd_path).context("Failed to load initrd")?;
         vm.load_initrd(&initrd_data)?;
     }
 
@@ -2082,21 +2072,23 @@ pub fn run(args: Args) -> Result<()> {
 
     // Set mount setup + command to be injected via UART after BOOT_MARKER.
     // The init script reads two lines: mount setup, then the command.
-    let mount_setup = crate::initramfs::build_mount_setup_line(&shares);
+    let mount_setup = initramfs::build_mount_setup_line(&shares);
     vm.pending_mount_setup = Some(mount_setup);
-    let cmd_line = crate::initramfs::build_command_line(&args.command);
+    let cmd_line = initramfs::build_command_line(&args.command);
     vm.pending_command = Some(cmd_line.clone());
 
     // Compute fingerprint for snapshot caching.
     // Uses content-based hashing (first/last 4KB) — same as the fast
     // path in try_snapshot_restore, so saved snapshots are found on
     // subsequent runs.
-    let kernel_fp = crate::snapshot::hash_file_content(&kernel_path);
-    let rootfs_fp = rootfs_arg
-        .map(|p| crate::snapshot::hash_file_content(p))
-        .unwrap_or(0);
+    let kernel_fp = snapshot::hash_file_content(&kernel_path);
+    let rootfs_fp = if let Some(p) = rootfs_arg {
+        snapshot::hash_file_content(p)
+    } else {
+        snapshot::hash_bytes(rootfs::BUILTIN_ROOTFS_GZ)
+    };
     let fingerprint =
-        crate::snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
+        snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
     vm.snapshot_fingerprint = fingerprint;
 
     if !args.no_cache {
@@ -2104,7 +2096,7 @@ pub fn run(args: Args) -> Result<()> {
         // Virtiofs is supported: the mount is deferred to after BOOT_MARKER,
         // so no FUSE session is active at snapshot time.  On restore, fresh
         // VirtioFsDevice instances are created from --share args.
-        if let Ok(snap_path) = crate::snapshot::snapshot_path(fingerprint) {
+        if let Ok(snap_path) = snapshot::snapshot_path(fingerprint) {
             if !snap_path.exists() {
                 vm.snapshot_save_path = Some(snap_path);
             }
@@ -2120,15 +2112,12 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 /// Fast-path: restore a VM from a snapshot file and run a command.
-pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: u64) -> Result<()> {
-    use crate::snapshot::load_snapshot;
-    use std::ffi::c_void;
-
-    let t0 = std::time::Instant::now();
+pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Result<()> {
+    let t0 = Instant::now();
 
     info!("Restoring VM from snapshot...");
 
-    let snapshot = load_snapshot(snap_path, fingerprint)?;
+    let snapshot = snapshot::load_snapshot(snap_path, fingerprint)?;
     debug!(
         "[bench] load_snapshot (COW mmap): {:.2}ms",
         t0.elapsed().as_secs_f64() * 1000.0
@@ -2144,7 +2133,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     let memory_size = snapshot.memory_size;
 
     // Initialize hypervisor subsystem
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     hypervisor::init().context("Failed to initialize hypervisor")?;
     debug!(
         "[bench] hypervisor::init: {:.2}ms",
@@ -2152,8 +2141,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     );
 
     // Create VM (this also creates the GIC)
-    let t1 = std::time::Instant::now();
-    let vm_handle = crate::hypervisor::Vm::new().context("Failed to create VM")?;
+    let t1 = Instant::now();
+    let vm_handle = Vm::new().context("Failed to create VM")?;
     debug!(
         "[bench] Vm::new (+ GIC): {:.2}ms",
         t1.elapsed().as_secs_f64() * 1000.0
@@ -2162,7 +2151,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     // Use the COW (MAP_PRIVATE) memory directly from the snapshot — no
     // 256 MB memcpy.  Pages are faulted lazily and only copied when the
     // guest writes to them.
-    let crate::snapshot::SnapshotRestore {
+    let SnapshotRestore {
         mut memory,
         cpu_state: snapshot_cpu_state,
         device_state: snapshot_device_state,
@@ -2170,7 +2159,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     } = snapshot;
 
     // Map memory into guest
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     vm_handle.map_memory(
         memory.as_mut_ptr() as *mut c_void,
         RAM_BASE,
@@ -2195,11 +2184,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     };
 
     // Restore virtio-net device
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     let virtio_net = if network_enabled {
-        use crate::net::NetworkFilter;
-        use crate::unet::UserNet;
-
         let backend = UserNet::new().context("Failed to create user-space network")?;
         let filter = {
             let mut f = NetworkFilter::new();
@@ -2266,9 +2252,9 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     );
 
     // Restore virtio-blk device (load saved disk image)
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     let (virtio_blk, use_virtio_blk) = if snapshot_device_state.use_virtio_blk {
-        let disk_path = crate::snapshot::disk_image_path(fingerprint)?;
+        let disk_path = snapshot::disk_image_path(fingerprint)?;
         if !disk_path.exists() {
             anyhow::bail!(
                 "Snapshot requires disk image but {} not found",
@@ -2323,20 +2309,20 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
         let mount_tag = format!("share{i}");
         let host_path = if let Some(share_spec) = args.shared_dirs.get(i) {
             if let Some((host_str, guest_str)) = share_spec.split_once(':') {
-                let p = std::path::PathBuf::from(host_str);
+                let p = PathBuf::from(host_str);
                 if p.is_dir() {
                     shares.push((mount_tag.clone(), guest_str.to_string()));
                     p
                 } else {
                     log::warn!("Shared path is not a directory (skipped): {host_str:?}");
-                    std::path::PathBuf::from("/")
+                    PathBuf::from("/")
                 }
             } else {
                 log::warn!("Invalid --share format (skipped): {share_spec:?}");
-                std::path::PathBuf::from("/")
+                PathBuf::from("/")
             }
         } else {
-            std::path::PathBuf::from("/")
+            PathBuf::from("/")
         };
         let mut device = VirtioFsDevice::new(host_path, mount_tag);
 
@@ -2370,8 +2356,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
     );
 
     // Build mount setup + command line to inject via UART
-    let mount_setup = crate::initramfs::build_mount_setup_line(&shares);
-    let cmd_line = crate::initramfs::build_command_line(&args.command);
+    let mount_setup = initramfs::build_mount_setup_line(&shares);
+    let cmd_line = initramfs::build_command_line(&args.command);
 
     // Build the VmInstance struct with restored state
     let mut vm = VmInstance {
@@ -2423,7 +2409,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: 
         "[bench] total restore (before run): {:.2}ms",
         t0.elapsed().as_secs_f64() * 1000.0
     );
-    let t1 = std::time::Instant::now();
+    let t1 = Instant::now();
     let exit_code = vm.run_command(&args.command)?;
     debug!(
         "[bench] run_command wall time: {:.2}ms",

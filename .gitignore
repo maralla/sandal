@@ -7,6 +7,7 @@ Cargo.lock
 *.swp
 *.swo
 *~
-rootfs*
+rootfs.ext2*
+rootfs/
 kernels
 PROGRESS.md

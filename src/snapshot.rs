@@ -494,6 +494,25 @@ pub fn hash_file_content(path: &Path) -> u64 {
     hasher.finish()
 }
 
+/// Hash in-memory bytes for fingerprinting (same approach: size + first/last 4KB).
+/// Used for the built-in rootfs which is already in memory.
+pub fn hash_bytes(data: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    data.len().hash(&mut hasher);
+
+    let head_len = data.len().min(4096);
+    data[..head_len].hash(&mut hasher);
+
+    if data.len() > 4096 {
+        data[data.len() - 4096..].hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
 /// Compute a fingerprint from kernel/rootfs content hashes, memory size,
 /// and network config.  Changes to any of these invalidate the snapshot.
 ///

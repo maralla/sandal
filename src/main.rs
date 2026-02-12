@@ -5,6 +5,7 @@ mod ext2;
 mod hypervisor;
 mod initramfs;
 mod net;
+mod rootfs;
 mod snapshot;
 mod unet;
 mod virtio;
@@ -37,9 +38,13 @@ fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
     // Fingerprint from file content (reads only 8KB per file, not the
     // full kernel).  Reliable across copies, git checkouts, etc.
     let kernel_fp = snapshot::hash_file_content(&kernel_path);
-    let rootfs_fp = rootfs_path
-        .map(|p| snapshot::hash_file_content(p))
-        .unwrap_or(0);
+    let rootfs_fp = if let Some(p) = rootfs_path {
+        snapshot::hash_file_content(p)
+    } else {
+        // No external rootfs — use built-in rootfs fingerprint.
+        // Hash the compressed bytes directly (stable, no decompression needed).
+        snapshot::hash_bytes(rootfs::BUILTIN_ROOTFS_GZ)
+    };
 
     let fingerprint =
         snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);

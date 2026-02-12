@@ -55,7 +55,10 @@ pub fn lsl_x(rd: u32, rn: u32, shift: u32) -> u32 {
 /// `LDR Xt, [SP, #byte_off]` — load 64-bit from stack (unsigned offset).
 /// `byte_off` must be 8-byte aligned.
 pub fn ldr_x_sp(rt: u32, byte_off: u32) -> u32 {
-    assert!(byte_off.is_multiple_of(8), "byte_off must be 8-byte aligned");
+    assert!(
+        byte_off.is_multiple_of(8),
+        "byte_off must be 8-byte aligned"
+    );
     0xF9400000 | ((byte_off / 8) << 10) | (31 << 5) | rt
 }
 
