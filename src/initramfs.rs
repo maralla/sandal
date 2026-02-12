@@ -4,8 +4,7 @@
 /// Format reference: https://www.kernel.org/doc/Documentation/early-userspace/buffer-format.txt
 use anyhow::{Context, Result};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Marker printed by the init script before shutdown.
 /// The VM run loop looks for this to extract the exit code.
@@ -15,363 +14,6 @@ pub const EXIT_MARKER: &str = "SANDAL_EXIT:";
 /// before running the user command.  The VM loop detects this to switch
 /// from suppressed (pre-boot) output to direct character output.
 pub const BOOT_MARKER: &str = "SANDAL_BOOT_COMPLETE";
-
-/// Build a cpio newc archive from a directory on the host,
-/// injecting a command to run as the init process.
-/// Returns the raw bytes of the archive (uncompressed).
-pub fn build_from_directory(
-    dir: &Path,
-    command: &[String],
-    network: bool,
-    use_8250_uart: bool,
-    shares: &[(String, String)],
-) -> Result<Vec<u8>> {
-    let mut archive = Vec::new();
-    let mut inode: u32 = 300000; // Start with a high inode number to avoid collisions
-
-    // Collect all entries recursively
-    let mut entries: Vec<PathBuf> = Vec::new();
-    collect_entries(dir, dir, &mut entries)?;
-
-    // Sort for deterministic output
-    entries.sort();
-
-    for entry_path in &entries {
-        let rel_path = entry_path
-            .strip_prefix(dir)
-            .context("Failed to compute relative path")?;
-        let archive_path = rel_path.to_string_lossy().to_string();
-
-        // Skip the host's /init — we'll inject our own
-        if archive_path == "init" {
-            continue;
-        }
-
-        let metadata = fs::symlink_metadata(entry_path)
-            .with_context(|| format!("Failed to stat {entry_path:?}"))?;
-
-        let file_type = metadata.file_type();
-
-        if file_type.is_symlink() {
-            let target = fs::read_link(entry_path)
-                .with_context(|| format!("Failed to read symlink {entry_path:?}"))?;
-            let target_bytes = target.to_string_lossy().into_owned().into_bytes();
-
-            // Symlink: mode has 0o120000 bit set
-            let mode = 0o120777;
-            write_cpio_entry(
-                &mut archive,
-                &archive_path,
-                inode,
-                mode,
-                0,
-                0,
-                1,
-                metadata.mtime() as u32,
-                &target_bytes,
-                0,
-                0,
-            )?;
-        } else if file_type.is_dir() {
-            let mode = 0o040000 | (metadata.permissions().mode() & 0o7777);
-            write_cpio_entry(
-                &mut archive,
-                &archive_path,
-                inode,
-                mode,
-                0,
-                0,
-                2,
-                metadata.mtime() as u32,
-                &[],
-                0,
-                0,
-            )?;
-        } else if file_type.is_file() {
-            let data =
-                fs::read(entry_path).with_context(|| format!("Failed to read {entry_path:?}"))?;
-            let mode = 0o100000 | (metadata.permissions().mode() & 0o7777);
-            write_cpio_entry(
-                &mut archive,
-                &archive_path,
-                inode,
-                mode,
-                0,
-                0,
-                1,
-                metadata.mtime() as u32,
-                &data,
-                0,
-                0,
-            )?;
-        }
-        // Skip other file types (devices, sockets, etc.)
-
-        inode += 1;
-    }
-
-    // Ensure /dev directory exists (may already be in entries)
-    let has_dev = entries.iter().any(|e| {
-        e.strip_prefix(dir)
-            .map(|r| r.to_string_lossy() == "dev")
-            .unwrap_or(false)
-    });
-    if !has_dev {
-        write_cpio_entry(&mut archive, "dev", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
-        inode += 1;
-    }
-
-    // Create essential device nodes that can't be created on macOS with mknod
-    // Character device mode: 0o020000 | permissions
-    // /dev/console: major 5, minor 1
-    write_cpio_entry(
-        &mut archive,
-        "dev/console",
-        inode,
-        0o020666,
-        0,
-        0,
-        1,
-        0,
-        &[],
-        5,
-        1,
-    )?;
-    inode += 1;
-    // Serial console device node — depends on UART type
-    if use_8250_uart {
-        // /dev/ttyS0: major 4, minor 64 (8250/16550 UART)
-        write_cpio_entry(
-            &mut archive,
-            "dev/ttyS0",
-            inode,
-            0o020666,
-            0,
-            0,
-            1,
-            0,
-            &[],
-            4,
-            64,
-        )?;
-    } else {
-        // /dev/ttyAMA0: major 204, minor 64 (PL011 UART)
-        write_cpio_entry(
-            &mut archive,
-            "dev/ttyAMA0",
-            inode,
-            0o020666,
-            0,
-            0,
-            1,
-            0,
-            &[],
-            204,
-            64,
-        )?;
-    }
-    inode += 1;
-    // /dev/null: major 1, minor 3
-    write_cpio_entry(
-        &mut archive,
-        "dev/null",
-        inode,
-        0o020666,
-        0,
-        0,
-        1,
-        0,
-        &[],
-        1,
-        3,
-    )?;
-    inode += 1;
-    // /dev/tty: major 5, minor 0
-    write_cpio_entry(
-        &mut archive,
-        "dev/tty",
-        inode,
-        0o020666,
-        0,
-        0,
-        1,
-        0,
-        &[],
-        5,
-        0,
-    )?;
-    inode += 1;
-    // /dev/zero: major 1, minor 5
-    write_cpio_entry(
-        &mut archive,
-        "dev/zero",
-        inode,
-        0o020666,
-        0,
-        0,
-        1,
-        0,
-        &[],
-        1,
-        5,
-    )?;
-    inode += 1;
-
-    // Inject host CA certificates for HTTPS support
-    if network {
-        if let Some(ca_data) = load_host_ca_certificates() {
-            // Ensure etc/ssl/certs directory exists
-            let has_ssl_certs = entries.iter().any(|e| {
-                e.strip_prefix(dir)
-                    .map(|r| r.to_string_lossy() == "etc/ssl/certs")
-                    .unwrap_or(false)
-            });
-            if !has_ssl_certs {
-                let has_ssl = entries.iter().any(|e| {
-                    e.strip_prefix(dir)
-                        .map(|r| r.to_string_lossy() == "etc/ssl")
-                        .unwrap_or(false)
-                });
-                if !has_ssl {
-                    write_cpio_entry(
-                        &mut archive,
-                        "etc/ssl",
-                        inode,
-                        0o040755,
-                        0,
-                        0,
-                        2,
-                        0,
-                        &[],
-                        0,
-                        0,
-                    )?;
-                    inode += 1;
-                }
-                write_cpio_entry(
-                    &mut archive,
-                    "etc/ssl/certs",
-                    inode,
-                    0o040755,
-                    0,
-                    0,
-                    2,
-                    0,
-                    &[],
-                    0,
-                    0,
-                )?;
-                inode += 1;
-            }
-            write_cpio_entry(
-                &mut archive,
-                "etc/ssl/certs/ca-certificates.crt",
-                inode,
-                0o100644,
-                0,
-                0,
-                1,
-                0,
-                &ca_data,
-                0,
-                0,
-            )?;
-            inode += 1;
-        }
-    }
-
-    // Inject the entropy seeder binary (needed for TLS/getrandom to work)
-    let seeder_bin = generate_entropy_seeder();
-    // Ensure /usr/sbin directory exists
-    let has_usr_sbin = entries.iter().any(|e| {
-        e.strip_prefix(dir)
-            .map(|r| r.to_string_lossy() == "usr/sbin")
-            .unwrap_or(false)
-    });
-    if !has_usr_sbin {
-        let has_usr = entries.iter().any(|e| {
-            e.strip_prefix(dir)
-                .map(|r| r.to_string_lossy() == "usr")
-                .unwrap_or(false)
-        });
-        if !has_usr {
-            write_cpio_entry(&mut archive, "usr", inode, 0o040755, 0, 0, 2, 0, &[], 0, 0)?;
-            inode += 1;
-        }
-        write_cpio_entry(
-            &mut archive,
-            "usr/sbin",
-            inode,
-            0o040755,
-            0,
-            0,
-            2,
-            0,
-            &[],
-            0,
-            0,
-        )?;
-        inode += 1;
-    }
-    write_cpio_entry(
-        &mut archive,
-        "usr/sbin/seed-entropy",
-        inode,
-        0o100755,
-        0,
-        0,
-        1,
-        0,
-        &seeder_bin,
-        0,
-        0,
-    )?;
-    inode += 1;
-
-    // Inject the ctty helper binary (sets up controlling terminal for interactive shells)
-    let ctty_bin = generate_ctty_helper();
-    write_cpio_entry(
-        &mut archive,
-        "usr/sbin/sandal-ctty",
-        inode,
-        0o100755,
-        0,
-        0,
-        1,
-        0,
-        &ctty_bin,
-        0,
-        0,
-    )?;
-    inode += 1;
-
-    // Inject the /init script that runs the user's command
-    let init_script = generate_init_script(command, network, shares);
-    write_cpio_entry(
-        &mut archive,
-        "init",
-        inode,
-        0o100755,
-        0,
-        0,
-        1,
-        0,
-        init_script.as_bytes(),
-        0,
-        0,
-    )?;
-    let _inode = inode + 1;
-
-    // Write trailer entry
-    write_cpio_entry(&mut archive, "TRAILER!!!", 0, 0, 0, 0, 1, 0, &[], 0, 0)?;
-
-    // Pad archive to 512-byte boundary (convention, helps some loaders)
-    while archive.len() % 512 != 0 {
-        archive.push(0);
-    }
-
-    Ok(archive)
-}
 
 /// Public version of init script generator for use by ext2 builder.
 pub fn generate_init_script_ext(
@@ -383,16 +25,16 @@ pub fn generate_init_script_ext(
 }
 
 /// Generate the /init shell script that runs inside the VM.
-/// It mounts essential filesystems, runs the user's command,
-/// prints an exit marker, and powers off.
-fn generate_init_script(command: &[String], network: bool, shares: &[(String, String)]) -> String {
-    // Shell-escape each argument
-    let escaped_cmd = command
-        .iter()
-        .map(|arg| shell_escape(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-
+/// It mounts essential filesystems, reads the command from the host
+/// via UART, prints an exit marker, and powers off.
+///
+/// The command is NOT baked into the script. Instead, after boot setup
+/// completes and BOOT_MARKER is printed, the script reads a single line
+/// from stdin (the UART). The host injects the shell-escaped command
+/// into the UART RX buffer after detecting BOOT_MARKER.
+/// This decoupling enables VM snapshots: the same booted state can
+/// run different commands by injecting different UART input on restore.
+fn generate_init_script(_command: &[String], network: bool, shares: &[(String, String)]) -> String {
     let net_setup = if network {
         r#"
 # Network setup
@@ -447,12 +89,23 @@ fi
 /bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null
 /bin/mount -t tmpfs tmpfs /tmp 2>/dev/null
 
-# Load virtio-mmio module if available (needed for some kernels that
-# compile it as a module instead of built-in)
+# Load virtio modules if compiled as modules (needed for some kernels
+# like Debian's that don't build them in).  Order matters for deps:
+# failover → net_failover → virtio_net.
 KVER=$(uname -r)
-if [ -f "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" ]; then
-    insmod "/lib/modules/$KVER/kernel/drivers/virtio/virtio_mmio.ko" 2>/dev/null
-fi
+KMOD="/lib/modules/$KVER/kernel"
+for mod in \
+    drivers/virtio/virtio_mmio.ko \
+    net/core/failover.ko \
+    drivers/net/net_failover.ko \
+    drivers/net/virtio_net.ko \
+    drivers/char/hw_random/virtio-rng.ko \
+    drivers/block/virtio_blk.ko \
+    fs/fuse/fuse.ko \
+    fs/fuse/virtiofs.ko \
+; do
+    [ -f "$KMOD/$mod" ] && insmod "$KMOD/$mod" 2>/dev/null
+done
 
 # Set system clock to host time (needed for TLS certificate validation)
 date -s "@{now}" >/dev/null 2>&1
@@ -466,8 +119,29 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export TERM=linux
 cd /
 {net_setup}{mount_setup}
+# Determine controlling terminal device before BOOT_MARKER
+# (reading /sys after boot-complete would show on stdout)
+CTTY=/dev/$(cat /sys/class/tty/console/active 2>/dev/null)
+
+# Disable echo BEFORE signaling boot complete, so the command
+# line sent by the host is not echoed back to stdout.
+stty -echo 2>/dev/null
+
 # Signal boot complete to host (triggers direct UART output)
 echo "{BOOT_MARKER}"
+
+# Read the command from the UART.  The host writes a single
+# shell-escaped line to the UART RX buffer after detecting
+# BOOT_MARKER (or after restoring a snapshot).
+IFS= read -r SANDAL_CMD_LINE
+
+# Parse the command line back into positional parameters
+eval "set -- $SANDAL_CMD_LINE"
+
+# Re-enable echo.  The stty -echo above was only needed to suppress
+# the injected command line; now that it has been read, restore echo
+# so interactive programs (shells, cat, python, etc.) work properly.
+stty echo 2>/dev/null
 
 # Set up a controlling terminal.  PID 1 inherits session 0 from the
 # kernel and is NOT a session leader, so open() on a TTY will not make
@@ -478,8 +152,6 @@ echo "{BOOT_MARKER}"
 # We also resolve the command to an absolute path because execve(2)
 # does not search PATH.  `which` returns the filesystem path (not
 # builtin names like `command -v` does).
-CTTY=/dev/$(cat /sys/class/tty/console/active 2>/dev/null)
-set -- {escaped_cmd}
 SANDAL_CMD=$(which "$1" 2>/dev/null || echo "$1")
 shift
 if [ -c "$CTTY" ]; then
@@ -490,13 +162,31 @@ else
     SANDAL_RC=$?
 fi
 
-# Signal exit code to host
+# Signal exit code to host.
+# Primary: write EXIT_MARKER via the normal UART path (works on cold boot).
+# Fallback: write exit code directly to a special MMIO register at
+# UART_BASE + 0x100 that the VMM intercepts.  This bypasses the
+# TTY layer and works even after snapshot restore when the serial
+# driver's interrupt-driven TX path may be broken.
 echo "{EXIT_MARKER}$SANDAL_RC"
+devmem 0x09000100 32 "$SANDAL_RC" 2>/dev/null
 
 # Power off
 exec /sbin/poweroff -f
 "#
     )
+}
+
+/// Build the shell-escaped command line that the host sends to the guest
+/// via UART after BOOT_MARKER.  Returns a single line (no trailing newline)
+/// that the init script can `eval "set -- $line"` to recover the original
+/// argv.
+pub fn build_command_line(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Simple shell escaping: wrap in single quotes, escaping any embedded single quotes.
@@ -515,28 +205,9 @@ pub fn load_initrd(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("Failed to read initrd from {path:?}"))
 }
 
-/// Recursively collect all filesystem entries under `base`.
-#[allow(clippy::only_used_in_recursion)]
-fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
-    let read_dir =
-        fs::read_dir(current).with_context(|| format!("Failed to read directory {current:?}"))?;
-
-    for entry in read_dir {
-        let entry = entry?;
-        let path = entry.path();
-        entries.push(path.clone());
-
-        if entry.file_type()?.is_dir() {
-            collect_entries(base, &path, entries)?;
-        }
-    }
-
-    Ok(())
-}
-
 /// Write a single cpio "newc" format entry.
 #[allow(clippy::too_many_arguments)]
-fn write_cpio_entry(
+pub fn write_cpio_entry(
     archive: &mut Vec<u8>,
     name: &str,
     ino: u32,

@@ -196,7 +196,7 @@ impl Vcpu {
 
     /// Force exit of VCPUs (ARM64 only)
     #[cfg(target_arch = "aarch64")]
-    pub fn force_exit(vcpu_ids: &[u32]) -> Result<()> {
+    pub fn force_exit(vcpu_ids: &[u64]) -> Result<()> {
         use super::ffi::hv_vcpus_exit_wrapper;
 
         let ret =
@@ -233,6 +233,35 @@ impl Vcpu {
 
         if ret != HV_SUCCESS {
             anyhow::bail!("Failed to set trap debug exceptions: error code {ret}");
+        }
+
+        Ok(())
+    }
+
+    /// Read a GIC ICC (CPU interface) register
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_icc_reg(&self, reg: HvGicIccReg) -> Result<u64> {
+        use super::ffi::hv_gic_get_icc_reg_wrapper;
+
+        let mut value: u64 = 0;
+        let ret = unsafe { hv_gic_get_icc_reg_wrapper(self.id, reg as u16, &mut value) };
+
+        if ret != HV_SUCCESS {
+            anyhow::bail!("Failed to read ICC register {:?}: error code {ret}", reg);
+        }
+
+        Ok(value)
+    }
+
+    /// Write a GIC ICC (CPU interface) register
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_icc_reg(&self, reg: HvGicIccReg, value: u64) -> Result<()> {
+        use super::ffi::hv_gic_set_icc_reg_wrapper;
+
+        let ret = unsafe { hv_gic_set_icc_reg_wrapper(self.id, reg as u16, value) };
+
+        if ret != HV_SUCCESS {
+            anyhow::bail!("Failed to write ICC register {:?}: error code {ret}", reg);
         }
 
         Ok(())

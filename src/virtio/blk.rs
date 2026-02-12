@@ -42,12 +42,10 @@ pub struct VirtioBlkDevice {
     // Block device backing store
     pub disk_image: Vec<u8>,
     pub capacity_sectors: u64,
-    #[allow(dead_code)]
-    pub irq_spi: u32,
 }
 
 impl VirtioBlkDevice {
-    pub fn new(disk_image: Vec<u8>, irq_spi: u32) -> Self {
+    pub fn new(disk_image: Vec<u8>) -> Self {
         let capacity_sectors = (disk_image.len() / SECTOR_SIZE) as u64;
 
         VirtioBlkDevice {
@@ -61,7 +59,6 @@ impl VirtioBlkDevice {
             config_generation: 0,
             disk_image,
             capacity_sectors,
-            irq_spi,
         }
     }
 
@@ -113,8 +110,8 @@ impl VirtioBlkDevice {
                 match config_off {
                     0 => (self.capacity_sectors & 0xFFFFFFFF) as u32,
                     4 => ((self.capacity_sectors >> 32) & 0xFFFFFFFF) as u32,
-                    8 => SECTOR_SIZE as u32, // size_max
-                    12 => 128,               // seg_max
+                    8 => 32768, // size_max: must be >= PAGE_SIZE (4096 on arm64)
+                    12 => 128,  // seg_max
                     _ => 0,
                 }
             }

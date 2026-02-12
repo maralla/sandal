@@ -158,8 +158,46 @@ impl Vm {
     pub fn set_gic_spi(spi_num: u32, level: bool) {
         unsafe {
             let intid = spi_num + 32; // SPIs start at GIC interrupt ID 32
-            hv_gic_set_spi_wrapper(intid, level);
+            let ret = hv_gic_set_spi_wrapper(intid, level);
+            if ret != HV_SUCCESS {
+                log::warn!("hv_gic_set_spi(intid={intid}, level={level}) failed: {ret}");
+            }
         }
+    }
+
+    /// Save GIC state as an opaque byte blob (macOS 15.0+).
+    /// Returns None if GIC state saving is not supported.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_gic_state() -> Option<Vec<u8>> {
+        use super::ffi::{hv_gic_state_save_wrapper, HV_SUCCESS};
+
+        // First call: get the size
+        let mut size: usize = 0;
+        let ret = unsafe { hv_gic_state_save_wrapper(std::ptr::null_mut(), &mut size) };
+        if ret != HV_SUCCESS || size == 0 {
+            return None;
+        }
+
+        // Second call: get the data
+        let mut data = vec![0u8; size];
+        let ret = unsafe { hv_gic_state_save_wrapper(data.as_mut_ptr(), &mut size) };
+        if ret != HV_SUCCESS {
+            return None;
+        }
+        data.truncate(size);
+        Some(data)
+    }
+
+    /// Restore GIC state from an opaque byte blob (macOS 15.0+).
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_gic_state(data: &[u8]) -> Result<()> {
+        use super::ffi::{hv_gic_state_restore_wrapper, HV_SUCCESS};
+
+        let ret = unsafe { hv_gic_state_restore_wrapper(data.as_ptr(), data.len()) };
+        if ret != HV_SUCCESS {
+            anyhow::bail!("Failed to restore GIC state: error code {ret}");
+        }
+        Ok(())
     }
 
     /// Unmap guest physical memory

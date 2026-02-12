@@ -9,6 +9,8 @@ pub use vcpu::Vcpu;
 pub use vm::Vm;
 
 #[cfg(target_arch = "aarch64")]
+pub use ffi::HvGicIccReg;
+#[cfg(target_arch = "aarch64")]
 pub use ffi::HvSysReg;
 
 /// Check if Hypervisor framework is available

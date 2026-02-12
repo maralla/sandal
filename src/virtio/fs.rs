@@ -280,8 +280,6 @@ enum HandleInner {
 
 struct HandleState {
     inner: HandleInner,
-    #[allow(dead_code)]
-    inode: u64,
 }
 
 // ============================================================================
@@ -307,14 +305,10 @@ pub struct VirtioFsDevice {
     handles: HashMap<u64, HandleState>,
     next_ino: u64,
     next_fh: u64,
-
-    // MMIO identity (for interrupt routing)
-    #[allow(dead_code)]
-    pub irq_spi: u32,
 }
 
 impl VirtioFsDevice {
-    pub fn new(root_path: PathBuf, mount_tag: String, irq_spi: u32) -> Self {
+    pub fn new(root_path: PathBuf, mount_tag: String) -> Self {
         let mut inodes = HashMap::new();
         let mut path_to_inode = HashMap::new();
 
@@ -344,7 +338,6 @@ impl VirtioFsDevice {
             handles: HashMap::new(),
             next_ino: 2, // 1 is reserved for root
             next_fh: 1,
-            irq_spi,
         }
     }
 
@@ -954,7 +947,6 @@ impl VirtioFsDevice {
 
         let fh = self.alloc_handle(HandleState {
             inner: HandleInner::File(file),
-            inode: nodeid,
         });
 
         // fuse_open_out: fh(8) + open_flags(4) + padding(4) = 16 bytes
@@ -1082,7 +1074,6 @@ impl VirtioFsDevice {
 
         let fh = self.alloc_handle(HandleState {
             inner: HandleInner::Dir(path),
-            inode: nodeid,
         });
 
         let mut wb = WriteBuf::fuse_out(unique);
@@ -1268,7 +1259,6 @@ impl VirtioFsDevice {
 
         let fh = self.alloc_handle(HandleState {
             inner: HandleInner::File(file),
-            inode: ino,
         });
 
         // Response: fuse_entry_out (128) + fuse_open_out (16)

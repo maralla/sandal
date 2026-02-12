@@ -90,7 +90,7 @@ int hv_vcpu_get_vtimer_offset_wrapper(uint32_t vcpu, uint64_t *vtimer_offset) {
 }
 
 // Force VCPU exit
-int hv_vcpus_exit_wrapper(uint32_t *vcpus, uint32_t vcpu_count) {
+int hv_vcpus_exit_wrapper(uint64_t *vcpus, uint32_t vcpu_count) {
     return hv_vcpus_exit((hv_vcpu_t *)vcpus, vcpu_count);
 }
 
@@ -154,6 +154,40 @@ int hv_gic_get_spi_interrupt_range_wrapper(uint32_t *base, uint32_t *count) {
 
 int hv_gic_set_spi_wrapper(uint32_t intid, bool level) {
     return hv_gic_set_spi(intid, level);
+}
+
+// GIC ICC (CPU interface) register access
+int hv_gic_get_icc_reg_wrapper(uint32_t vcpu, uint16_t reg, uint64_t *value) {
+    return hv_gic_get_icc_reg((hv_vcpu_t)vcpu, (hv_gic_icc_reg_t)reg, value);
+}
+
+int hv_gic_set_icc_reg_wrapper(uint32_t vcpu, uint16_t reg, uint64_t value) {
+    return hv_gic_set_icc_reg((hv_vcpu_t)vcpu, (hv_gic_icc_reg_t)reg, value);
+}
+
+// GIC state save/restore (macOS 15.0+)
+int hv_gic_state_save_wrapper(void *data, size_t *size) {
+    hv_gic_state_t state = hv_gic_state_create();
+    if (!state) return -1;
+
+    int ret = hv_gic_state_get_size(state, size);
+    if (ret != 0) {
+        extern void os_release(void *);
+        os_release(state);
+        return ret;
+    }
+
+    if (data) {
+        ret = hv_gic_state_get_data(state, data);
+    }
+
+    extern void os_release(void *);
+    os_release(state);
+    return ret;
+}
+
+int hv_gic_state_restore_wrapper(const void *data, size_t size) {
+    return hv_gic_set_state(data, size);
 }
 #else
 // x86_64 register access

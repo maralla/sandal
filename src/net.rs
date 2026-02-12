@@ -40,17 +40,6 @@ impl NetworkFilter {
         }
     }
 
-    /// Create a permissive filter (allows everything).
-    #[allow(dead_code)]
-    pub fn allow_all() -> Self {
-        let mut f = Self::new();
-        f.allowed_protocols.insert(Protocol::Http);
-        f.allowed_protocols.insert(Protocol::Https);
-        f.allowed_protocols.insert(Protocol::Tcp);
-        f.allowed_protocols.insert(Protocol::Udp);
-        f
-    }
-
     /// Set allowed protocols.
     pub fn set_protocols(&mut self, protocols: Vec<Protocol>) {
         self.allowed_protocols = protocols.into_iter().collect();

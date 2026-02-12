@@ -149,7 +149,7 @@ extern "C" {
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_get_vtimer_offset_wrapper(vcpu: HvVcpu, vtimer_offset: *mut u64) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
-    pub fn hv_vcpus_exit_wrapper(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
+    pub fn hv_vcpus_exit_wrapper(vcpus: *mut u64, vcpu_count: u32) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_set_trap_debug_exceptions_wrapper(vcpu: HvVcpu, value: bool) -> HvReturn;
 
@@ -189,10 +189,23 @@ extern "C" {
 
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_set_spi_wrapper(intid: u32, level: bool) -> HvReturn;
+
+    // GIC ICC (CPU interface) register access
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_get_icc_reg_wrapper(vcpu: HvVcpu, reg: u16, value: *mut u64) -> HvReturn;
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_set_icc_reg_wrapper(vcpu: HvVcpu, reg: u16, value: u64) -> HvReturn;
+
+    // GIC state save/restore (macOS 15.0+)
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_state_save_wrapper(data: *mut u8, size: *mut usize) -> HvReturn;
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_state_restore_wrapper(data: *const u8, size: usize) -> HvReturn;
 }
 
 // ARM64 system registers
 #[repr(u32)]
+#[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 pub enum HvSysReg {
@@ -202,6 +215,7 @@ pub enum HvSysReg {
 
     // Memory management
     SctlrEl1 = 0xc080, // System Control Register
+    CpacrEl1 = 0xc082, // Coprocessor Access Control Register
     Ttbr0El1 = 0xc100, // Translation Table Base Register 0
     Ttbr1El1 = 0xc101, // Translation Table Base Register 1
     TcrEl1 = 0xc102,   // Translation Control Register
@@ -215,9 +229,46 @@ pub enum HvSysReg {
     FarEl1 = 0xc300,  // Fault Address Register (EL1)
     VbarEl1 = 0xc600, // Vector Base Address Register
 
+    // Thread ID registers
+    TpidrEl0 = 0xde82,   // Thread Pointer/ID Register (EL0)
+    TpidrroEl0 = 0xde83, // Thread Pointer/ID Register (EL0, read-only)
+    TpidrEl1 = 0xc684,   // Thread Pointer/ID Register (EL1)
+
     // Stack pointers
     SpEl1 = 0xe208, // Stack Pointer (EL1)
 
     // Debug
     MdscrEl1 = 0x8012, // Monitor Debug System Control Register
+
+    // Context ID
+    ContextidrEl1 = 0xc681, // Context ID Register (EL1)
+
+    // Auxiliary Control
+    ActlrEl1 = 0xc081, // Auxiliary Control Register (EL1)
+
+    // Address translation
+    ParEl1 = 0xc3a0, // Physical Address Register (EL1)
+
+    // Counter-timer
+    CntkctlEl1 = 0xc708,  // Counter-timer Kernel Control Register
+    CntvCtlEl0 = 0xdf19,  // Counter-timer Virtual Timer Control
+    CntvCvalEl0 = 0xdf1a, // Counter-timer Virtual Timer CompareValue
+}
+
+/// GIC ICC (CPU Interface) system registers.
+/// These are separate from HvSysReg and require dedicated hv_gic_{get,set}_icc_reg API.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+#[cfg(target_arch = "aarch64")]
+pub enum HvGicIccReg {
+    PmrEl1 = 0xc230,     // Priority Mask Register
+    Bpr0El1 = 0xc643,    // Binary Point Register 0
+    Ap0r0El1 = 0xc644,   // Active Priority Group 0 Register 0
+    Ap1r0El1 = 0xc648,   // Active Priority Group 1 Register 0
+    Bpr1El1 = 0xc663,    // Binary Point Register 1
+    CtlrEl1 = 0xc664,    // Control Register
+    SreEl1 = 0xc665,     // System Register Enable
+    Igrpen0El1 = 0xc666, // Interrupt Group 0 Enable
+    Igrpen1El1 = 0xc667, // Interrupt Group 1 Enable
 }

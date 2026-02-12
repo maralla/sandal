@@ -112,8 +112,17 @@ pub struct VmInstance {
     initrd_info: Option<(u64, u64)>, // (start GPA, end GPA)
     exit_code: Option<i32>,          // Set when guest signals exit via UART marker
     boot_complete: bool,             // Set once kernel finishes booting and init runs
-    uart_line_buf: String,           // Buffer for current line being received
-    uart_suppress_line: bool,        // True if rest of line is suppressed (kernel/marker)
+    boot_complete_iter: u64,         // Iteration at which boot_complete became true
+    command_injected: bool,          // Set once the command has been sent to the guest via UART
+    pending_command: Option<String>, // Shell-escaped command line to inject after BOOT_MARKER
+    snapshot_save_path: Option<std::path::PathBuf>, // If set, save snapshot after boot
+    snapshot_fingerprint: u64,       // Fingerprint for the snapshot file
+    snapshot_pending: u32,           // Countdown: save snapshot when this reaches 0
+    restored_cpu_state: Option<crate::snapshot::CpuState>, // If set, restore these registers instead of boot state
+    gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
+    is_restored: bool,                     // True if VM was restored from a snapshot
+    uart_line_buf: String,                 // Buffer for current line being received
+    uart_suppress_line: bool,              // True if rest of line is suppressed (kernel/marker)
     uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read (shared by both UART types)
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
@@ -248,6 +257,15 @@ impl VmInstance {
             initrd_info: None,
             exit_code: None,
             boot_complete: false,
+            boot_complete_iter: 0,
+            command_injected: false,
+            pending_command: None,
+            snapshot_save_path: None,
+            snapshot_fingerprint: 0,
+            snapshot_pending: 0,
+            restored_cpu_state: None,
+            gic_state_to_restore: None,
+            is_restored: false,
             uart_line_buf: String::new(),
             uart_suppress_line: false,
             uart_rx_buf: VecDeque::new(),
@@ -301,6 +319,23 @@ impl VmInstance {
     }
 
     pub fn load_kernel(&mut self, kernel_data: &[u8]) -> Result<()> {
+        // Read the text_offset from the ARM64 Image header (bytes 8-15, little-endian).
+        // The ARM64 boot protocol requires the Image at text_offset bytes from a
+        // 2MB-aligned base.  Older kernels (4.14) use text_offset=0x80000; modern
+        // kernels (>= 5.x) set text_offset=0 and are position-independent.
+        // When text_offset is 0, we use 0x200000 (2MB) to satisfy alignment and
+        // avoid overlapping with our bootloader trampoline at offset 0.
+        let text_offset = if kernel_data.len() >= 16 {
+            let offset = u64::from_le_bytes(kernel_data[8..16].try_into().unwrap());
+            if offset == 0 {
+                0x200000
+            } else {
+                offset
+            }
+        } else {
+            KERNEL_OFFSET
+        };
+
         // Bootloader trampoline at RAM_BASE.
         //
         // The Linux ARM64 boot protocol requires X0 = DTB address, X1-X3 = 0, and
@@ -308,8 +343,8 @@ impl VmInstance {
         // vCPU starts, this small stub runs first: it loads the DTB and kernel
         // addresses from its embedded data section, sets up registers, then jumps
         // to the kernel.
-        const DTB_GPA: u64 = RAM_BASE + DTB_OFFSET;
-        const KERNEL_ENTRY_GPA: u64 = RAM_BASE + KERNEL_OFFSET;
+        let dtb_gpa: u64 = RAM_BASE + DTB_OFFSET;
+        let kernel_entry_gpa: u64 = RAM_BASE + text_offset;
 
         let bootloader: [u32; 10] = [
             0x580000c0, // ldr x0, [pc, #0x18]  → load DTB address into X0
@@ -319,13 +354,13 @@ impl VmInstance {
             0x58000084, // ldr x4, [pc, #0x10]  → load kernel entry into X4
             0xd61f0080, // br x4                → jump to kernel
             // Embedded data: guest physical addresses
-            (DTB_GPA & 0xFFFFFFFF) as u32,
-            ((DTB_GPA >> 32) & 0xFFFFFFFF) as u32,
-            (KERNEL_ENTRY_GPA & 0xFFFFFFFF) as u32,
-            ((KERNEL_ENTRY_GPA >> 32) & 0xFFFFFFFF) as u32,
+            (dtb_gpa & 0xFFFFFFFF) as u32,
+            ((dtb_gpa >> 32) & 0xFFFFFFFF) as u32,
+            (kernel_entry_gpa & 0xFFFFFFFF) as u32,
+            ((kernel_entry_gpa >> 32) & 0xFFFFFFFF) as u32,
         ];
 
-        self.kernel_entry = KERNEL_ENTRY_GPA;
+        self.kernel_entry = kernel_entry_gpa;
 
         unsafe {
             let ptr = self.memory.as_mut_ptr() as *mut u32;
@@ -334,8 +369,8 @@ impl VmInstance {
             }
         }
 
-        // Load kernel at RAM_BASE + KERNEL_OFFSET
-        let kernel_offset = KERNEL_OFFSET as usize;
+        // Load kernel at the text_offset read from the Image header
+        let kernel_offset = text_offset as usize;
 
         if kernel_offset + kernel_data.len() > self.memory_size {
             anyhow::bail!(
@@ -358,8 +393,8 @@ impl VmInstance {
         self.load_device_tree()?;
 
         debug!("Bootloader configured:");
-        debug!("   Kernel at GPA: 0x{KERNEL_ENTRY_GPA:x}");
-        debug!("   DTB at GPA: 0x{DTB_GPA:x}");
+        debug!("   Kernel at GPA: 0x{kernel_entry_gpa:x} (text_offset=0x{text_offset:x})");
+        debug!("   DTB at GPA: 0x{dtb_gpa:x}");
 
         Ok(())
     }
@@ -471,53 +506,84 @@ impl VmInstance {
         let vcpu = Vcpu::new().context("Failed to create vCPU")?;
         debug!("vCPU created (ID: {})", vcpu.id());
 
-        // Configure VCPU state
-
-        // PC → bootloader at RAM_BASE
-        let bootloader_gpa = RAM_BASE;
-        vcpu.write_register(HvReg::Pc, bootloader_gpa)?;
-
-        // CPSR → EL1h with all interrupts masked (DAIF)
-        vcpu.write_register(HvReg::Cpsr, 0x3C5)?;
-
-        // SCTLR_EL1 → 0 (MMU off, caches off)
-        vcpu.write_sys_register(HvSysReg::SctlrEl1, 0)?;
-
-        // Stack pointers
-        let sp_addr = RAM_BASE + (self.memory_size as u64) - 0x10000; // Near top of RAM
-        vcpu.write_sys_register(HvSysReg::SpEl0, sp_addr)?;
-        vcpu.write_sys_register(HvSysReg::SpEl1, sp_addr)?;
-
-        // Set MPIDR_EL1 for GIC redistributor mapping
-        // Bit 31 is RES1 on AArch64, Aff0=0 for CPU 0
-        vcpu.write_sys_register(HvSysReg::MpidrEl1, 0x80000000)?;
-
-        // Trap debug exceptions
-        vcpu.set_trap_debug_exceptions(true)?;
-
-        if log::log_enabled!(log::Level::Debug) {
-            let verify_pc = vcpu.read_register(HvReg::Pc)?;
-            let verify_cpsr = vcpu.read_register(HvReg::Cpsr)?;
-            debug!("VCPU configured:");
+        // If we have restored CPU state (snapshot restore), apply it.
+        // Otherwise set up fresh boot state.
+        if let Some(ref cpu_state) = self.restored_cpu_state {
+            crate::snapshot::restore_cpu_state(&vcpu, cpu_state)?;
             debug!(
-                "   PC:   0x{:x} (expected: 0x{:x}) {}",
-                verify_pc,
-                bootloader_gpa,
-                if verify_pc == bootloader_gpa {
-                    "OK"
-                } else {
-                    "MISMATCH!"
-                }
+                "vCPU state restored from snapshot (PC=0x{:x}, CPSR=0x{:x})",
+                cpu_state.pc, cpu_state.cpsr
             );
-            debug!("   CPSR: 0x{:x} (EL{}h)", verify_cpsr, verify_cpsr & 0xF);
-            debug!("   SP:   0x{sp_addr:x}");
-            debug!("   Kernel entry: 0x{:x}", self.kernel_entry);
 
-            if verify_pc != bootloader_gpa {
-                warn!("PC mismatch! HvReg values may still be wrong.");
+            // Defer GIC state restore until the vCPU has run.
+            // HVF's internal GIC routing tables may not be ready
+            // until the vCPU has executed at least once.
+            // GIC state will be restored from self.gic_state_to_restore
+            // in the main loop after the first few iterations.
+
+            // Note: The snapshot is taken while the kernel holds the UART
+            // port spinlock (inside spin_lock_irqsave), with IRQs disabled
+            // in CPSR.  On restore the kernel resumes at the same PC,
+            // processes the MMIO result, and naturally unlocks via
+            // spin_unlock_irqrestore.  The unlock uses `stlr` (store-release),
+            // NOT `stlxr` (store-exclusive), so the HVF exclusive-monitor
+            // clearing between VM exits does not affect it — the unlock
+            // always succeeds.  No manual lock patching is needed.
+            //
+            // IRQs remain masked in CPSR until spin_unlock_irqrestore
+            // restores the saved flags, so no interrupt handler can run
+            // (and attempt to re-acquire the lock) until the lock is freed.
+
+            debug!("--- Entering VCPU run loop (restored) ---");
+        } else {
+            // Configure VCPU state for fresh boot
+
+            // PC → bootloader at RAM_BASE
+            let bootloader_gpa = RAM_BASE;
+            vcpu.write_register(HvReg::Pc, bootloader_gpa)?;
+
+            // CPSR → EL1h with all interrupts masked (DAIF)
+            vcpu.write_register(HvReg::Cpsr, 0x3C5)?;
+
+            // SCTLR_EL1 → 0 (MMU off, caches off)
+            vcpu.write_sys_register(HvSysReg::SctlrEl1, 0)?;
+
+            // Stack pointers
+            let sp_addr = RAM_BASE + (self.memory_size as u64) - 0x10000; // Near top of RAM
+            vcpu.write_sys_register(HvSysReg::SpEl0, sp_addr)?;
+            vcpu.write_sys_register(HvSysReg::SpEl1, sp_addr)?;
+
+            // Set MPIDR_EL1 for GIC redistributor mapping
+            // Bit 31 is RES1 on AArch64, Aff0=0 for CPU 0
+            vcpu.write_sys_register(HvSysReg::MpidrEl1, 0x80000000)?;
+
+            // Trap debug exceptions
+            vcpu.set_trap_debug_exceptions(true)?;
+
+            if log::log_enabled!(log::Level::Debug) {
+                let verify_pc = vcpu.read_register(HvReg::Pc)?;
+                let verify_cpsr = vcpu.read_register(HvReg::Cpsr)?;
+                debug!("VCPU configured:");
+                debug!(
+                    "   PC:   0x{:x} (expected: 0x{:x}) {}",
+                    verify_pc,
+                    bootloader_gpa,
+                    if verify_pc == bootloader_gpa {
+                        "OK"
+                    } else {
+                        "MISMATCH!"
+                    }
+                );
+                debug!("   CPSR: 0x{:x} (EL{}h)", verify_cpsr, verify_cpsr & 0xF);
+                debug!("   SP:   0x{sp_addr:x}");
+                debug!("   Kernel entry: 0x{:x}", self.kernel_entry);
+
+                if verify_pc != bootloader_gpa {
+                    warn!("PC mismatch! HvReg values may still be wrong.");
+                }
+
+                debug!("--- Entering VCPU run loop ---");
             }
-
-            debug!("--- Entering VCPU run loop ---");
         }
 
         let mut iteration: u64 = 0;
@@ -560,14 +626,14 @@ impl VmInstance {
         // pipe fd reports always-readable on macOS kqueue), so a
         // poll()-based poller is the only reliable approach.
         let stdin_poller_thread = {
-            let vcpu_id = vcpu.id();
+            let vcpu_id = vcpu.id() as u64;
             Some(std::thread::spawn(move || {
                 Self::stdin_poller(vcpu_id, stdin_fd);
             }))
         };
 
         let net_poller_thread = if let Some(ref mut net) = self.virtio_net {
-            let poller = net.create_poller(vcpu.id());
+            let poller = net.create_poller(vcpu.id() as u64);
             // Register stdin with kqueue so keypresses kick the vcpu
             // (TTY only — pipes report as always-readable on kqueue
             // which would spin the poller).
@@ -594,6 +660,53 @@ impl VmInstance {
                 debug!("iter={}M, PC=0x{:x}", iteration / 1000000, pc);
             }
 
+            // Track iterations after boot_complete
+            if self.boot_complete && self.boot_complete_iter == 0 {
+                self.boot_complete_iter = iteration;
+            }
+
+            // Deferred GIC state restore: apply before the first vcpu.run()
+            // in the main loop.  HVF initializes its GIC routing tables
+            // during VM/vCPU creation, so this works at iteration==1.
+            if iteration == 1 {
+                if let Some(gic_data) = self.gic_state_to_restore.take() {
+                    match Vm::restore_gic_state(&gic_data) {
+                        Ok(()) => debug!("GIC state restored (deferred, {} bytes)", gic_data.len()),
+                        Err(e) => {
+                            // GIC state is required for interrupt routing (UART TX,
+                            // vtimer, virtio).  Without it the VM will hang or produce
+                            // no output.  Return an error so the caller can fall back
+                            // to a full boot.
+                            return Err(anyhow::anyhow!("GIC state restore failed: {e}"));
+                        }
+                    }
+                    // Re-apply ICC registers after GIC state restore, because
+                    // hv_gic_set_state may have reset the CPU interface to defaults.
+                    if let Some(ref cpu_state) = self.restored_cpu_state {
+                        if cpu_state.icc_pmr_el1 != 0 || cpu_state.icc_igrpen1_el1 != 0 {
+                            use crate::hypervisor::HvGicIccReg;
+                            vcpu.set_icc_reg(HvGicIccReg::SreEl1, cpu_state.icc_sre_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::PmrEl1, cpu_state.icc_pmr_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Bpr0El1, cpu_state.icc_bpr0_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Bpr1El1, cpu_state.icc_bpr1_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::CtlrEl1, cpu_state.icc_ctlr_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Ap0r0El1, cpu_state.icc_ap0r0_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Ap1r0El1, cpu_state.icc_ap1r0_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Igrpen0El1, cpu_state.icc_igrpen0_el1)?;
+                            vcpu.set_icc_reg(HvGicIccReg::Igrpen1El1, cpu_state.icc_igrpen1_el1)?;
+                            debug!("ICC regs re-applied after GIC state restore");
+                        }
+                    }
+                }
+            }
+
+            // Diagnostic: log pre-run state on restore
+            if self.is_restored && iteration <= 5 {
+                let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                let cpsr = vcpu.read_register(HvReg::Cpsr).unwrap_or(0);
+                debug!("restore pre-run iter {iteration}: PC=0x{pc:x} CPSR=0x{cpsr:x}");
+            }
+
             let exit_reason = match vcpu.run() {
                 Ok(r) => r,
                 Err(e) => {
@@ -603,11 +716,73 @@ impl VmInstance {
                 }
             };
 
+            // Unmask the vtimer after any non-VTIMER exit.
+            if exit_reason != 2 {
+                vcpu.set_vtimer_mask(false)?;
+            }
+
+            // ── Snapshot countdown ──────────────────────────────────
+            // After BOOT_MARKER the kernel enters a UART polling loop
+            // (DataAbort exits) waiting for our command.  Count down a
+            // handful of exits so the kernel has flushed the BOOT_MARKER
+            // echo and is in a steady polling state, then save.
+            if self.snapshot_pending > 0 {
+                self.snapshot_pending -= 1;
+                if self.snapshot_pending == 0 && self.boot_complete && !self.command_injected {
+                    let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                    debug!("Snapshot countdown reached 0, saving (PC=0x{pc:x})");
+                    if let Some(ref save_path) = self.snapshot_save_path.clone() {
+                        let device_state = self.capture_device_state();
+                        if device_state.gic_state.is_none() {
+                            warn!("Skipping snapshot save: GIC state not available (macOS 15.0+ required)");
+                        } else {
+                            match crate::snapshot::save_snapshot(
+                                save_path,
+                                &self.memory,
+                                &vcpu,
+                                &device_state,
+                                self.snapshot_fingerprint,
+                            ) {
+                                Ok(()) => {
+                                    info!("Snapshot saved to {}", save_path.display());
+                                    if let Some(ref blk) = self.virtio_blk {
+                                        if let Ok(disk_path) = crate::snapshot::disk_image_path(
+                                            self.snapshot_fingerprint,
+                                        ) {
+                                            let tmp = disk_path.with_extension("tmp");
+                                            match std::fs::write(&tmp, &blk.disk_image) {
+                                                Ok(()) => {
+                                                    if let Err(e) =
+                                                        std::fs::rename(&tmp, &disk_path)
+                                                    {
+                                                        warn!("Failed to rename disk image: {e}");
+                                                    } else {
+                                                        debug!(
+                                                            "Disk image saved ({} MB)",
+                                                            blk.disk_image.len() / (1024 * 1024)
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to save disk image: {e}")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => warn!("Failed to save snapshot: {e}"),
+                            }
+                        }
+                    }
+                    // Inject the command into the UART buffer.
+                    self.inject_command();
+                }
+            }
+
             match exit_reason {
                 0 => {
                     // HV_EXIT_REASON_CANCELED — hv_vcpus_exit() was called
-                    // (from the network poller thread or externally).
-                    // Just continue to poll the network and re-enter the vcpu.
+                    // (e.g. by the stdin/network poller to wake a WFI-parked vCPU)
                 }
                 1 => {
                     // HV_EXIT_REASON_EXCEPTION
@@ -616,7 +791,7 @@ impl VmInstance {
                     let ec = (syndrome >> 26) & 0x3F;
                     let iss = syndrome & 0x1FFFFFF;
 
-                    // Detailed logging for first 30 iterations
+                    // Detailed logging for first 30 iterations during boot
                     if iteration <= 30 {
                         let ec_name = match ec {
                             0x01 => "WFI/WFE",
@@ -636,7 +811,8 @@ impl VmInstance {
 
                     match ec {
                         0x01 => {
-                            // WFI/WFE - just advance PC
+                            // WFI/WFE — the kernel is idle.
+                            // Just advance past the WFI instruction.
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
 
@@ -850,10 +1026,7 @@ impl VmInstance {
 
                 2 => {
                     // HV_EXIT_REASON_VTIMER_ACTIVATED
-                    // Virtual timer fired - inject the timer IRQ and unmask
-                    // The GIC will deliver the interrupt to the guest
                     vcpu.set_vtimer_mask(true)?;
-                    // Inject IRQ (type 0 = IRQ) to signal the timer interrupt
                     vcpu.set_pending_interrupt(0, true)?;
                 }
 
@@ -864,14 +1037,16 @@ impl VmInstance {
             }
 
             // Poll stdin for input and buffer it for the guest UART.
-            // Delay until boot completes so piped data isn't consumed by
-            // the kernel's console driver during init (PL011 polls DR
-            // during probe, draining any buffered characters).
-            if self.boot_complete {
+            // Delay until after the command has been injected so that
+            // (a) piped data isn't consumed by the kernel's console
+            //     driver during init (PL011 polls DR during probe), and
+            // (b) stdin EOF (Ctrl-D) doesn't reach the guest's `read`
+            //     before the command data when running without a TTY.
+            if self.boot_complete && self.command_injected {
                 self.poll_stdin(stdin_fd, &mut stdin_eof);
             }
 
-            // Fire UART interrupt if any source is pending
+            // Fire UART interrupt if any source is pending.
             if let UartType::Uart8250(ref mut state) = self.uart_type {
                 let rx_pending = !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0;
                 let tx_pending =
@@ -895,6 +1070,8 @@ impl VmInstance {
                     Vm::set_gic_spi(VIRTIO_NET_SPI, true);
                 }
             }
+
+            // (vtimer is unmasked at the top of the loop, before vcpu.run())
 
             // Exit immediately once the exit marker has been received
             // (no need to wait for the guest to poweroff)
@@ -945,7 +1122,7 @@ impl VmInstance {
     /// Minimal poller for stdin when networking is disabled.
     /// Uses poll() to block until stdin has data, then kicks the vcpu.
     /// Exits when stdin reaches EOF/POLLHUP or an error occurs.
-    fn stdin_poller(vcpu_id: u32, stdin_fd: RawFd) {
+    fn stdin_poller(vcpu_id: u64, stdin_fd: RawFd) {
         use crate::hypervisor::Vcpu;
         loop {
             let (ready, hungup) = poll_stdin_once(stdin_fd);
@@ -994,10 +1171,27 @@ impl VmInstance {
         }
 
         // Detect boot completion — the init script prints this marker
-        // right before running the user command.
-        if trimmed.contains(crate::initramfs::BOOT_MARKER) {
+        // right before reading the command from the UART.
+        // Skip on restored VMs: boot is already complete and the command
+        // has been injected.  Without this guard, user command output that
+        // happens to contain BOOT_MARKER would re-trigger inject_command
+        // (harmless but wasteful) and log misleading messages.
+        if !self.is_restored && trimmed.contains(crate::initramfs::BOOT_MARKER) {
             self.boot_complete = true;
+            // boot_complete_iter is set by the caller (run_command) after calling process_uart_line
             debug!("{trimmed}");
+
+            if self.snapshot_save_path.is_some() {
+                // Start a countdown to save the snapshot.  We wait a
+                // few VM-exit iterations so the kernel has finished
+                // flushing the BOOT_MARKER echo output and is settled
+                // into the UART polling loop for `read`.
+                debug!("BOOT_MARKER detected, starting snapshot countdown");
+                self.snapshot_pending = 5;
+            } else {
+                // No snapshot saving; inject the command immediately.
+                self.inject_command();
+            }
             return;
         }
 
@@ -1008,6 +1202,70 @@ impl VmInstance {
 
         // After boot: characters were already written directly to stdout
         // by the UART write handler, so nothing more to print here.
+    }
+
+    /// Inject the pending command into the UART RX buffer so the guest
+    /// init script's `read` call receives it.
+    fn inject_command(&mut self) {
+        if self.command_injected {
+            return;
+        }
+        if let Some(cmd_line) = self.pending_command.take() {
+            debug!("Injecting command via UART: {cmd_line}");
+            for byte in cmd_line.as_bytes() {
+                self.uart_rx_buf.push_back(*byte);
+            }
+            self.uart_rx_buf.push_back(b'\n'); // Terminate the line
+            self.command_injected = true;
+        }
+    }
+
+    /// Build the device state snapshot from current device states.
+    fn capture_device_state(&self) -> crate::snapshot::DeviceState {
+        let uart_is_8250 = matches!(self.uart_type, UartType::Uart8250(_));
+        let uart_8250_ier = if let UartType::Uart8250(ref state) = self.uart_type {
+            state.ier
+        } else {
+            0
+        };
+        let pl011_imsc = if let UartType::PL011(ref state) = self.uart_type {
+            state.imsc
+        } else {
+            0
+        };
+
+        let net_mmio = self
+            .virtio_net
+            .as_ref()
+            .map(crate::snapshot::VirtioMmioSnapshot::from_net);
+        let rng_mmio = self
+            .virtio_rng
+            .as_ref()
+            .map(crate::snapshot::VirtioMmioSnapshot::from_rng);
+        let blk_mmio = self
+            .virtio_blk
+            .as_ref()
+            .map(crate::snapshot::VirtioMmioSnapshot::from_blk);
+
+        // Save GIC state (macOS 15.0+)
+        let gic_state = Vm::save_gic_state();
+        if let Some(ref state) = gic_state {
+            debug!("GIC state saved ({} bytes)", state.len());
+        } else {
+            warn!("GIC state save not available (macOS 15.0+ required for snapshot restore)");
+        }
+
+        crate::snapshot::DeviceState {
+            uart_is_8250,
+            uart_8250_ier,
+            pl011_imsc,
+            network_enabled: self.network_enabled,
+            net_mmio,
+            rng_mmio,
+            blk_mmio,
+            use_virtio_blk: self.use_virtio_blk,
+            gic_state,
+        }
     }
 
     /// Handle PSCI calls (Power State Coordination Interface)
@@ -1022,8 +1280,10 @@ impl VmInstance {
                 Ok(0)
             }
             0x84000002 => {
-                // PSCI_CPU_OFF
-                Ok(0)
+                // PSCI_CPU_OFF — on a single-CPU VM, turning off the
+                // only CPU is equivalent to system shutdown.  Treat it
+                // like SYSTEM_OFF so the VM exits cleanly.
+                Ok(0xDEAD_DEAD)
             }
             0x84000003 | 0xC4000003 => {
                 // PSCI_CPU_ON
@@ -1092,6 +1352,19 @@ impl VmInstance {
             if is_write {
                 let value = Self::read_guest_register(vcpu, rt)?;
 
+                // Exit code register at UART_BASE + 0x100.
+                // The init script writes the exit code here via devmem
+                // as a fallback when the UART TTY path is broken
+                // (e.g. after snapshot restore).
+                if reg_offset == 0x100 {
+                    let code = value as i32;
+                    debug!("Exit code register written: {code}");
+                    if self.exit_code.is_none() {
+                        self.exit_code = Some(code);
+                    }
+                    return Ok(());
+                }
+
                 // Both PL011 DR and 8250 THR are at offset 0x00
                 if reg_offset == 0 {
                     let ch = (value & 0xFF) as u8;
@@ -1140,9 +1413,17 @@ impl VmInstance {
                             self.process_uart_line(&line);
                         }
                     }
-                    // Mark that THR was written; THRE will fire after the ISR exits
+                    // Mark that THR was written.  In our emulation the
+                    // character is "transmitted" immediately (written to
+                    // host stdout), so the Transmit Holding Register is
+                    // empty again.  Set thre_pending directly so the
+                    // post-exit interrupt check fires the THRE SPI,
+                    // driving the kernel's TTY output path.
                     if let UartType::Uart8250(ref mut state) = self.uart_type {
                         state.thr_written = true;
+                        if (state.ier & 0x02) != 0 {
+                            state.thre_pending = true;
+                        }
                     }
                 } else if reg_offset == 0x04 {
                     if let UartType::Uart8250(ref mut state) = self.uart_type {
@@ -1163,8 +1444,19 @@ impl VmInstance {
                             // sources.  Changing the mask can make MIS transition
                             // to/from zero, so update the IRQ level afterward.
                             0x38 => {
+                                let old_imsc = state.imsc;
                                 state.imsc = value as u32;
                                 update_irq = true;
+                                let rx_len = self.uart_rx_buf.len();
+                                let mut ris = 1u32 << 5; // TXIS
+                                if rx_len > 0 {
+                                    ris |= 1 << 4; // RXIS
+                                }
+                                let mis = ris & state.imsc;
+                                debug!(
+                                    "PL011 IMSC: 0x{:x} -> 0x{:x}, RIS=0x{:x}, MIS=0x{:x}, rx_buf={}",
+                                    old_imsc, state.imsc, ris, mis, rx_len
+                                );
                             }
                             // ICR (Interrupt Clear Register): on real hardware,
                             // write-1-to-clear latches in RIS.  Our RIS is purely
@@ -1334,7 +1626,7 @@ impl VmInstance {
                 if is_write {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = blk.mmio_write(offset, value) {
-                        // QueueNotify — process the request queue
+                        // QueueNotify — process the request and complete it
                         if blk.process_queue(&mut self.memory, RAM_BASE) {
                             Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
                         }
@@ -1453,8 +1745,8 @@ impl VmInstance {
     /// For TTBR1_EL1 (kernel addresses starting with 0xFFFF...)
     fn translate_va_to_pa(&self, va: u64, ttbr1: u64, t1sz: u64) -> Option<u64> {
         // ARM64 4KB page table walk
-        // Extract table base from TTBR1 (mask off ASID and other bits)
-        let table_base = ttbr1 & !0xFFF;
+        // Extract table base from TTBR1 (mask off ASID in bits[63:48] and page offset)
+        let table_base = ttbr1 & 0x0000_FFFF_FFFF_F000;
 
         // VA bits used: 64 - T1SZ
         let va_bits = 64 - t1sz;
@@ -1546,7 +1838,7 @@ impl VmInstance {
 
 /// Resolve a default data path by searching relative to the executable directory,
 /// then two levels up (for target/release/sandal -> project root), then CWD.
-fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
+pub fn resolve_data_path(relative: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe
             .canonicalize()
@@ -1610,14 +1902,14 @@ pub fn run(args: Args) -> Result<()> {
             f
         };
 
-        let device = VirtioNetDevice::new(backend, filter, VIRTIO_NET_SPI);
+        let device = VirtioNetDevice::new(backend, filter);
         vm.virtio_net = Some(device);
     }
 
-    // Resolve kernel path (default: kernels/vmlinux)
+    // Resolve kernel path (default: vmlinux-sandal)
     let kernel_path = match &args.kernel {
         Some(p) => p.clone(),
-        None => resolve_data_path("kernels/vmlinux").ok_or_else(|| {
+        None => resolve_data_path("vmlinux-sandal").ok_or_else(|| {
             anyhow::anyhow!("No kernel found. Use --kernel or run: scripts/setup-image.sh")
         })?,
     };
@@ -1630,14 +1922,18 @@ pub fn run(args: Args) -> Result<()> {
 
     // Check kernel capabilities to decide rootfs strategy
     let has_virtio_blk = kernel_data.windows(10).any(|w| w == b"virtio_blk");
-    // Check if the kernel explicitly lacks initramfs support
-    // (only the Firecracker kernel is known to lack it — detected by having virtio_blk but no initrd strings)
+    // Check if the kernel supports initramfs (BLK_DEV_INITRD).
+    // We look for multiple signatures: the config string (if IKCONFIG is enabled),
+    // internal symbols, and the "Unpacking initramfs" log message which is only
+    // compiled in when CONFIG_BLK_DEV_INITRD=y. Note: "rdinit" is NOT reliable
+    // as the command-line parser always contains it regardless of initramfs support.
     let has_initrd_strings = kernel_data
         .windows(18)
         .any(|w| w == b"BLK_DEV_INITRD=y\r\n" || w == b"BLK_DEV_INITRD=y\n\x00")
         || kernel_data.windows(17).any(|w| w == b"BLK_DEV_INITRD=y\n")
         || kernel_data.windows(14).any(|w| w == b"initramfs_data")
-        || kernel_data.windows(9).any(|w| w == b"cpio_data");
+        || kernel_data.windows(9).any(|w| w == b"cpio_data")
+        || kernel_data.windows(19).any(|w| w == b"Unpacking initramfs");
     // Default to initramfs support (most kernels have it); only use virtio-blk if we can
     // confirm virtio-blk support AND cannot confirm initramfs support
     let prefer_virtio_blk = has_virtio_blk && !has_initrd_strings;
@@ -1664,17 +1960,16 @@ pub fn run(args: Args) -> Result<()> {
         }
         let mount_tag = format!("share{i}");
         let guest_path = guest_str.to_string();
-        let spi = VIRTIOFS_SPI_START + i as u32;
         info!("Sharing {host_str:?} -> {guest_str} (tag={mount_tag})");
         vm.virtiofs
-            .push(VirtioFsDevice::new(host_path, mount_tag.clone(), spi));
+            .push(VirtioFsDevice::new(host_path, mount_tag.clone()));
         shares.push((mount_tag, guest_path));
     }
 
     // Load initrd/rootfs (must be done before load_kernel, because load_kernel builds DTB)
-    // Resolve rootfs path (default: rootfs)
+    // Resolve rootfs path (default: rootfs.ext2)
     let default_rootfs = if args.rootfs.is_none() {
-        resolve_data_path("rootfs")
+        resolve_data_path("rootfs.ext2")
     } else {
         None
     };
@@ -1682,40 +1977,47 @@ pub fn run(args: Args) -> Result<()> {
 
     let use_8250 = vm.is_uart_8250();
     if let Some(rootfs_path) = rootfs_arg {
-        if !rootfs_path.is_dir() {
-            anyhow::bail!("--rootfs path {rootfs_path:?} is not a directory");
+        if !rootfs_path.is_file() {
+            anyhow::bail!(
+                "--rootfs path {rootfs_path:?} is not a file (use `sandal pack <dir>` to create an ext2 image)"
+            );
         }
 
+        info!("Loading ext2 rootfs from {rootfs_path:?}...");
+        let mut disk_image = std::fs::read(rootfs_path)
+            .with_context(|| format!("Failed to read rootfs image {rootfs_path:?}"))?;
+        debug!(
+            "ext2 image: {} bytes ({} KB)",
+            disk_image.len(),
+            disk_image.len() / 1024
+        );
+
+        // Inject runtime files (/init, device nodes, CA certs, etc.)
+        crate::ext2::inject_runtime_files(
+            &mut disk_image,
+            &args.command,
+            network_enabled,
+            use_8250,
+            &shares,
+        )
+        .context("Failed to inject runtime files into ext2 image")?;
+
         if prefer_virtio_blk {
-            // Kernel supports virtio-blk but NOT initramfs — use ext2 image on virtio-blk
-            info!("Packing host directory {rootfs_path:?} as ext2 on virtio-blk...");
-            let disk_image = crate::ext2::build_ext2_from_directory(
-                rootfs_path,
-                &args.command,
-                network_enabled,
-                use_8250,
-                &shares,
-            )
-            .context("Failed to build ext2 filesystem image")?;
-            debug!(
-                "ext2 image: {} bytes ({} KB)",
-                disk_image.len(),
-                disk_image.len() / 1024
-            );
-            vm.virtio_blk = Some(VirtioBlkDevice::new(disk_image, VIRTIO_BLK_SPI));
+            // Fast path: kernel supports virtio-blk — load ext2 directly
+            info!("Loading ext2 on virtio-blk...");
+            vm.virtio_blk = Some(VirtioBlkDevice::new(disk_image));
             vm.use_virtio_blk = true;
         } else {
-            // Default: use initramfs (cpio archive) — works with most kernels
-            info!("Packing host directory {rootfs_path:?} as initramfs...");
-            let initrd_data = crate::initramfs::build_from_directory(
-                rootfs_path,
-                &args.command,
-                network_enabled,
-                use_8250,
-                &shares,
-            )
-            .context("Failed to build initramfs from directory")?;
-            vm.load_initrd(&initrd_data)?;
+            // Fallback: kernel only supports initramfs — convert ext2 to cpio
+            info!("Converting ext2 to cpio for initramfs...");
+            let cpio_data =
+                crate::ext2::ext2_to_cpio(&disk_image).context("Failed to convert ext2 to cpio")?;
+            debug!(
+                "cpio archive: {} bytes ({} KB)",
+                cpio_data.len(),
+                cpio_data.len() / 1024
+            );
+            vm.load_initrd(&cpio_data)?;
         }
     } else if let Some(initrd_path) = &args.initrd {
         info!("Loading initrd from {initrd_path:?}...");
@@ -1730,10 +2032,304 @@ pub fn run(args: Args) -> Result<()> {
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(&kernel_data)?;
 
+    // Set the command to be injected via UART after BOOT_MARKER.
+    // The init script reads this from stdin instead of having it baked in.
+    let cmd_line = crate::initramfs::build_command_line(&args.command);
+    vm.pending_command = Some(cmd_line.clone());
+
+    // Compute fingerprint for snapshot caching
+    let rootfs_fp = rootfs_arg
+        .map(|p| crate::snapshot::hash_file_content(p))
+        .unwrap_or(0);
+    let fingerprint = crate::snapshot::compute_fingerprint(
+        &kernel_data,
+        rootfs_fp,
+        args.memory,
+        network_enabled,
+        &args.shared_dirs,
+    );
+    vm.snapshot_fingerprint = fingerprint;
+
+    if !args.no_cache {
+        // Only enable snapshot save when:
+        //  - No virtiofs devices (their host-side state can't be snapshotted)
+        //  - Snapshot file doesn't already exist (avoid re-saving on every run)
+        let can_snapshot = vm.virtiofs.is_empty();
+        if can_snapshot {
+            if let Ok(snap_path) = crate::snapshot::snapshot_path(fingerprint) {
+                if !snap_path.exists() {
+                    vm.snapshot_save_path = Some(snap_path);
+                }
+            }
+        }
+    }
+
     // Run the VM
     let exit_code = vm.run_command(&args.command)?;
 
     debug!("VM exited with code: {exit_code}");
 
+    std::process::exit(exit_code);
+}
+
+/// Fast-path: restore a VM from a snapshot file and run a command.
+pub fn run_from_snapshot(args: &Args, snap_path: &std::path::Path, fingerprint: u64) -> Result<()> {
+    use crate::snapshot::load_snapshot;
+    use std::ffi::c_void;
+
+    let t0 = std::time::Instant::now();
+
+    info!("Restoring VM from snapshot...");
+
+    let snapshot = load_snapshot(snap_path, fingerprint)?;
+    debug!(
+        "[bench] load_snapshot (COW mmap): {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // GIC state is required for reliable restore — without it the GIC
+    // starts fresh, UART interrupts are never routed, and the guest hangs.
+    if snapshot.device_state.gic_state.is_none() {
+        anyhow::bail!("Snapshot missing GIC state (macOS 15.0+ required for snapshot restore)");
+    }
+
+    let network_enabled = snapshot.device_state.network_enabled;
+    let memory_size = snapshot.memory_size;
+
+    // Initialize hypervisor subsystem
+    let t1 = std::time::Instant::now();
+    hypervisor::init().context("Failed to initialize hypervisor")?;
+    debug!(
+        "[bench] hypervisor::init: {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Create VM (this also creates the GIC)
+    let t1 = std::time::Instant::now();
+    let vm_handle = crate::hypervisor::Vm::new().context("Failed to create VM")?;
+    debug!(
+        "[bench] Vm::new (+ GIC): {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Use the COW (MAP_PRIVATE) memory directly from the snapshot — no
+    // 256 MB memcpy.  Pages are faulted lazily and only copied when the
+    // guest writes to them.
+    let crate::snapshot::SnapshotRestore {
+        mut memory,
+        cpu_state: snapshot_cpu_state,
+        device_state: snapshot_device_state,
+        ..
+    } = snapshot;
+
+    // Map memory into guest
+    let t1 = std::time::Instant::now();
+    vm_handle.map_memory(
+        memory.as_mut_ptr() as *mut c_void,
+        RAM_BASE,
+        memory_size,
+        HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC,
+    )?;
+    debug!(
+        "[bench] map_memory: {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Set up UART type from snapshot, restoring interrupt enable state
+    let uart_type = if snapshot_device_state.uart_is_8250 {
+        UartType::Uart8250(Uart8250State {
+            ier: snapshot_device_state.uart_8250_ier,
+            ..Uart8250State::default()
+        })
+    } else {
+        UartType::PL011(Pl011State {
+            imsc: snapshot_device_state.pl011_imsc,
+        })
+    };
+
+    // Restore virtio-net device
+    let t1 = std::time::Instant::now();
+    let virtio_net = if network_enabled {
+        use crate::net::NetworkFilter;
+        use crate::unet::UserNet;
+
+        let backend = UserNet::new().context("Failed to create user-space network")?;
+        let filter = {
+            let mut f = NetworkFilter::new();
+            f.set_protocols(NetworkFilter::parse_protocols(&args.protocols));
+            if let Some(ref hosts) = args.allowed_hosts {
+                f.set_allowed_hosts(NetworkFilter::parse_hosts(hosts));
+            }
+            f
+        };
+
+        let mut device = VirtioNetDevice::new(backend, filter);
+
+        // Restore MMIO state from snapshot
+        if let Some(ref mmio) = snapshot_device_state.net_mmio {
+            device.device_features_sel = mmio.device_features_sel;
+            device.driver_features = mmio.driver_features;
+            device.driver_features_sel = mmio.driver_features_sel;
+            device.queue_sel = mmio.queue_sel;
+            device.status = mmio.status;
+            device.interrupt_status = mmio.interrupt_status;
+            device.config_generation = mmio.config_generation;
+            for (i, q) in mmio.queues.iter().enumerate() {
+                if i < device.queues.len() {
+                    device.queues[i].num_max = q.num_max;
+                    device.queues[i].num = q.num;
+                    device.queues[i].ready = q.ready != 0;
+                    device.queues[i].desc_addr = q.desc_addr;
+                    device.queues[i].avail_addr = q.avail_addr;
+                    device.queues[i].used_addr = q.used_addr;
+                    device.queues[i].last_avail_idx = q.last_avail_idx;
+                }
+            }
+        }
+        Some(device)
+    } else {
+        None
+    };
+
+    // Restore virtio-rng device
+    let mut virtio_rng = VirtioRngDevice::new();
+    if let Some(ref mmio) = snapshot_device_state.rng_mmio {
+        virtio_rng.device_features_sel = mmio.device_features_sel;
+        virtio_rng.driver_features = mmio.driver_features;
+        virtio_rng.driver_features_sel = mmio.driver_features_sel;
+        virtio_rng.queue_sel = mmio.queue_sel;
+        virtio_rng.status = mmio.status;
+        virtio_rng.interrupt_status = mmio.interrupt_status;
+        for (i, q) in mmio.queues.iter().enumerate() {
+            if i < virtio_rng.queues.len() {
+                virtio_rng.queues[i].num_max = q.num_max;
+                virtio_rng.queues[i].num = q.num;
+                virtio_rng.queues[i].ready = q.ready != 0;
+                virtio_rng.queues[i].desc_addr = q.desc_addr;
+                virtio_rng.queues[i].avail_addr = q.avail_addr;
+                virtio_rng.queues[i].used_addr = q.used_addr;
+                virtio_rng.queues[i].last_avail_idx = q.last_avail_idx;
+            }
+        }
+    }
+
+    debug!(
+        "[bench] restore net+rng devices: {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Restore virtio-blk device (load saved disk image)
+    let t1 = std::time::Instant::now();
+    let (virtio_blk, use_virtio_blk) = if snapshot_device_state.use_virtio_blk {
+        let disk_path = crate::snapshot::disk_image_path(fingerprint)?;
+        if !disk_path.exists() {
+            anyhow::bail!(
+                "Snapshot requires disk image but {} not found",
+                disk_path.display()
+            );
+        }
+        let disk_image = std::fs::read(&disk_path).context("Failed to read snapshot disk image")?;
+        debug!(
+            "Disk image loaded ({} MB)",
+            disk_image.len() / (1024 * 1024)
+        );
+
+        let mut device = VirtioBlkDevice::new(disk_image);
+
+        // Restore MMIO state from snapshot
+        if let Some(ref mmio) = snapshot_device_state.blk_mmio {
+            device.device_features_sel = mmio.device_features_sel;
+            device.driver_features = mmio.driver_features;
+            device.driver_features_sel = mmio.driver_features_sel;
+            device.queue_sel = mmio.queue_sel;
+            device.status = mmio.status;
+            device.interrupt_status = mmio.interrupt_status;
+            device.config_generation = mmio.config_generation;
+            for (i, q) in mmio.queues.iter().enumerate() {
+                if i < device.queues.len() {
+                    device.queues[i].num_max = q.num_max;
+                    device.queues[i].num = q.num;
+                    device.queues[i].ready = q.ready != 0;
+                    device.queues[i].desc_addr = q.desc_addr;
+                    device.queues[i].avail_addr = q.avail_addr;
+                    device.queues[i].used_addr = q.used_addr;
+                    device.queues[i].last_avail_idx = q.last_avail_idx;
+                }
+            }
+        }
+        (Some(device), true)
+    } else {
+        (None, false)
+    };
+
+    debug!(
+        "[bench] restore blk device: {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Build the command line to inject
+    let cmd_line = crate::initramfs::build_command_line(&args.command);
+
+    // Build the VmInstance struct with restored state
+    let mut vm = VmInstance {
+        vm: vm_handle,
+        memory,
+        memory_size,
+        uart_type,
+        kernel_entry: 0, // Not needed for restore
+        initrd_info: None,
+        exit_code: None,
+        boot_complete: true, // Already booted
+        boot_complete_iter: 0,
+        command_injected: false,
+        pending_command: Some(cmd_line),
+        snapshot_save_path: None,
+        snapshot_fingerprint: fingerprint,
+        snapshot_pending: 0,
+        restored_cpu_state: Some(snapshot_cpu_state),
+        gic_state_to_restore: snapshot_device_state.gic_state,
+        is_restored: true,
+        uart_line_buf: String::new(),
+        uart_suppress_line: false,
+        uart_rx_buf: VecDeque::new(),
+        network_enabled,
+        virtio_net,
+        virtio_rng: Some(virtio_rng),
+        virtio_blk,
+        use_virtio_blk,
+        virtiofs: Vec::new(),
+    };
+
+    // Inject the command into the UART RX buffer.
+    // The snapshot was taken during UART polling (port lock held), so
+    // we must NOT assert the UART SPI — that would cause the interrupt
+    // handler to try acquiring the already-held lock → deadlock.
+    // Instead, the kernel's UART polling code will naturally find the
+    // injected data in the buffer via MMIO reads.
+    vm.inject_command();
+
+    let restore_time = t0.elapsed();
+    info!(
+        "Snapshot restored in {:.2}ms",
+        restore_time.as_secs_f64() * 1000.0
+    );
+
+    // Run the VM from the restored state
+    debug!(
+        "[bench] total restore (before run): {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    let t1 = std::time::Instant::now();
+    let exit_code = vm.run_command(&args.command)?;
+    debug!(
+        "[bench] run_command wall time: {:.2}ms",
+        t1.elapsed().as_secs_f64() * 1000.0
+    );
+    debug!(
+        "[bench] total (restore + run): {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    debug!("VM exited with code: {exit_code}");
     std::process::exit(exit_code);
 }

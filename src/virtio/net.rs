@@ -41,15 +41,13 @@ pub struct VirtioNetDevice {
     pub mac: [u8; 6],
     pub backend: UserNet,
     pub filter: NetworkFilter,
-    #[allow(dead_code)]
-    pub irq_spi: u32,
 
     // Scratch buffer for packet I/O
     pkt_buf: Vec<u8>,
 }
 
 impl VirtioNetDevice {
-    pub fn new(backend: UserNet, filter: NetworkFilter, irq_spi: u32) -> Self {
+    pub fn new(backend: UserNet, filter: NetworkFilter) -> Self {
         let mac = backend.mac_address();
 
         VirtioNetDevice {
@@ -64,7 +62,6 @@ impl VirtioNetDevice {
             mac,
             backend,
             filter,
-            irq_spi,
             pkt_buf: vec![0u8; 2048],
         }
     }
@@ -218,7 +215,7 @@ impl VirtioNetDevice {
     }
 
     /// Create a kqueue-based network poller for the user-space networking backend.
-    pub fn create_poller(&mut self, vcpu_id: u32) -> NetPoller {
+    pub fn create_poller(&mut self, vcpu_id: u64) -> NetPoller {
         self.backend.create_poller(vcpu_id)
     }
 

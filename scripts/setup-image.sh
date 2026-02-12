@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
-# setup-image.sh — Download kernels and build a Python rootfs from pre-built packages
+# setup-image.sh — Build an Alpine rootfs and ext2 image for sandal
 #
-# Usage: scripts/setup-image.sh
+# Usage: scripts/setup-image.sh [--with-debian-kernel]
 #
-# Downloads a Firecracker-compatible aarch64 kernel, a Debian 6.12 kernel (with
-# virtiofs support), and creates an Alpine Linux rootfs with Python 3 by fetching
-# pre-built packages from the Alpine CDN.
+# Creates an Alpine Linux rootfs with Python 3 by fetching pre-built packages
+# from the Alpine CDN, then packs it into a rootfs.ext2 image via `sandal pack`.
+#
+# Options:
+#   --with-debian-kernel  Also download a Debian 6.12 kernel (with virtiofs
+#                         support) and install virtio modules into the rootfs.
 
 set -euo pipefail
 
@@ -14,13 +17,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 KERNEL_DIR="$PROJECT_DIR/kernels"
-KERNEL_PATH="$KERNEL_DIR/vmlinux"
 ROOTFS_DIR="$PROJECT_DIR/rootfs"
 
 ALPINE_VERSION="3.21"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 ARCH="aarch64"
-KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/kernels/vmlinux"
 
 # Debian kernel (6.12, supports virtiofs)
 DEBIAN_KVER="6.12.63+deb13-arm64"
@@ -29,8 +30,11 @@ DEBIAN_PKG="linux-image-${DEBIAN_KVER}-unsigned_6.12.63-1_arm64.deb"
 DEBIAN_PKG_URL="https://deb.debian.org/debian/pool/main/l/linux/${DEBIAN_PKG}"
 
 # Virtio modules needed from the Debian kernel (compiled as modules, not built-in)
+# Order matters for dependencies: failover → net_failover → virtio_net
 DEBIAN_MODULES=(
     "kernel/drivers/virtio/virtio_mmio.ko"
+    "kernel/net/core/failover.ko"
+    "kernel/drivers/net/net_failover.ko"
     "kernel/drivers/net/virtio_net.ko"
     "kernel/drivers/block/virtio_blk.ko"
     "kernel/drivers/char/hw_random/virtio-rng.ko"
@@ -56,20 +60,6 @@ PYTHON_PACKAGES=(
 info()  { printf "\033[1;34m==>\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m==>\033[0m %s\n" "$*"; }
 error() { printf "\033[1;31mERR\033[0m %s\n" "$*" >&2; }
-
-# --- Download Firecracker kernel ---
-
-setup_kernel() {
-    if [ -f "$KERNEL_PATH" ]; then
-        ok "Kernel already exists at kernels/vmlinux, skipping"
-        return
-    fi
-
-    info "Downloading Firecracker kernel for aarch64..."
-    mkdir -p "$KERNEL_DIR"
-    curl -fSL --progress-bar -o "$KERNEL_PATH" "$KERNEL_URL"
-    ok "Kernel saved to kernels/vmlinux ($(du -h "$KERNEL_PATH" | cut -f1 | xargs))"
-}
 
 # --- Download Debian kernel + modules ---
 
@@ -204,21 +194,64 @@ setup_rootfs() {
     ok "Rootfs created at rootfs/ ($(du -sh "$ROOTFS_DIR" | cut -f1 | xargs))"
 }
 
+# --- Pack rootfs into ext2 image ---
+
+setup_rootfs_ext2() {
+    local ext2_path="$PROJECT_DIR/rootfs.ext2"
+
+    if [ -f "$ext2_path" ]; then
+        ok "rootfs.ext2 already exists, skipping (delete it to rebuild)"
+        return
+    fi
+
+    local sandal_bin="$PROJECT_DIR/target/release/sandal"
+    if [ ! -x "$sandal_bin" ]; then
+        error "sandal binary not found at target/release/sandal"
+        error "Build it first with: cargo build --release"
+        exit 1
+    fi
+
+    info "Packing rootfs/ into rootfs.ext2..."
+    "$sandal_bin" pack "$ROOTFS_DIR" -o "$ext2_path"
+    ok "rootfs.ext2 created ($(du -h "$ext2_path" | cut -f1 | xargs))"
+}
+
 # --- Main ---
 
 main() {
-    info "Setting up sandal kernels and rootfs..."
+    local with_debian_kernel=false
+
+    for arg in "$@"; do
+        case "$arg" in
+            --with-debian-kernel)
+                with_debian_kernel=true
+                ;;
+            *)
+                error "Unknown option: $arg"
+                echo "Usage: $0 [--with-debian-kernel]"
+                exit 1
+                ;;
+        esac
+    done
+
+    info "Setting up sandal rootfs..."
     echo
 
-    setup_kernel
     setup_rootfs
-    setup_debian_kernel
+
+    if [ "$with_debian_kernel" = true ]; then
+        setup_debian_kernel
+    fi
+
+    setup_rootfs_ext2
 
     echo
     ok "Setup complete! You can now run:"
     echo "  ./target/release/sandal -- echo 'Hello from the sandbox'"
     echo "  ./target/release/sandal -- python3"
-    echo "  ./target/release/sandal --kernel kernels/vmlinux-debian --share /tmp:/mnt/host -- ls /mnt/host"
+    if [ "$with_debian_kernel" = true ]; then
+        echo "  ./target/release/sandal --kernel kernels/vmlinux-debian --share /tmp:/mnt/host -- ls /mnt/host"
+    fi
 }
 
 main "$@"

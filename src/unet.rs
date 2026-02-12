@@ -190,7 +190,7 @@ impl UserNet {
     /// Create a `NetPoller` for this network backend's sockets.
     /// The DNS socket is registered immediately; TCP sockets are registered
     /// as connections are established.
-    pub fn create_poller(&mut self, vcpu_id: u32) -> NetPoller {
+    pub fn create_poller(&mut self, vcpu_id: u64) -> NetPoller {
         let poller = NetPoller::new(vcpu_id, self.dns_socket.as_raw_fd());
         self.poller_fd_tx = Some(poller.fd_sender());
         self.poller_wakeup_fd = Some(poller.wakeup_fd());
@@ -1172,7 +1172,7 @@ pub struct NetPoller {
     kq: RawFd,
     wakeup_read: RawFd,
     wakeup_write: RawFd,
-    vcpu_id: u32,
+    vcpu_id: u64,
     fd_rx: mpsc::Receiver<RawFd>,
     fd_tx: mpsc::Sender<RawFd>,
 }
@@ -1237,7 +1237,7 @@ mod kq {
 impl NetPoller {
     /// Create a new poller. `dns_fd` is the DNS UDP socket's raw fd, which
     /// is registered immediately so DNS replies wake the vcpu.
-    pub fn new(vcpu_id: u32, dns_fd: RawFd) -> Self {
+    pub fn new(vcpu_id: u64, dns_fd: RawFd) -> Self {
         let kq = unsafe { kq::kqueue() };
         assert!(kq >= 0, "kqueue() failed");
 
