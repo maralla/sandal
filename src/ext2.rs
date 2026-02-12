@@ -1600,18 +1600,7 @@ pub fn inject_runtime_files(
         }
     }
 
-    // Entropy seeder
-    let seeder_bin = crate::initramfs::generate_entropy_seeder();
-    inject_file(
-        image,
-        &sb,
-        &bgd,
-        "usr/sbin/seed-entropy",
-        &seeder_bin,
-        0o755,
-    )?;
-
-    // Ctty helper
+    // Ctty helper binary
     let ctty_bin = crate::initramfs::generate_ctty_helper();
     inject_file(image, &sb, &bgd, "usr/sbin/sandal-ctty", &ctty_bin, 0o755)?;
 

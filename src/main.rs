@@ -1,5 +1,6 @@
 mod cli;
 mod devicetree;
+mod elf;
 mod ext2;
 mod hypervisor;
 mod initramfs;
