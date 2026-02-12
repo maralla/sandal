@@ -34,7 +34,7 @@ extern "C" {
 // ── Snapshot file format ──────────────────────────────────────────────
 
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 /// Page size for snapshot memory alignment.  macOS on Apple Silicon uses
 /// 16 KB pages, so the memory section offset in the snapshot file must be
 /// 16 KB-aligned for `mmap(MAP_PRIVATE)` to work.
@@ -56,7 +56,12 @@ struct SnapshotHeader {
 }
 
 /// All vCPU register state needed for restore.
-#[derive(Clone, Debug, Default)]
+///
+/// `#[repr(C)]` layout allows zero-cost serialization as a raw byte cast
+/// (same approach as `SnapshotHeader`).  All fields are u64 so there are
+/// no padding holes.  This is ARM64 macOS only (always little-endian).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CpuState {
     // General-purpose registers
     pub x: [u64; 31], // X0-X30
@@ -92,7 +97,7 @@ pub struct CpuState {
 
     // VTimer
     pub vtimer_offset: u64,
-    pub vtimer_mask: u8,
+    pub vtimer_mask: u64, // 0 or 1; widened from u8 to avoid repr(C) padding
 
     /// Physical counter (CNTPCT) value at snapshot time.
     /// Used to adjust vtimer_offset on restore so the guest virtual counter
@@ -157,6 +162,14 @@ pub struct DeviceState {
 
 // ── Save ──────────────────────────────────────────────────────────────
 
+/// Check if a memory page is all zeros using u128 word comparisons.
+/// ~16x fewer loop iterations than byte-by-byte (`page.iter().all()`).
+#[inline]
+fn is_zero_page(page: &[u8]) -> bool {
+    page.chunks_exact(16)
+        .all(|c| u128::from_ne_bytes(c.try_into().unwrap()) == 0)
+}
+
 /// Save the complete VM state to a snapshot file.
 pub fn save_snapshot(
     path: &Path,
@@ -166,7 +179,7 @@ pub fn save_snapshot(
     fingerprint: u64,
 ) -> Result<()> {
     let cpu_state = read_cpu_state(vcpu)?;
-    let cpu_bytes = serialize_cpu_state(&cpu_state);
+    let cpu_bytes = cpu_state_as_bytes(&cpu_state);
     let device_bytes = serialize_device_state(device_state);
 
     let memory_size = memory.len() as u64;
@@ -203,24 +216,38 @@ pub fn save_snapshot(
 
     // Write CPU state
     file.seek(SeekFrom::Start(cpu_state_offset))?;
-    file.write_all(&cpu_bytes)?;
+    file.write_all(cpu_bytes)?;
 
     // Write device state
     file.seek(SeekFrom::Start(device_state_offset))?;
     file.write_all(&device_bytes)?;
 
-    // Write memory (sparse: skip zero pages)
+    // Write memory (sparse: skip zero pages, batch contiguous non-zero runs)
     let num_pages = memory.len() / PAGE_SIZE;
     let mut written_pages = 0u64;
-    for page_idx in 0..num_pages {
-        let offset = page_idx * PAGE_SIZE;
-        let page = &memory[offset..offset + PAGE_SIZE];
-        if page.iter().all(|&b| b == 0) {
-            continue; // sparse hole
+    let mut run_start: Option<usize> = None;
+
+    for page_idx in 0..=num_pages {
+        let is_nonzero = if page_idx < num_pages {
+            let offset = page_idx * PAGE_SIZE;
+            !is_zero_page(&memory[offset..offset + PAGE_SIZE])
+        } else {
+            false // sentinel to flush any trailing run
+        };
+
+        if is_nonzero {
+            written_pages += 1;
+            if run_start.is_none() {
+                run_start = Some(page_idx);
+            }
+        } else if let Some(start) = run_start {
+            // Flush contiguous run as a single write
+            let byte_start = start * PAGE_SIZE;
+            let byte_end = page_idx * PAGE_SIZE;
+            file.seek(SeekFrom::Start(memory_offset + byte_start as u64))?;
+            file.write_all(&memory[byte_start..byte_end])?;
+            run_start = None;
         }
-        file.seek(SeekFrom::Start(memory_offset + offset as u64))?;
-        file.write_all(page)?;
-        written_pages += 1;
     }
 
     // Ensure file is the full size (so mmap works)
@@ -302,9 +329,9 @@ pub fn load_snapshot(path: &Path, expected_fingerprint: u64) -> Result<SnapshotR
     file.read_at(&mut state_buf, state_start as u64)
         .context("Failed to read snapshot state")?;
 
-    // Parse CPU state from the combined buffer
+    // Parse CPU state from the combined buffer (zero-cost: just a ptr::read)
     let cpu_local_end = header.cpu_state_size as usize;
-    let cpu_state = deserialize_cpu_state(&state_buf[..cpu_local_end])?;
+    let cpu_state = cpu_state_from_bytes(&state_buf[..cpu_local_end])?;
 
     // Parse device state from the combined buffer
     let dev_local_start = header.device_state_offset as usize - state_start;
@@ -559,6 +586,118 @@ pub fn disk_image_path(fingerprint: u64) -> Result<PathBuf> {
     Ok(dir.join(format!("snap-{fingerprint:016x}.disk")))
 }
 
+// ── Binary reader / writer helpers ────────────────────────────────────
+
+/// A lightweight cursor over a byte slice for deserializing fixed-width
+/// integers.  Replaces the closure-based approach with monomorphized
+/// method calls (no dyn dispatch).
+struct SnapReader<'a> {
+    data: &'a [u8],
+    off: usize,
+}
+
+impl<'a> SnapReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, off: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.off)
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        if self.off >= self.data.len() {
+            anyhow::bail!("snapshot data truncated at offset {}", self.off);
+        }
+        let v = self.data[self.off];
+        self.off += 1;
+        Ok(v)
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        if self.off + 2 > self.data.len() {
+            anyhow::bail!("snapshot data truncated at offset {}", self.off);
+        }
+        let v = u16::from_le_bytes(self.data[self.off..self.off + 2].try_into().unwrap());
+        self.off += 2;
+        Ok(v)
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        if self.off + 4 > self.data.len() {
+            anyhow::bail!("snapshot data truncated at offset {}", self.off);
+        }
+        let v = u32::from_le_bytes(self.data[self.off..self.off + 4].try_into().unwrap());
+        self.off += 4;
+        Ok(v)
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        if self.off + 8 > self.data.len() {
+            anyhow::bail!("snapshot data truncated at offset {}", self.off);
+        }
+        let v = u64::from_le_bytes(self.data[self.off..self.off + 8].try_into().unwrap());
+        self.off += 8;
+        Ok(v)
+    }
+
+    fn read_bool(&mut self) -> Result<bool> {
+        Ok(self.read_u8()? != 0)
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.off + n > self.data.len() {
+            anyhow::bail!("snapshot data truncated at offset {}", self.off);
+        }
+        let slice = &self.data[self.off..self.off + n];
+        self.off += n;
+        Ok(slice)
+    }
+}
+
+/// A lightweight wrapper over `Vec<u8>` for serializing fixed-width
+/// integers.  Replaces scattered `extend_from_slice(&val.to_le_bytes())`
+/// calls.
+struct SnapWriter {
+    buf: Vec<u8>,
+}
+
+impl SnapWriter {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
+    }
+
+    fn write_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    fn write_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn write_bool(&mut self, v: bool) {
+        self.buf.push(if v { 1 } else { 0 });
+    }
+
+    fn write_bytes(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
 // ── Internal serialization ────────────────────────────────────────────
 
 fn read_cpu_state(vcpu: &Vcpu) -> Result<CpuState> {
@@ -621,269 +760,118 @@ fn read_cpu_state(vcpu: &Vcpu) -> Result<CpuState> {
     Ok(state)
 }
 
-// Simple binary serialization for CpuState (fixed layout)
-fn serialize_cpu_state(state: &CpuState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(512);
-    // GPRs
-    for &v in &state.x {
-        buf.extend_from_slice(&v.to_le_bytes());
+/// Reinterpret CpuState as a raw byte slice.  CpuState is `#[repr(C)]`
+/// with all-u64 fields, so this is a zero-cost cast (no field-by-field
+/// serialization).
+fn cpu_state_as_bytes(state: &CpuState) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(state as *const _ as *const u8, mem::size_of::<CpuState>())
     }
-    buf.extend_from_slice(&state.pc.to_le_bytes());
-    buf.extend_from_slice(&state.cpsr.to_le_bytes());
-    buf.extend_from_slice(&state.fpcr.to_le_bytes());
-    buf.extend_from_slice(&state.fpsr.to_le_bytes());
-    // Sys regs
-    for v in [
-        state.sp_el0,
-        state.sp_el1,
-        state.sctlr_el1,
-        state.cpacr_el1,
-        state.ttbr0_el1,
-        state.ttbr1_el1,
-        state.tcr_el1,
-        state.mair_el1,
-        state.spsr_el1,
-        state.elr_el1,
-        state.esr_el1,
-        state.far_el1,
-        state.vbar_el1,
-        state.tpidr_el0,
-        state.tpidrro_el0,
-        state.tpidr_el1,
-        state.mpidr_el1,
-        state.mdscr_el1,
-        state.contextidr_el1,
-        state.par_el1,
-        state.cntkctl_el1,
-        state.cntv_ctl_el0,
-        state.cntv_cval_el0,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf.extend_from_slice(&state.vtimer_offset.to_le_bytes());
-    buf.push(state.vtimer_mask);
-    buf.extend_from_slice(&state.saved_cntpct.to_le_bytes());
-    // ICC registers
-    for v in [
-        state.icc_pmr_el1,
-        state.icc_bpr0_el1,
-        state.icc_bpr1_el1,
-        state.icc_ctlr_el1,
-        state.icc_sre_el1,
-        state.icc_igrpen0_el1,
-        state.icc_igrpen1_el1,
-        state.icc_ap0r0_el1,
-        state.icc_ap1r0_el1,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf
 }
 
-fn deserialize_cpu_state(data: &[u8]) -> Result<CpuState> {
-    let mut state = CpuState::default();
-    let mut off = 0usize;
-
-    let read_u64 = |data: &[u8], off: &mut usize| -> Result<u64> {
-        if *off + 8 > data.len() {
-            anyhow::bail!("CPU state truncated at offset {}", *off);
-        }
-        let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
-        *off += 8;
-        Ok(v)
-    };
-
-    for i in 0..31 {
-        state.x[i] = read_u64(data, &mut off)?;
+/// Deserialize CpuState from raw bytes via `ptr::read`.  Inverse of
+/// `cpu_state_as_bytes`.
+fn cpu_state_from_bytes(data: &[u8]) -> Result<CpuState> {
+    let expected = mem::size_of::<CpuState>();
+    if data.len() < expected {
+        anyhow::bail!(
+            "CPU state too small: {} bytes (expected {})",
+            data.len(),
+            expected
+        );
     }
-    state.pc = read_u64(data, &mut off)?;
-    state.cpsr = read_u64(data, &mut off)?;
-    state.fpcr = read_u64(data, &mut off)?;
-    state.fpsr = read_u64(data, &mut off)?;
-
-    state.sp_el0 = read_u64(data, &mut off)?;
-    state.sp_el1 = read_u64(data, &mut off)?;
-    state.sctlr_el1 = read_u64(data, &mut off)?;
-    state.cpacr_el1 = read_u64(data, &mut off)?;
-    state.ttbr0_el1 = read_u64(data, &mut off)?;
-    state.ttbr1_el1 = read_u64(data, &mut off)?;
-    state.tcr_el1 = read_u64(data, &mut off)?;
-    state.mair_el1 = read_u64(data, &mut off)?;
-    state.spsr_el1 = read_u64(data, &mut off)?;
-    state.elr_el1 = read_u64(data, &mut off)?;
-    state.esr_el1 = read_u64(data, &mut off)?;
-    state.far_el1 = read_u64(data, &mut off)?;
-    state.vbar_el1 = read_u64(data, &mut off)?;
-    state.tpidr_el0 = read_u64(data, &mut off)?;
-    state.tpidrro_el0 = read_u64(data, &mut off)?;
-    state.tpidr_el1 = read_u64(data, &mut off)?;
-    state.mpidr_el1 = read_u64(data, &mut off)?;
-    state.mdscr_el1 = read_u64(data, &mut off)?;
-    state.contextidr_el1 = read_u64(data, &mut off)?;
-    state.par_el1 = read_u64(data, &mut off)?;
-    state.cntkctl_el1 = read_u64(data, &mut off)?;
-    state.cntv_ctl_el0 = read_u64(data, &mut off)?;
-    state.cntv_cval_el0 = read_u64(data, &mut off)?;
-    state.vtimer_offset = read_u64(data, &mut off)?;
-
-    if off >= data.len() {
-        anyhow::bail!("CPU state truncated (missing vtimer_mask)");
-    }
-    state.vtimer_mask = data[off];
-    off += 1;
-
-    // saved_cntpct (added later; may be absent in old snapshots)
-    if off + 8 <= data.len() {
-        state.saved_cntpct = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        off += 8;
-    }
-
-    // ICC registers (added later; may be absent in old snapshots)
-    if off + 9 * 8 <= data.len() {
-        state.icc_pmr_el1 = read_u64(data, &mut off)?;
-        state.icc_bpr0_el1 = read_u64(data, &mut off)?;
-        state.icc_bpr1_el1 = read_u64(data, &mut off)?;
-        state.icc_ctlr_el1 = read_u64(data, &mut off)?;
-        state.icc_sre_el1 = read_u64(data, &mut off)?;
-        state.icc_igrpen0_el1 = read_u64(data, &mut off)?;
-        state.icc_igrpen1_el1 = read_u64(data, &mut off)?;
-        state.icc_ap0r0_el1 = read_u64(data, &mut off)?;
-        state.icc_ap1r0_el1 = read_u64(data, &mut off)?;
-    }
-
-    Ok(state)
+    Ok(unsafe { ptr::read(data.as_ptr() as *const CpuState) })
 }
 
 fn serialize_device_state(state: &DeviceState) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(256);
-    buf.push(if state.uart_is_8250 { 1 } else { 0 });
-    buf.push(state.uart_8250_ier);
-    buf.extend_from_slice(&state.pl011_imsc.to_le_bytes());
-    buf.push(if state.network_enabled { 1 } else { 0 });
+    let mut w = SnapWriter::with_capacity(256);
+
+    w.write_bool(state.uart_is_8250);
+    w.write_u8(state.uart_8250_ier);
+    w.write_u32(state.pl011_imsc);
+    w.write_bool(state.network_enabled);
 
     // Net MMIO
-    buf.push(if state.net_mmio.is_some() { 1 } else { 0 });
+    w.write_bool(state.net_mmio.is_some());
     if let Some(ref mmio) = state.net_mmio {
-        serialize_virtio_mmio(&mut buf, mmio);
+        write_virtio_mmio(&mut w, mmio);
     }
 
     // RNG MMIO
-    buf.push(if state.rng_mmio.is_some() { 1 } else { 0 });
+    w.write_bool(state.rng_mmio.is_some());
     if let Some(ref mmio) = state.rng_mmio {
-        serialize_virtio_mmio(&mut buf, mmio);
+        write_virtio_mmio(&mut w, mmio);
     }
 
     // Blk MMIO + use_virtio_blk flag
-    buf.push(if state.use_virtio_blk { 1 } else { 0 });
-    buf.push(if state.blk_mmio.is_some() { 1 } else { 0 });
+    w.write_bool(state.use_virtio_blk);
+    w.write_bool(state.blk_mmio.is_some());
     if let Some(ref mmio) = state.blk_mmio {
-        serialize_virtio_mmio(&mut buf, mmio);
+        write_virtio_mmio(&mut w, mmio);
     }
 
     // Virtiofs MMIO state (one entry per --share device)
-    buf.extend_from_slice(&(state.fs_mmio.len() as u32).to_le_bytes());
+    w.write_u32(state.fs_mmio.len() as u32);
     for mmio in &state.fs_mmio {
-        serialize_virtio_mmio(&mut buf, mmio);
+        write_virtio_mmio(&mut w, mmio);
     }
 
     // GIC state
     if let Some(ref gic) = state.gic_state {
-        buf.extend_from_slice(&(gic.len() as u32).to_le_bytes());
-        buf.extend_from_slice(gic);
+        w.write_u32(gic.len() as u32);
+        w.write_bytes(gic);
     } else {
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        w.write_u32(0);
     }
 
-    buf
+    w.into_vec()
 }
 
-fn serialize_virtio_mmio(buf: &mut Vec<u8>, mmio: &VirtioMmioSnapshot) {
-    buf.extend_from_slice(&mmio.device_features_sel.to_le_bytes());
-    buf.extend_from_slice(&mmio.driver_features.to_le_bytes());
-    buf.extend_from_slice(&mmio.driver_features_sel.to_le_bytes());
-    buf.extend_from_slice(&mmio.queue_sel.to_le_bytes());
-    buf.extend_from_slice(&mmio.status.to_le_bytes());
-    buf.extend_from_slice(&mmio.interrupt_status.to_le_bytes());
-    buf.extend_from_slice(&mmio.config_generation.to_le_bytes());
-    buf.extend_from_slice(&(mmio.queues.len() as u32).to_le_bytes());
+fn write_virtio_mmio(w: &mut SnapWriter, mmio: &VirtioMmioSnapshot) {
+    w.write_u32(mmio.device_features_sel);
+    w.write_u64(mmio.driver_features);
+    w.write_u32(mmio.driver_features_sel);
+    w.write_u32(mmio.queue_sel);
+    w.write_u32(mmio.status);
+    w.write_u32(mmio.interrupt_status);
+    w.write_u32(mmio.config_generation);
+    w.write_u32(mmio.queues.len() as u32);
     for q in &mmio.queues {
-        buf.extend_from_slice(&q.num_max.to_le_bytes());
-        buf.extend_from_slice(&q.num.to_le_bytes());
-        buf.push(q.ready);
-        buf.extend_from_slice(&q.desc_addr.to_le_bytes());
-        buf.extend_from_slice(&q.avail_addr.to_le_bytes());
-        buf.extend_from_slice(&q.used_addr.to_le_bytes());
-        buf.extend_from_slice(&q.last_avail_idx.to_le_bytes());
+        w.write_u32(q.num_max);
+        w.write_u32(q.num);
+        w.write_u8(q.ready);
+        w.write_u64(q.desc_addr);
+        w.write_u64(q.avail_addr);
+        w.write_u64(q.used_addr);
+        w.write_u16(q.last_avail_idx);
     }
 }
 
 fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
-    let mut off = 0usize;
+    let mut r = SnapReader::new(data);
 
-    let read_u8 = |data: &[u8], off: &mut usize| -> Result<u8> {
-        if *off >= data.len() {
-            anyhow::bail!("Device state truncated");
-        }
-        let v = data[*off];
-        *off += 1;
-        Ok(v)
-    };
-    let read_u16 = |data: &[u8], off: &mut usize| -> Result<u16> {
-        if *off + 2 > data.len() {
-            anyhow::bail!("Device state truncated");
-        }
-        let v = u16::from_le_bytes(data[*off..*off + 2].try_into().unwrap());
-        *off += 2;
-        Ok(v)
-    };
-    let read_u32 = |data: &[u8], off: &mut usize| -> Result<u32> {
-        if *off + 4 > data.len() {
-            anyhow::bail!("Device state truncated");
-        }
-        let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
-        *off += 4;
-        Ok(v)
-    };
-    let read_u64 = |data: &[u8], off: &mut usize| -> Result<u64> {
-        if *off + 8 > data.len() {
-            anyhow::bail!("Device state truncated");
-        }
-        let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
-        *off += 8;
-        Ok(v)
-    };
+    let uart_is_8250 = r.read_bool()?;
+    let uart_8250_ier = r.read_u8()?;
+    let pl011_imsc = r.read_u32()?;
+    let network_enabled = r.read_bool()?;
 
-    let uart_is_8250 = read_u8(data, &mut off)? != 0;
-    let uart_8250_ier = read_u8(data, &mut off)?;
-    let pl011_imsc = read_u32(data, &mut off)?;
-    let network_enabled = read_u8(data, &mut off)? != 0;
-
-    let has_net = read_u8(data, &mut off)? != 0;
-    let net_mmio = if has_net {
-        Some(deserialize_virtio_mmio(
-            data, &mut off, &read_u8, &read_u16, &read_u32, &read_u64,
-        )?)
+    let net_mmio = if r.read_bool()? {
+        Some(read_virtio_mmio(&mut r)?)
     } else {
         None
     };
 
-    let has_rng = read_u8(data, &mut off)? != 0;
-    let rng_mmio = if has_rng {
-        Some(deserialize_virtio_mmio(
-            data, &mut off, &read_u8, &read_u16, &read_u32, &read_u64,
-        )?)
+    let rng_mmio = if r.read_bool()? {
+        Some(read_virtio_mmio(&mut r)?)
     } else {
         None
     };
 
-    // Blk MMIO + use_virtio_blk flag (added later; may be absent in old snapshots)
-    let (use_virtio_blk, blk_mmio) = if off < data.len() {
-        let use_blk = read_u8(data, &mut off)? != 0;
-        let has_blk = read_u8(data, &mut off)? != 0;
-        let blk = if has_blk {
-            Some(deserialize_virtio_mmio(
-                data, &mut off, &read_u8, &read_u16, &read_u32, &read_u64,
-            )?)
+    // Blk MMIO + use_virtio_blk flag
+    let (use_virtio_blk, blk_mmio) = if r.remaining() > 0 {
+        let use_blk = r.read_bool()?;
+        let blk = if r.read_bool()? {
+            Some(read_virtio_mmio(&mut r)?)
         } else {
             None
         };
@@ -892,14 +880,12 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         (false, None)
     };
 
-    // Virtiofs MMIO state (added later; may be absent in old snapshots)
-    let fs_mmio = if off + 4 <= data.len() {
-        let num_fs = read_u32(data, &mut off)? as usize;
+    // Virtiofs MMIO state
+    let fs_mmio = if r.remaining() >= 4 {
+        let num_fs = r.read_u32()? as usize;
         let mut fs = Vec::with_capacity(num_fs);
         for _ in 0..num_fs {
-            fs.push(deserialize_virtio_mmio(
-                data, &mut off, &read_u8, &read_u16, &read_u32, &read_u64,
-            )?);
+            fs.push(read_virtio_mmio(&mut r)?);
         }
         fs
     } else {
@@ -907,18 +893,12 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
     };
 
     // GIC state
-    let gic_len = read_u32(data, &mut off)? as usize;
+    let gic_len = r.read_u32()? as usize;
     let gic_state = if gic_len > 0 {
-        if off + gic_len > data.len() {
-            anyhow::bail!("Device state truncated (GIC state)");
-        }
-        let gic = data[off..off + gic_len].to_vec();
-        off += gic_len;
-        Some(gic)
+        Some(r.read_bytes(gic_len)?.to_vec())
     } else {
         None
     };
-    let _ = off; // suppress unused warning
 
     Ok(DeviceState {
         uart_is_8250,
@@ -934,33 +914,26 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
     })
 }
 
-fn deserialize_virtio_mmio(
-    data: &[u8],
-    off: &mut usize,
-    read_u8: &dyn Fn(&[u8], &mut usize) -> Result<u8>,
-    read_u16: &dyn Fn(&[u8], &mut usize) -> Result<u16>,
-    read_u32: &dyn Fn(&[u8], &mut usize) -> Result<u32>,
-    read_u64: &dyn Fn(&[u8], &mut usize) -> Result<u64>,
-) -> Result<VirtioMmioSnapshot> {
-    let device_features_sel = read_u32(data, off)?;
-    let driver_features = read_u64(data, off)?;
-    let driver_features_sel = read_u32(data, off)?;
-    let queue_sel = read_u32(data, off)?;
-    let status = read_u32(data, off)?;
-    let interrupt_status = read_u32(data, off)?;
-    let config_generation = read_u32(data, off)?;
-    let num_queues = read_u32(data, off)? as usize;
+fn read_virtio_mmio(r: &mut SnapReader) -> Result<VirtioMmioSnapshot> {
+    let device_features_sel = r.read_u32()?;
+    let driver_features = r.read_u64()?;
+    let driver_features_sel = r.read_u32()?;
+    let queue_sel = r.read_u32()?;
+    let status = r.read_u32()?;
+    let interrupt_status = r.read_u32()?;
+    let config_generation = r.read_u32()?;
+    let num_queues = r.read_u32()? as usize;
 
     let mut queues = Vec::with_capacity(num_queues);
     for _ in 0..num_queues {
         queues.push(VirtqSnapshot {
-            num_max: read_u32(data, off)?,
-            num: read_u32(data, off)?,
-            ready: read_u8(data, off)?,
-            desc_addr: read_u64(data, off)?,
-            avail_addr: read_u64(data, off)?,
-            used_addr: read_u64(data, off)?,
-            last_avail_idx: read_u16(data, off)?,
+            num_max: r.read_u32()?,
+            num: r.read_u32()?,
+            ready: r.read_u8()?,
+            desc_addr: r.read_u64()?,
+            avail_addr: r.read_u64()?,
+            used_addr: r.read_u64()?,
+            last_avail_idx: r.read_u16()?,
         });
     }
 

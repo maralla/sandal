@@ -15,18 +15,26 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Args, Cli, Command, PackArgs};
 use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// Check if a valid snapshot exists and try to restore from it.
 /// Returns None if no snapshot is available, Some(Ok(())) if restore succeeded
 /// (note: process exits inside), or Some(Err) if restore failed.
-fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
+/// Check if a valid snapshot exists and try to restore from it.
+/// Returns `(Option<Result<()>>, Option<PathBuf>)`:
+/// - First element: None if no snapshot found, Some(Ok/Err) if attempted.
+/// - Second element: snapshot path if one was found (for cleanup on failure).
+fn try_snapshot_restore(args: &Args) -> (Option<Result<()>>, Option<PathBuf>) {
     let t0 = Instant::now();
 
     // Resolve kernel and rootfs paths.
     let kernel_path = match &args.kernel {
         Some(p) => p.clone(),
-        None => vm::resolve_data_path("vmlinux-sandal")?,
+        None => match vm::resolve_data_path("vmlinux-sandal") {
+            Some(p) => p,
+            None => return (None, None),
+        },
     };
     let default_rootfs = if args.rootfs.is_none() {
         vm::resolve_data_path("rootfs.ext2")
@@ -51,9 +59,12 @@ fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
     let fingerprint =
         snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
 
-    let snap_path = snapshot::snapshot_path(fingerprint).ok()?;
+    let snap_path = match snapshot::snapshot_path(fingerprint) {
+        Ok(p) => p,
+        Err(_) => return (None, None),
+    };
     if !snap_path.exists() {
-        return None;
+        return (None, None);
     }
 
     log::debug!(
@@ -61,7 +72,8 @@ fn try_snapshot_restore(args: &Args) -> Option<Result<()>> {
         t0.elapsed().as_secs_f64() * 1000.0
     );
     log::info!("Found snapshot: {}", snap_path.display());
-    Some(vm::run_from_snapshot(args, &snap_path, fingerprint))
+    let result = vm::run_from_snapshot(args, &snap_path, fingerprint);
+    (Some(result), Some(snap_path))
 }
 
 fn run_pack(pack_args: &PackArgs) -> Result<()> {
@@ -105,11 +117,18 @@ fn run_vm(args: Args) -> Result<()> {
     {
         // Try snapshot restore fast path first
         if !args.no_cache {
-            if let Some(snap_result) = try_snapshot_restore(&args) {
-                match snap_result {
+            let (snap_result, snap_path) = try_snapshot_restore(&args);
+            if let Some(result) = snap_result {
+                match result {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         log::debug!("Snapshot restore failed, falling back to full boot: {e}");
+                        // Delete the stale/invalid snapshot so the next cold
+                        // boot creates a fresh one.
+                        if let Some(p) = snap_path {
+                            log::debug!("Removing stale snapshot: {}", p.display());
+                            let _ = fs::remove_file(&p);
+                        }
                     }
                 }
             }
