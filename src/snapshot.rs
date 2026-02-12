@@ -27,6 +27,10 @@ use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 
+extern "C" {
+    fn mach_absolute_time() -> u64;
+}
+
 // ── Snapshot file format ──────────────────────────────────────────────
 
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
@@ -391,9 +395,6 @@ pub fn restore_cpu_state(vcpu: &Vcpu, state: &CpuState) -> Result<()> {
     // inside spin_lock_irqsave (IRQs disabled), the timer interrupt
     // cannot be delivered, causing an infinite vtimer-fire-mask-unmask
     // loop that hangs the VM.
-    extern "C" {
-        fn mach_absolute_time() -> u64;
-    }
     let current_cntpct = unsafe { mach_absolute_time() };
     let adjusted_offset = if state.saved_cntpct != 0 {
         // new_offset = old_offset + (current_phys - saved_phys)
@@ -604,9 +605,6 @@ fn read_cpu_state(vcpu: &Vcpu) -> Result<CpuState> {
     state.vtimer_mask = if vcpu.get_vtimer_mask()? { 1 } else { 0 };
 
     // Save the physical counter so we can adjust the vtimer offset on restore.
-    extern "C" {
-        fn mach_absolute_time() -> u64;
-    }
     state.saved_cntpct = unsafe { mach_absolute_time() };
 
     // GIC ICC (CPU interface) registers
