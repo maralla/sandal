@@ -1,5 +1,6 @@
 
 # Network setup
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ip link set lo up 2>/dev/null
 if [ -e /sys/class/net/eth0 ]; then
     ip link set eth0 up 2>/dev/null
