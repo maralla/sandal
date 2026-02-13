@@ -39,10 +39,12 @@ impl DeviceTree {
         initrd: Option<(u64, u64)>,
         virtio_net: Option<(u64, u32)>,
         virtio_blk: Option<(u64, u32)>,
+        data_blk: Option<(u64, u32)>,
         virtio_rng: Option<(u64, u32)>,
         virtiofs: &[(u64, u32)],
         use_8250_uart: bool,
         verbose: bool,
+        overlay_bootarg: Option<&str>,
     ) -> Result<Vec<u8>> {
         let mut dt = Self::new();
 
@@ -74,7 +76,10 @@ impl DeviceTree {
             // preventing printk from cluttering the interactive terminal.
             // In verbose mode we omit it so all kernel output is visible.
             let quiet = if verbose { "" } else { " quiet" };
-            dt.prop_string("bootargs", &format!("{earlycon}{rootfs}{quiet}"));
+            let overlay = overlay_bootarg
+                .map(|v| format!(" overlay={v}"))
+                .unwrap_or_default();
+            dt.prop_string("bootargs", &format!("{earlycon}{rootfs}{quiet}{overlay}"));
         }
         if use_8250_uart {
             dt.prop_string("stdout-path", "/serial@9000000");
@@ -233,6 +238,24 @@ impl DeviceTree {
             let mut virq = Vec::new();
             virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
             virq.extend_from_slice(&blk_spi.to_be_bytes());
+            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
+            dt.prop_bytes("interrupts", &virq);
+            dt.prop_empty("dma-coherent");
+            dt.end_node();
+        }
+
+        // Data block MMIO node (overlay writable disk, --disk-size)
+        if let Some((base, spi)) = data_blk {
+            let node_name = format!("virtio_mmio@{base:x}");
+            dt.begin_node(&node_name);
+            dt.prop_string("compatible", "virtio,mmio");
+            let mut vreg = Vec::new();
+            vreg.extend_from_slice(&base.to_be_bytes());
+            vreg.extend_from_slice(&0x200u64.to_be_bytes());
+            dt.prop_bytes("reg", &vreg);
+            let mut virq = Vec::new();
+            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
+            virq.extend_from_slice(&spi.to_be_bytes());
             virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
             dt.prop_bytes("interrupts", &virq);
             dt.prop_empty("dma-coherent");

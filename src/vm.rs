@@ -73,6 +73,12 @@ mod mem_layout {
     pub const VIRTIOFS_SPI_START: u32 = 19;
     pub const MAX_FS_DEVICES: usize = 8;
 
+    // Second virtio-blk device for the writable overlay disk (--disk-size).
+    // Placed after the virtiofs MMIO region (0x0A000600 + 8*0x200 = 0x0A001600).
+    pub const DATA_BLK_BASE: u64 = 0x0A001800;
+    pub const DATA_BLK_SIZE: u64 = 0x200;
+    pub const DATA_BLK_SPI: u32 = 27; // After virtiofs SPIs (19..26)
+
     pub const UART_SPI: u32 = 1;
 }
 
@@ -137,6 +143,8 @@ pub struct VmInstance {
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
+    data_blk: Option<VirtioBlkDevice>, // Overlay data disk (--disk-size)
+    data_blk_config_changed: bool,     // Trigger config change SPI after GIC restore
     virtio_rng: Option<VirtioRngDevice>,
     virtiofs: Vec<VirtioFsDevice>,
     use_virtio_blk: bool,
@@ -283,6 +291,8 @@ impl VmInstance {
             network_enabled: false,
             virtio_net: None,
             virtio_blk: None,
+            data_blk: None,
+            data_blk_config_changed: false,
             virtio_rng: None,
             virtiofs: Vec::new(),
             use_virtio_blk: false,
@@ -473,6 +483,11 @@ impl VmInstance {
             })
             .collect();
 
+        // Always include the second virtio-blk device in the DT so the
+        // kernel probes the slot during cold boot.  This produces a
+        // snapshot reusable regardless of whether --disk-size is supplied.
+        let data_blk_dt = Some((DATA_BLK_BASE, DATA_BLK_SPI));
+
         let use_8250 = self.is_uart_8250();
         let dtb = DeviceTree::build(
             self.memory_size as u64,
@@ -484,10 +499,12 @@ impl VmInstance {
             self.initrd_info,
             virtio_net_dt,
             virtio_blk_dt,
+            data_blk_dt,
             virtio_rng_dt,
             &virtiofs_dt,
             use_8250,
             log::log_enabled!(log::Level::Debug),
+            None, // no overlay bootarg — init script detects via /dev/vdb size
         )?;
 
         let dtb_offset = DTB_OFFSET as usize;
@@ -711,6 +728,15 @@ impl VmInstance {
                     } else {
                         self.pl011_update_irq();
                     }
+                }
+
+                // If the overlay disk capacity changed (--disk-size on a
+                // snapshot that cold-booted with the 1MB stub), assert the
+                // config change SPI so the kernel re-reads the block size.
+                if self.data_blk_config_changed {
+                    self.data_blk_config_changed = false;
+                    Vm::set_gic_spi(DATA_BLK_SPI, true);
+                    debug!("Asserted data_blk config change SPI for capacity resize");
                 }
             }
 
@@ -1241,6 +1267,7 @@ impl VmInstance {
         let net_mmio = self.virtio_net.as_ref().map(VirtioMmioSnapshot::from_net);
         let rng_mmio = self.virtio_rng.as_ref().map(VirtioMmioSnapshot::from_rng);
         let blk_mmio = self.virtio_blk.as_ref().map(VirtioMmioSnapshot::from_blk);
+        let data_blk_mmio = self.data_blk.as_ref().map(VirtioMmioSnapshot::from_blk);
 
         // Save GIC state (macOS 15.0+)
         let gic_state = Vm::save_gic_state();
@@ -1267,6 +1294,7 @@ impl VmInstance {
             use_virtio_blk: self.use_virtio_blk,
             fs_mmio,
             gic_state,
+            data_blk_mmio,
         }
     }
 
@@ -1618,6 +1646,28 @@ impl VmInstance {
                     }
                 } else {
                     let value = blk.mmio_read(offset);
+                    Self::write_guest_register(vcpu, rt, value as u64)?;
+                }
+            } else if !is_write {
+                Self::write_guest_register(vcpu, rt, 0)?;
+            }
+        }
+        // Data block MMIO region (overlay disk)
+        else if (DATA_BLK_BASE..DATA_BLK_BASE + DATA_BLK_SIZE).contains(&fault_addr) {
+            let offset = fault_addr - DATA_BLK_BASE;
+            if let Some(ref mut dev) = self.data_blk {
+                if is_write {
+                    let value = Self::read_guest_register(vcpu, rt)? as u32;
+                    if let Some(_queue_idx) = dev.mmio_write(offset, value) {
+                        if dev.process_queue(&mut self.memory, RAM_BASE) {
+                            Vm::set_gic_spi(DATA_BLK_SPI, true);
+                        }
+                    }
+                    if offset == crate::virtio::REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
+                        Vm::set_gic_spi(DATA_BLK_SPI, false);
+                    }
+                } else {
+                    let value = dev.mmio_read(offset);
                     Self::write_guest_register(vcpu, rt, value as u64)?;
                 }
             } else if !is_write {
@@ -2005,6 +2055,21 @@ pub fn run(args: Args) -> Result<()> {
     // Always provide a virtio-rng device for guest entropy
     vm.virtio_rng = Some(VirtioRngDevice::new());
 
+    // Always create a second virtio-blk device so the kernel probes /dev/vdb
+    // during cold boot.  This ensures the same snapshot works regardless of
+    // whether --disk-size is specified on subsequent warm restores.
+    // With --disk-size: create a real-sized ext2 disk.
+    // Without: create a minimal 1MB stub (enough for the kernel to register
+    // the device; the init script will fall back to tmpfs overlay).
+    {
+        let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
+        let disk_image = ext2::create_empty_ext2(data_blk_bytes)?;
+        vm.data_blk = Some(VirtioBlkDevice::new(disk_image));
+        if let Some(mb) = args.disk_size {
+            info!("Created {}MB overlay disk (/dev/vdb)", mb);
+        }
+    }
+
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(&kernel_data)?;
 
@@ -2324,9 +2389,59 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         virtio_net,
         virtio_rng: Some(virtio_rng),
         virtio_blk,
+        data_blk: None, // Restored below with fresh disk
+        data_blk_config_changed: false,
         use_virtio_blk,
         virtiofs: virtiofs_devices,
     };
+
+    // Restore second virtio-blk device (overlay disk).  The disk data is
+    // ephemeral (fresh ext2 on every run), but the MMIO state must match
+    // what the kernel's driver saw during cold boot.
+    // With --disk-size N: create an N MB disk.
+    // Without: create a 1 MB stub (init script will fall back to tmpfs).
+    {
+        let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
+        let disk_image = crate::ext2::create_empty_ext2(data_blk_bytes)?;
+        let mut device = VirtioBlkDevice::new(disk_image);
+
+        // Restore MMIO state from snapshot so the kernel driver stays consistent
+        if let Some(ref mmio) = snapshot_device_state.data_blk_mmio {
+            device.device_features_sel = mmio.device_features_sel;
+            device.driver_features = mmio.driver_features;
+            device.driver_features_sel = mmio.driver_features_sel;
+            device.queue_sel = mmio.queue_sel;
+            device.status = mmio.status;
+            device.interrupt_status = mmio.interrupt_status;
+            device.config_generation = mmio.config_generation;
+            for (i, q) in mmio.queues.iter().enumerate() {
+                if i < device.queues.len() {
+                    device.queues[i].num_max = q.num_max;
+                    device.queues[i].num = q.num;
+                    device.queues[i].ready = q.ready != 0;
+                    device.queues[i].desc_addr = q.desc_addr;
+                    device.queues[i].avail_addr = q.avail_addr;
+                    device.queues[i].used_addr = q.used_addr;
+                    device.queues[i].last_avail_idx = q.last_avail_idx;
+                }
+            }
+        }
+
+        // If the new disk has a different capacity than the cold-boot stub,
+        // signal a virtio config change so the kernel re-reads the size.
+        // The interrupt will be delivered when the vCPU resumes.
+        if args.disk_size.is_some() {
+            device.config_generation = device.config_generation.wrapping_add(1);
+            // Bit 1 = config change notification (VIRTIO_MMIO_INT_CONFIG)
+            device.interrupt_status |= 2;
+            vm.data_blk_config_changed = true;
+        }
+
+        vm.data_blk = Some(device);
+        if let Some(mb) = args.disk_size {
+            info!("Created {}MB overlay disk (/dev/vdb)", mb);
+        }
+    }
 
     // Inject the command into the UART RX buffer.  The snapshot was
     // taken in userspace (EL0) at the BRK instruction — no kernel

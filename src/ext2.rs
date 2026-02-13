@@ -17,8 +17,10 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
+use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::slice;
 
 use crate::initramfs;
 
@@ -30,6 +32,149 @@ const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 // Inode numbers
 const ROOT_INO: u32 = 2;
 const FIRST_FREE_INO: u32 = 11; // First non-reserved inode
+
+/// On-disk ext2 superblock — exact binary layout (136 bytes).
+/// All multi-byte fields stored in native little-endian order via `.to_le()`.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Ext2Sb {
+    s_inodes_count: u32,      // 0
+    s_blocks_count: u32,      // 4
+    s_r_blocks_count: u32,    // 8
+    s_free_blocks_count: u32, // 12
+    s_free_inodes_count: u32, // 16
+    s_first_data_block: u32,  // 20
+    s_log_block_size: u32,    // 24
+    s_log_frag_size: u32,     // 28
+    s_blocks_per_group: u32,  // 32
+    s_frags_per_group: u32,   // 36
+    s_inodes_per_group: u32,  // 40
+    s_mtime: u32,             // 44
+    s_wtime: u32,             // 48
+    s_mnt_count: u16,         // 52
+    s_max_mnt_count: u16,     // 54
+    s_magic: u16,             // 56
+    s_state: u16,             // 58
+    s_errors: u16,            // 60
+    s_minor_rev_level: u16,   // 62
+    s_lastcheck: u32,         // 64
+    s_checkinterval: u32,     // 68
+    s_creator_os: u32,        // 72
+    s_rev_level: u32,         // 76
+    s_def_resuid: u16,        // 80
+    s_def_resgid: u16,        // 82
+    s_first_ino: u32,         // 84
+    s_inode_size: u16,        // 88
+    s_block_group_nr: u16,    // 90
+    s_feature_compat: u32,    // 92
+    s_feature_incompat: u32,  // 96
+    s_feature_ro_compat: u32, // 100
+    s_uuid: [u8; 16],         // 104
+    s_volume_name: [u8; 16],  // 120
+                              // total: 136 bytes
+}
+
+const _: () = assert!(size_of::<Ext2Sb>() == 136);
+
+impl Ext2Sb {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+
+    /// Write the superblock into `dst` (must be >= 136 bytes).
+    fn write_to(&self, dst: &mut [u8]) {
+        dst[..size_of::<Self>()].copy_from_slice(self.as_bytes());
+    }
+}
+
+/// On-disk ext2 block group descriptor — exact binary layout (32 bytes).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Ext2Bgdt {
+    bg_block_bitmap: u32,      // 0
+    bg_inode_bitmap: u32,      // 4
+    bg_inode_table: u32,       // 8
+    bg_free_blocks_count: u16, // 12
+    bg_free_inodes_count: u16, // 14
+    bg_used_dirs_count: u16,   // 16
+    bg_pad: u16,               // 18
+    bg_reserved: [u8; 12],     // 20
+                               // total: 32 bytes
+}
+
+const _: () = assert!(size_of::<Ext2Bgdt>() == 32);
+
+impl Ext2Bgdt {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+
+    /// Write the descriptor into `dst` (must be >= 32 bytes).
+    fn write_to(&self, dst: &mut [u8]) {
+        dst[..size_of::<Self>()].copy_from_slice(self.as_bytes());
+    }
+}
+
+/// On-disk ext2 inode — exact binary layout (128 bytes).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Ext2RawInode {
+    i_mode: u16,        // 0
+    i_uid: u16,         // 2
+    i_size: u32,        // 4
+    i_atime: u32,       // 8
+    i_ctime: u32,       // 12
+    i_mtime: u32,       // 16
+    i_dtime: u32,       // 20
+    i_gid: u16,         // 24
+    i_links_count: u16, // 26
+    i_blocks: u32,      // 28
+    i_flags: u32,       // 32
+    i_osd1: u32,        // 36
+    i_block: [u32; 15], // 40  (60 bytes)
+    i_generation: u32,  // 100
+    i_file_acl: u32,    // 104
+    i_dir_acl: u32,     // 108
+    i_faddr: u32,       // 112
+    i_osd2: [u8; 12],   // 116
+                        // total: 128 bytes
+}
+
+const _: () = assert!(size_of::<Ext2RawInode>() == INODE_SIZE);
+
+impl Ext2RawInode {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+
+    fn write_to(&self, dst: &mut [u8]) {
+        dst[..size_of::<Self>()].copy_from_slice(self.as_bytes());
+    }
+}
+
+/// On-disk ext2 directory entry — fixed 12-byte variant (fits "." and "..").
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Ext2RawDirEntry {
+    inode: u32,    // 0
+    rec_len: u16,  // 4
+    name_len: u8,  // 6
+    file_type: u8, // 7
+    name: [u8; 4], // 8  (up to 4 chars, covers "." and "..")
+                   // total: 12 bytes
+}
+
+const _: () = assert!(size_of::<Ext2RawDirEntry>() == 12);
+
+impl Ext2RawDirEntry {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
+    }
+
+    fn write_to(&self, dst: &mut [u8]) {
+        dst[..size_of::<Self>()].copy_from_slice(self.as_bytes());
+    }
+}
 
 // File type constants for directory entries
 const EXT2_FT_UNKNOWN: u8 = 0;
@@ -74,6 +219,196 @@ pub fn pack_directory(dir: &Path) -> Result<Vec<u8>> {
 
     // Build the image
     builder.build()
+}
+
+/// Create an empty ext2 filesystem image of the given size in bytes.
+/// Used for the overlay writable disk (--disk-size).  The image contains
+/// only the root directory, block group metadata, and bitmaps — all
+/// remaining space is free for guest use.
+///
+/// Supports multiple block groups for disks larger than 128 MB.
+pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
+    let total_blocks = size_bytes / BLOCK_SIZE;
+    if total_blocks < 16 {
+        anyhow::bail!("Disk size too small (need at least 64KB)");
+    }
+
+    // Maximum blocks per group is limited by the block bitmap (one 4KB block = 32768 bits).
+    const MAX_BPG: usize = BLOCK_SIZE * 8; // 32768
+
+    let blocks_per_group = total_blocks.min(MAX_BPG);
+    let num_groups = total_blocks.div_ceil(blocks_per_group);
+
+    // Distribute inodes evenly across groups.
+    let total_inodes_target = (total_blocks / 4).clamp(256, 65536);
+    let inodes_per_group = total_inodes_target.div_ceil(num_groups);
+    let num_inodes = inodes_per_group * num_groups;
+    let inode_table_blocks = (inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE);
+
+    // Every group has the same layout (no sparse_super):
+    //   superblock (or backup) + BGDT (or backup) + block bitmap +
+    //   inode bitmap + inode table
+    let meta_per_group = 4 + inode_table_blocks; // sb + bgdt + bb + ib + IT
+
+    // Root directory data block sits right after group 0's metadata.
+    let root_data_block = meta_per_group;
+
+    // Total used blocks across all groups (metadata + root dir data in group 0).
+    let total_used = meta_per_group * num_groups + 1; // +1 for root dir data
+    let total_free_blocks = total_blocks - total_used;
+    let total_free_inodes = num_inodes - (FIRST_FREE_INO as usize - 1);
+
+    let mut image = vec![0u8; total_blocks * BLOCK_SIZE];
+
+    // --- Superblock (at byte 1024) ---
+    {
+        let mut name = [0u8; 16];
+        name[..7].copy_from_slice(b"overlay");
+        let sb = Ext2Sb {
+            s_inodes_count: (num_inodes as u32).to_le(),
+            s_blocks_count: (total_blocks as u32).to_le(),
+            s_free_blocks_count: (total_free_blocks as u32).to_le(),
+            s_free_inodes_count: (total_free_inodes as u32).to_le(),
+            s_log_block_size: 2u32.to_le(),
+            s_log_frag_size: 2u32.to_le(),
+            s_blocks_per_group: (blocks_per_group as u32).to_le(),
+            s_frags_per_group: (blocks_per_group as u32).to_le(),
+            s_inodes_per_group: (inodes_per_group as u32).to_le(),
+            s_max_mnt_count: u16::MAX.to_le(),
+            s_magic: EXT2_SUPER_MAGIC.to_le(),
+            s_state: 1u16.to_le(),
+            s_errors: 1u16.to_le(),
+            s_rev_level: 1u32.to_le(),
+            s_first_ino: FIRST_FREE_INO.to_le(),
+            s_inode_size: (INODE_SIZE as u16).to_le(),
+            s_feature_incompat: 0x02u32.to_le(),
+            s_volume_name: name,
+            ..Default::default()
+        };
+        sb.write_to(&mut image[SUPERBLOCK_OFFSET..]);
+    }
+
+    // --- Block Group Descriptor Table (block 1) + per-group bitmaps & inode tables ---
+    //
+    // Every group has identical layout at the same relative offsets:
+    //   +0: superblock (primary in g0, backup in others)
+    //   +1: BGDT      (primary in g0, backup in others)
+    //   +2: block bitmap
+    //   +3: inode bitmap
+    //   +4..+4+IT-1: inode table
+    //   +4+IT..: data blocks
+    for g in 0..num_groups {
+        let group_start = g * blocks_per_group;
+        let group_blocks = if g == num_groups - 1 {
+            total_blocks - group_start
+        } else {
+            blocks_per_group
+        };
+
+        // Used blocks in this group: metadata + root data in group 0.
+        let used_in_group = meta_per_group + if g == 0 { 1 } else { 0 };
+
+        // Write BGDT entry (32 bytes each, in primary BGDT at block 1).
+        (Ext2Bgdt {
+            bg_block_bitmap: ((group_start + 2) as u32).to_le(),
+            bg_inode_bitmap: ((group_start + 3) as u32).to_le(),
+            bg_inode_table: ((group_start + 4) as u32).to_le(),
+            bg_free_blocks_count: ((group_blocks - used_in_group) as u16).to_le(),
+            bg_free_inodes_count: (if g == 0 {
+                (inodes_per_group - (FIRST_FREE_INO as usize - 1)) as u16
+            } else {
+                inodes_per_group as u16
+            })
+            .to_le(),
+            bg_used_dirs_count: (if g == 0 { 1u16 } else { 0u16 }).to_le(),
+            ..Default::default()
+        })
+        .write_to(&mut image[BLOCK_SIZE + g * 32..]);
+
+        // Block bitmap — mark metadata blocks as used, pad trailing bits.
+        {
+            let bb_block = group_start + 2;
+            let bm = bb_block * BLOCK_SIZE;
+            for b in 0..used_in_group {
+                image[bm + b / 8] |= 1 << (b % 8);
+            }
+            // Pad bits beyond group_blocks to fill the bitmap block.
+            let first_pad_byte = group_blocks.div_ceil(8);
+            for b in group_blocks..(first_pad_byte * 8) {
+                image[bm + b / 8] |= 1 << (b % 8);
+            }
+            for byte_idx in first_pad_byte..BLOCK_SIZE {
+                image[bm + byte_idx] = 0xFF;
+            }
+        }
+
+        // Inode bitmap — mark reserved inodes in group 0, pad trailing bits.
+        {
+            let ib_block = group_start + 3;
+            let bm = ib_block * BLOCK_SIZE;
+            if g == 0 {
+                for i in 0..(FIRST_FREE_INO as usize - 1) {
+                    image[bm + i / 8] |= 1 << (i % 8);
+                }
+            }
+            let first_pad_byte = inodes_per_group.div_ceil(8);
+            for i in inodes_per_group..(first_pad_byte * 8) {
+                image[bm + i / 8] |= 1 << (i % 8);
+            }
+            for byte_idx in first_pad_byte..BLOCK_SIZE {
+                image[bm + byte_idx] = 0xFF;
+            }
+        }
+
+        // Write superblock + BGDT backups in groups > 0.
+        if g > 0 {
+            let sb_backup_off = group_start * BLOCK_SIZE;
+            let sb_primary = &image[0..2 * BLOCK_SIZE].to_vec();
+            image[sb_backup_off..sb_backup_off + 2 * BLOCK_SIZE].copy_from_slice(sb_primary);
+        }
+    }
+
+    // --- Inode table (group 0, starting at block 4) ---
+    // Write root directory inode (inode 2, zero-indexed offset = 1).
+    {
+        let root_off = 4 * BLOCK_SIZE + (ROOT_INO as usize - 1) * INODE_SIZE;
+        let mut i_block = [0u32; 15];
+        i_block[0] = (root_data_block as u32).to_le();
+        (Ext2RawInode {
+            i_mode: (S_IFDIR | 0o755).to_le(),
+            i_size: (BLOCK_SIZE as u32).to_le(),
+            i_links_count: 2u16.to_le(),
+            i_blocks: ((BLOCK_SIZE / 512) as u32).to_le(),
+            i_block,
+            ..Default::default()
+        })
+        .write_to(&mut image[root_off..]);
+    }
+
+    // --- Root directory data (block root_data_block) ---
+    {
+        let dir = root_data_block * BLOCK_SIZE;
+        // "." entry
+        (Ext2RawDirEntry {
+            inode: ROOT_INO.to_le(),
+            rec_len: 12u16.to_le(),
+            name_len: 1,
+            file_type: EXT2_FT_DIR,
+            name: [b'.', 0, 0, 0],
+        })
+        .write_to(&mut image[dir..]);
+        // ".." entry (fills rest of block)
+        (Ext2RawDirEntry {
+            inode: ROOT_INO.to_le(),
+            rec_len: ((BLOCK_SIZE - 12) as u16).to_le(),
+            name_len: 2,
+            file_type: EXT2_FT_DIR,
+            name: [b'.', b'.', 0, 0],
+        })
+        .write_to(&mut image[dir + 12..]);
+    }
+
+    Ok(image)
 }
 
 struct Ext2Builder {
@@ -319,22 +654,10 @@ impl Ext2Builder {
         let used_blocks = next_block as usize;
 
         // Write superblock
-        self.write_superblock(
-            &mut image,
-            total_blocks,
-            num_inodes,
-            used_blocks,
-            first_data_block,
-        );
+        self.write_superblock(&mut image, total_blocks, num_inodes, used_blocks);
 
         // Write block group descriptor
-        self.write_bgdt(
-            &mut image,
-            num_inodes,
-            used_blocks,
-            first_data_block,
-            inode_table_blocks,
-        );
+        self.write_bgdt(&mut image, num_inodes, used_blocks);
 
         // Write block bitmap
         self.write_block_bitmap(&mut image, used_blocks, total_blocks);
@@ -356,116 +679,50 @@ impl Ext2Builder {
         total_blocks: usize,
         num_inodes: usize,
         used_blocks: usize,
-        _first_data_block: usize,
     ) {
-        let sb = &mut image[SUPERBLOCK_OFFSET..SUPERBLOCK_OFFSET + 1024];
-
-        let free_blocks = total_blocks - used_blocks;
-        let free_inodes = num_inodes - (self.next_ino as usize - 1);
-
-        // s_inodes_count
-        write_le32(sb, 0, num_inodes as u32);
-        // s_blocks_count
-        write_le32(sb, 4, total_blocks as u32);
-        // s_r_blocks_count (reserved)
-        write_le32(sb, 8, 0);
-        // s_free_blocks_count
-        write_le32(sb, 12, free_blocks as u32);
-        // s_free_inodes_count
-        write_le32(sb, 16, free_inodes as u32);
-        // s_first_data_block (0 for 4KB blocks)
-        write_le32(sb, 20, 0);
-        // s_log_block_size (log2(block_size) - 10 = log2(4096) - 10 = 2)
-        write_le32(sb, 24, 2);
-        // s_log_frag_size
-        write_le32(sb, 28, 2);
-        // s_blocks_per_group
-        write_le32(sb, 32, total_blocks as u32);
-        // s_frags_per_group
-        write_le32(sb, 36, total_blocks as u32);
-        // s_inodes_per_group
-        write_le32(sb, 40, num_inodes as u32);
-        // s_mtime, s_wtime
-        write_le32(sb, 44, 0);
-        write_le32(sb, 48, 0);
-        // s_mnt_count
-        write_le16(sb, 52, 0);
-        // s_max_mnt_count
-        write_le16(sb, 54, u16::MAX);
-        // s_magic
-        write_le16(sb, 56, EXT2_SUPER_MAGIC);
-        // s_state (clean)
-        write_le16(sb, 58, 1);
-        // s_errors (continue)
-        write_le16(sb, 60, 1);
-        // s_minor_rev_level
-        write_le16(sb, 62, 0);
-        // s_lastcheck
-        write_le32(sb, 64, 0);
-        // s_checkinterval
-        write_le32(sb, 68, 0);
-        // s_creator_os (Linux)
-        write_le32(sb, 72, 0);
-        // s_rev_level (1 = dynamic revision for inode size)
-        write_le32(sb, 76, 1);
-        // s_def_resuid
-        write_le16(sb, 80, 0);
-        // s_def_resgid
-        write_le16(sb, 82, 0);
-        // == EXT2_DYNAMIC_REV fields ==
-        // s_first_ino
-        write_le32(sb, 84, FIRST_FREE_INO);
-        // s_inode_size
-        write_le16(sb, 88, INODE_SIZE as u16);
-        // s_block_group_nr
-        write_le16(sb, 90, 0);
-        // s_feature_compat (EXT2_FEATURE_COMPAT_EXT_ATTR = 0x08)
-        write_le32(sb, 92, 0);
-        // s_feature_incompat (EXT2_FEATURE_INCOMPAT_FILETYPE = 0x02)
-        write_le32(sb, 96, 0x02);
-        // s_feature_ro_compat
-        write_le32(sb, 100, 0);
-        // s_uuid (16 bytes) - leave as zeros
-        // s_volume_name (16 bytes)
-        sb[120..128].copy_from_slice(b"sandal\0\0");
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"sandal");
+        let sb = Ext2Sb {
+            s_inodes_count: (num_inodes as u32).to_le(),
+            s_blocks_count: (total_blocks as u32).to_le(),
+            s_free_blocks_count: ((total_blocks - used_blocks) as u32).to_le(),
+            s_free_inodes_count: ((num_inodes - (self.next_ino as usize - 1)) as u32).to_le(),
+            s_log_block_size: 2u32.to_le(),
+            s_log_frag_size: 2u32.to_le(),
+            s_blocks_per_group: (total_blocks as u32).to_le(),
+            s_frags_per_group: (total_blocks as u32).to_le(),
+            s_inodes_per_group: (num_inodes as u32).to_le(),
+            s_max_mnt_count: u16::MAX.to_le(),
+            s_magic: EXT2_SUPER_MAGIC.to_le(),
+            s_state: 1u16.to_le(),
+            s_errors: 1u16.to_le(),
+            s_rev_level: 1u32.to_le(),
+            s_first_ino: FIRST_FREE_INO.to_le(),
+            s_inode_size: (INODE_SIZE as u16).to_le(),
+            s_feature_incompat: 0x02u32.to_le(),
+            s_volume_name: name,
+            ..Default::default()
+        };
+        sb.write_to(&mut image[SUPERBLOCK_OFFSET..]);
     }
 
-    fn write_bgdt(
-        &self,
-        image: &mut [u8],
-        num_inodes: usize,
-        used_blocks: usize,
-        _first_data_block: usize,
-        _inode_table_blocks: usize,
-    ) {
-        let bgdt_offset = BLOCK_SIZE; // Block 1
+    fn write_bgdt(&self, image: &mut [u8], num_inodes: usize, used_blocks: usize) {
         let total_blocks = image.len() / BLOCK_SIZE;
-        let free_blocks = total_blocks - used_blocks;
-        let free_inodes = num_inodes - (self.next_ino as usize - 1);
-        let dir_count = self
-            .entries
-            .values()
-            .filter(|e| e.mode & 0xF000 == S_IFDIR)
-            .count();
-
-        let bg = &mut image[bgdt_offset..bgdt_offset + 64]; // Use 64 bytes for ext4 compat
-
-        // bg_block_bitmap
-        write_le32(bg, 0, 2);
-        // bg_inode_bitmap
-        write_le32(bg, 4, 3);
-        // bg_inode_table
-        write_le32(bg, 8, 4);
-        // bg_free_blocks_count
-        write_le16(bg, 12, free_blocks as u16);
-        // bg_free_inodes_count
-        write_le16(bg, 14, free_inodes as u16);
-        // bg_used_dirs_count
-        write_le16(bg, 16, dir_count as u16);
-        // bg_flags: EXT4_BG_INODE_ZEROED (0x4) — tells ext4 inode table is already zeroed
-        write_le16(bg, 18, 0x0004);
-        // bg_itable_unused_lo: number of unused inodes in the inode table
-        write_le16(bg, 28, free_inodes as u16);
+        (Ext2Bgdt {
+            bg_block_bitmap: 2u32.to_le(),
+            bg_inode_bitmap: 3u32.to_le(),
+            bg_inode_table: 4u32.to_le(),
+            bg_free_blocks_count: ((total_blocks - used_blocks) as u16).to_le(),
+            bg_free_inodes_count: ((num_inodes - (self.next_ino as usize - 1)) as u16).to_le(),
+            bg_used_dirs_count: (self
+                .entries
+                .values()
+                .filter(|e| e.mode & 0xF000 == S_IFDIR)
+                .count() as u16)
+                .to_le(),
+            ..Default::default()
+        })
+        .write_to(&mut image[BLOCK_SIZE..]);
     }
 
     fn write_block_bitmap(&self, image: &mut [u8], used_blocks: usize, total_blocks: usize) {

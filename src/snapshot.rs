@@ -158,6 +158,7 @@ pub struct DeviceState {
     pub use_virtio_blk: bool,
     pub fs_mmio: Vec<VirtioMmioSnapshot>, // virtiofs device MMIO state (one per --share)
     pub gic_state: Option<Vec<u8>>,       // Opaque GIC state blob (macOS 15+)
+    pub data_blk_mmio: Option<VirtioMmioSnapshot>, // Overlay data disk (--disk-size)
 }
 
 // ── Save ──────────────────────────────────────────────────────────────
@@ -532,10 +533,10 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
 /// Compute a fingerprint from kernel/rootfs content hashes, memory size,
 /// and network config.  Changes to any of these invalidate the snapshot.
 ///
-/// Shared directories (`--share`) are NOT included: the device tree
-/// always reserves all MAX_FS_DEVICES virtiofs slots, and mount commands
-/// are injected via UART at runtime, so the same snapshot works for any
-/// combination of `--share` arguments.
+/// Shared directories (`--share`) and `--disk-size` are NOT included:
+/// the device tree always reserves all virtiofs and data block slots,
+/// and the overlay disk is ephemeral (fresh on every run), so the same
+/// snapshot works regardless of those arguments.
 ///
 /// Both `kernel_fingerprint` and `rootfs_fingerprint` should be produced
 /// by [`hash_file_content`].
@@ -816,6 +817,12 @@ fn serialize_device_state(state: &DeviceState) -> Vec<u8> {
         w.write_u32(0);
     }
 
+    // Data block MMIO (overlay disk) — appended after GIC for backward compat
+    w.write_bool(state.data_blk_mmio.is_some());
+    if let Some(ref mmio) = state.data_blk_mmio {
+        write_virtio_mmio(&mut w, mmio);
+    }
+
     w.into_vec()
 }
 
@@ -892,6 +899,17 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         None
     };
 
+    // Data block MMIO (overlay disk) — added after GIC; absent in old snapshots
+    let data_blk_mmio = if r.remaining() > 0 {
+        if r.read_bool()? {
+            Some(read_virtio_mmio(&mut r)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(DeviceState {
         uart_is_8250,
         uart_8250_ier,
@@ -903,6 +921,7 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         use_virtio_blk,
         fs_mmio,
         gic_state,
+        data_blk_mmio,
     })
 }
 

@@ -65,6 +65,10 @@ pub struct RunArgs {
     /// Disable snapshot caching (always boot from scratch)
     #[arg(long = "no-cache")]
     pub no_cache: bool,
+
+    /// Extra writable disk size in MB (creates /dev/vdb with overlayfs)
+    #[arg(long = "disk-size", value_name = "MB")]
+    pub disk_size: Option<usize>,
 }
 
 #[derive(Parser, Debug, Clone)]

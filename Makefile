@@ -32,10 +32,10 @@ ROOTFS_DIRS := \
 
 # Empty files the apk database needs to exist
 ROOTFS_TOUCH := \
-	lib/apk/db/installed lib/apk/db/lock lib/apk/db/triggers etc/apk/world
+	lib/apk/db/lock lib/apk/db/triggers
 
-# Apk config to copy verbatim from rootfs/ (keys/ dir is copied recursively)
-ROOTFS_APK_CONF := etc/apk/repositories etc/apk/arch
+# Apk config and database to copy verbatim from rootfs/ (keys/ dir is copied recursively)
+ROOTFS_APK_CONF := etc/apk/repositories etc/apk/arch etc/apk/world lib/apk/db/installed
 ROOTFS_APK_KEYS := etc/apk/keys
 
 .PHONY: build debug clippy rootfs-minimal
