@@ -4,7 +4,9 @@ use crate::hypervisor::{
     self, HvGicIccReg, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
 };
 use crate::net::NetworkFilter;
-use crate::snapshot::{self, CpuState, DeviceState, SnapshotRestore, VirtioMmioSnapshot};
+use crate::snapshot::{
+    self, read_cpu_state, CpuState, DeviceState, SnapshotRestore, VirtioMmioSnapshot,
+};
 use crate::unet::UserNet;
 use crate::virtio::blk::VirtioBlkDevice;
 use crate::virtio::fs::VirtioFsDevice;
@@ -125,7 +127,7 @@ pub struct VmInstance {
     pending_command: Option<String>, // Shell-escaped command line to inject after BOOT_MARKER
     snapshot_save_path: Option<PathBuf>, // If set, save snapshot after boot
     snapshot_fingerprint: u64, // Fingerprint for the snapshot file
-    snapshot_pending: u32,  // Countdown: save snapshot when this reaches 0
+    snapshot_pending: u32,  // Flag: set to 1 by BRK handler to trigger snapshot save
     restored_cpu_state: Option<CpuState>, // If set, restore these registers instead of boot state
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
     is_restored: bool,      // True if VM was restored from a snapshot
@@ -538,18 +540,11 @@ impl VmInstance {
             // GIC state will be restored from self.gic_state_to_restore
             // in the main loop after the first few iterations.
 
-            // Note: The snapshot is taken while the kernel holds the UART
-            // port spinlock (inside spin_lock_irqsave), with IRQs disabled
-            // in CPSR.  On restore the kernel resumes at the same PC,
-            // processes the MMIO result, and naturally unlocks via
-            // spin_unlock_irqrestore.  The unlock uses `stlr` (store-release),
-            // NOT `stlxr` (store-exclusive), so the HVF exclusive-monitor
-            // clearing between VM exits does not affect it — the unlock
-            // always succeeds.  No manual lock patching is needed.
-            //
-            // IRQs remain masked in CPSR until spin_unlock_irqrestore
-            // restores the saved flags, so no interrupt handler can run
-            // (and attempt to re-acquire the lock) until the lock is freed.
+            // Note: The snapshot is taken from userspace (EL0) after the
+            // init script runs sandal-signal (BRK #0x5D1).  IRQs are
+            // enabled and no kernel locks are held, so on restore the
+            // guest can immediately handle interrupts and proceed with
+            // reading the injected command from the UART.
 
             debug!("--- Entering VCPU run loop (restored) ---");
         } else {
@@ -577,30 +572,7 @@ impl VmInstance {
             // Trap debug exceptions
             vcpu.set_trap_debug_exceptions(true)?;
 
-            if log::log_enabled!(log::Level::Debug) {
-                let verify_pc = vcpu.read_register(HvReg::Pc)?;
-                let verify_cpsr = vcpu.read_register(HvReg::Cpsr)?;
-                debug!("VCPU configured:");
-                debug!(
-                    "   PC:   0x{:x} (expected: 0x{:x}) {}",
-                    verify_pc,
-                    bootloader_gpa,
-                    if verify_pc == bootloader_gpa {
-                        "OK"
-                    } else {
-                        "MISMATCH!"
-                    }
-                );
-                debug!("   CPSR: 0x{:x} (EL{}h)", verify_cpsr, verify_cpsr & 0xF);
-                debug!("   SP:   0x{sp_addr:x}");
-                debug!("   Kernel entry: 0x{:x}", self.kernel_entry);
-
-                if verify_pc != bootloader_gpa {
-                    warn!("PC mismatch! HvReg values may still be wrong.");
-                }
-
-                debug!("--- Entering VCPU run loop ---");
-            }
+            debug!("--- Entering VCPU run loop ---");
         }
 
         debug!(
@@ -690,6 +662,10 @@ impl VmInstance {
             // Track iterations after boot_complete
             if self.boot_complete && self.boot_complete_iter == 0 {
                 self.boot_complete_iter = iteration;
+                debug!(
+                    "[bench] boot_complete at iter {iteration}: {:.2}ms",
+                    trc.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // Deferred GIC state restore: apply before the first vcpu.run()
@@ -724,13 +700,18 @@ impl VmInstance {
                         }
                     }
                 }
-            }
 
-            // Diagnostic: log pre-run state on restore
-            if self.is_restored && iteration <= 5 {
-                let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
-                let cpsr = vcpu.read_register(HvReg::Cpsr).unwrap_or(0);
-                debug!("restore pre-run iter {iteration}: PC=0x{pc:x} CPSR=0x{cpsr:x}");
+                // On restore, assert the UART RX interrupt so the
+                // guest can read the injected command data.
+                if !self.uart_rx_buf.is_empty() {
+                    if let UartType::Uart8250(ref state) = self.uart_type {
+                        if (state.ier & 0x01) != 0 {
+                            Vm::set_gic_spi(UART_SPI, true);
+                        }
+                    } else {
+                        self.pl011_update_irq();
+                    }
+                }
             }
 
             let exit_reason = match vcpu.run() {
@@ -745,64 +726,6 @@ impl VmInstance {
             // Unmask the vtimer after any non-VTIMER exit.
             if exit_reason != 2 {
                 vcpu.set_vtimer_mask(false)?;
-            }
-
-            // ── Snapshot countdown ──────────────────────────────────
-            // After BOOT_MARKER the kernel enters a UART polling loop
-            // (DataAbort exits) waiting for our command.  Count down a
-            // handful of exits so the kernel has flushed the BOOT_MARKER
-            // echo and is in a steady polling state, then save.
-            if self.snapshot_pending > 0 {
-                self.snapshot_pending -= 1;
-                if self.snapshot_pending == 0 && self.boot_complete && !self.command_injected {
-                    let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
-                    debug!("Snapshot countdown reached 0, saving (PC=0x{pc:x})");
-                    if let Some(ref save_path) = self.snapshot_save_path.clone() {
-                        let device_state = self.capture_device_state();
-                        if device_state.gic_state.is_none() {
-                            warn!("Skipping snapshot save: GIC state not available (macOS 15.0+ required)");
-                        } else {
-                            match snapshot::save_snapshot(
-                                save_path,
-                                &self.memory,
-                                &vcpu,
-                                &device_state,
-                                self.snapshot_fingerprint,
-                            ) {
-                                Ok(()) => {
-                                    info!("Snapshot saved to {}", save_path.display());
-                                    if let Some(ref blk) = self.virtio_blk {
-                                        if let Ok(disk_path) =
-                                            snapshot::disk_image_path(self.snapshot_fingerprint)
-                                        {
-                                            let tmp = disk_path.with_extension("tmp");
-                                            match std::fs::write(&tmp, &blk.disk_image) {
-                                                Ok(()) => {
-                                                    if let Err(e) =
-                                                        std::fs::rename(&tmp, &disk_path)
-                                                    {
-                                                        warn!("Failed to rename disk image: {e}");
-                                                    } else {
-                                                        debug!(
-                                                            "Disk image saved ({} MB)",
-                                                            blk.disk_image.len() / (1024 * 1024)
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to save disk image: {e}")
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => warn!("Failed to save snapshot: {e}"),
-                            }
-                        }
-                    }
-                    // Inject the command into the UART buffer.
-                    self.inject_command();
-                }
             }
 
             match exit_reason {
@@ -857,49 +780,6 @@ impl VmInstance {
                             let tcr = vcpu.read_sys_register(HvSysReg::TcrEl1).unwrap_or(0);
                             let t1sz = (tcr >> 16) & 0x3F;
                             let sp = sp_el1;
-
-                            if log::log_enabled!(log::Level::Debug) {
-                                let cpsr = vcpu.read_register(HvReg::Cpsr)?;
-                                let sp_el0 =
-                                    vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0xDEAD);
-                                let x4 = vcpu.read_register(HvReg::X4)?;
-                                let x7 = vcpu.read_register(HvReg::X7)?;
-                                let x8 = vcpu.read_register(HvReg::X8)?;
-                                let elr =
-                                    vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0xDEAD);
-
-                                debug!(
-                                    "[HVC] PC=0x{:x} func=0x{:x} CPSR=0x{:x} (EL{})",
-                                    pc,
-                                    x0,
-                                    cpsr,
-                                    cpsr & 0xF
-                                );
-                                debug!("[HVC]   SP_EL0=0x{sp_el0:x} SP_EL1=0x{sp_el1:x}");
-                                debug!("[HVC]   X4=0x{x4:x} X7=0x{x7:x} X8=0x{x8:x} LR=0x{lr:x}");
-                                debug!("[HVC]   ELR_EL1=0x{elr:x}");
-                                debug!(
-                                    "[HVC]   TTBR1_EL1=0x{ttbr1:x} TCR_EL1=0x{tcr:x} T1SZ={t1sz}"
-                                );
-
-                                if let Some(phys) = self.translate_va_to_pa(sp, ttbr1, t1sz) {
-                                    debug!("[HVC]   SP VA 0x{sp:x} -> PA 0x{phys:x}");
-                                    if phys >= RAM_BASE
-                                        && phys + 16 < RAM_BASE + self.memory_size as u64
-                                    {
-                                        let offset = (phys - RAM_BASE) as usize;
-                                        let val0 = u64::from_le_bytes(
-                                            self.memory[offset..offset + 8].try_into().unwrap(),
-                                        );
-                                        let val1 = u64::from_le_bytes(
-                                            self.memory[offset + 8..offset + 16]
-                                                .try_into()
-                                                .unwrap(),
-                                        );
-                                        debug!("[HVC]   [SP+0]=0x{val0:x} [SP+8]=0x{val1:x}");
-                                    }
-                                }
-                            }
 
                             let result = self.handle_psci(x0, x1, x2, x3)?;
 
@@ -962,8 +842,7 @@ impl VmInstance {
                                                     vcpu.write_register(HvReg::Pc, lr)?;
                                                     emulated_smccc = true;
 
-                                                    debug!("[HVC]   Emulated SMCCC: res@VA=0x{res_ptr_va:x} PA=0x{res_pa:x}, wrote a0=0x{result:x}");
-                                                    debug!("[HVC]   PC -> LR 0x{lr:x} (skipped __arm_smccc_hvc body)");
+                                                    trace!("[HVC] Emulated SMCCC: a0=0x{result:x}, PC -> LR 0x{lr:x}");
                                                 }
                                             }
                                         }
@@ -974,10 +853,6 @@ impl VmInstance {
                             if !emulated_smccc {
                                 // Fallback: just advance past HVC
                                 vcpu.write_register(HvReg::Pc, pc + 4)?;
-                                debug!(
-                                    "[HVC]   PC advanced to 0x{:x} (no SMCCC emulation)",
-                                    pc + 4
-                                );
                             }
                         }
 
@@ -1005,9 +880,22 @@ impl VmInstance {
                         }
 
                         0x3C => {
-                            // BRK - breakpoint/semihosting
+                            // BRK - breakpoint/semihosting/snapshot signal
                             let imm = iss & 0xFFFF;
-                            if imm == 0xF000 {
+                            if imm == initramfs::SNAPSHOT_SIGNAL_IMM as u64 {
+                                // Snapshot-ready signal from sandal-signal.
+                                // The guest is in EL0 with IRQs enabled and
+                                // no kernel locks — advance past BRK and
+                                // trigger snapshot save in this iteration.
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
+                                if self.boot_complete
+                                    && !self.command_injected
+                                    && self.snapshot_save_path.is_some()
+                                {
+                                    debug!("Snapshot-ready BRK signal received from guest");
+                                    self.snapshot_pending = 1;
+                                }
+                            } else if imm == 0xF000 {
                                 // ARM semihosting
                                 let op = vcpu.read_register(HvReg::X0)?;
                                 let param = vcpu.read_register(HvReg::X1)?;
@@ -1035,10 +923,11 @@ impl VmInstance {
                                         }
                                     }
                                 }
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
                             } else {
                                 debug!("BRK #{imm} at PC=0x{pc:x}");
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
                             }
-                            vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
 
                         _ => {
@@ -1062,6 +951,18 @@ impl VmInstance {
                 }
             }
 
+            // ── Guest-cooperative snapshot trigger ─────────────────
+            // The init script runs sandal-signal which executes
+            // BRK #0x5D1 from userspace right before `read`.  The
+            // BRK handler sets snapshot_pending=1, and we save HERE
+            // — in the same iteration, before the next vcpu.run() —
+            // so the guest state is exactly: EL0, IRQs enabled, no
+            // kernel locks, PC right after the BRK instruction.
+            if self.snapshot_pending > 0 && self.boot_complete && !self.command_injected {
+                self.snapshot_pending = 0;
+                self.save_snapshot_and_inject(&vcpu, &trc)?;
+            }
+
             // Poll stdin for input and buffer it for the guest UART.
             // Delay until after the command has been injected so that
             // (a) piped data isn't consumed by the kernel's console
@@ -1073,20 +974,22 @@ impl VmInstance {
             }
 
             // Fire UART interrupt if any source is pending.
-            if let UartType::Uart8250(ref mut state) = self.uart_type {
-                let rx_pending = !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0;
-                let tx_pending =
-                    state.thre_pending && (state.ier & 0x02) != 0 && !state.irq_asserted;
-                if rx_pending || tx_pending {
-                    if tx_pending {
-                        state.irq_asserted = true;
+            {
+                if let UartType::Uart8250(ref mut state) = self.uart_type {
+                    let rx_pending = !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0;
+                    let tx_pending =
+                        state.thre_pending && (state.ier & 0x02) != 0 && !state.irq_asserted;
+                    if rx_pending || tx_pending {
+                        if tx_pending {
+                            state.irq_asserted = true;
+                        }
+                        Vm::set_gic_spi(UART_SPI, true);
                     }
-                    Vm::set_gic_spi(UART_SPI, true);
+                } else {
+                    // PL011: update IRQ level based on current state.
+                    // Asserts SPI when MIS != 0, deasserts when MIS == 0.
+                    self.pl011_update_irq();
                 }
-            } else {
-                // PL011: update IRQ level based on current state.
-                // Asserts SPI when MIS != 0, deasserts when MIS == 0.
-                self.pl011_update_irq();
             }
 
             // Poll network backend and deliver incoming packets to guest RX queue
@@ -1102,6 +1005,10 @@ impl VmInstance {
             // Exit immediately once the exit marker has been received
             // (no need to wait for the guest to poweroff)
             if self.exit_code.is_some() {
+                debug!(
+                    "[bench] exit_code received at iter {iteration}: {:.2}ms",
+                    trc.elapsed().as_secs_f64() * 1000.0
+                );
                 break;
             }
         }
@@ -1207,12 +1114,10 @@ impl VmInstance {
             debug!("{trimmed}");
 
             if self.snapshot_save_path.is_some() {
-                // Start a countdown to save the snapshot.  We wait a
-                // few VM-exit iterations so the kernel has finished
-                // flushing the BOOT_MARKER echo output and is settled
-                // into the UART polling loop for `read`.
-                debug!("BOOT_MARKER detected, starting snapshot countdown");
-                self.snapshot_pending = 5;
+                // The init script runs sandal-signal which executes
+                // BRK #0x5D1.  The VMM traps the BRK from EL0 and
+                // saves the snapshot in the same iteration.
+                debug!("BOOT_MARKER detected, waiting for BRK snapshot signal");
             } else {
                 // No snapshot saving; inject the command immediately.
                 self.inject_command();
@@ -1252,6 +1157,71 @@ impl VmInstance {
             self.uart_rx_buf.push_back(b'\n');
             self.command_injected = true;
         }
+    }
+
+    /// Save snapshot to disk and inject the pending command into the UART.
+    /// Called when the guest signals snapshot-ready via BRK #0x5D1.
+    fn save_snapshot_and_inject(&mut self, vcpu: &Vcpu, trc: &Instant) -> Result<()> {
+        let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+        debug!("Saving snapshot (PC=0x{pc:x})");
+
+        let Some(ref save_path) = self.snapshot_save_path.clone() else {
+            self.inject_command();
+            return Ok(());
+        };
+
+        let t_total = Instant::now();
+        let device_state = self.capture_device_state();
+        if device_state.gic_state.is_none() {
+            warn!("Skipping snapshot save: GIC state not available (macOS 15.0+ required)");
+            self.inject_command();
+            return Ok(());
+        }
+
+        let cpu_state = read_cpu_state(vcpu)?;
+        let t_snap = Instant::now();
+        match snapshot::save_snapshot(
+            save_path,
+            &self.memory,
+            &cpu_state,
+            &device_state,
+            self.snapshot_fingerprint,
+        ) {
+            Ok(()) => {
+                info!(
+                    "Snapshot saved to {} ({:.1}ms)",
+                    save_path.display(),
+                    t_snap.elapsed().as_secs_f64() * 1000.0,
+                );
+                if let Some(ref blk) = self.virtio_blk {
+                    if let Ok(disk_path) = snapshot::disk_image_path(self.snapshot_fingerprint) {
+                        let t_disk = Instant::now();
+                        let tmp = disk_path.with_extension("tmp");
+                        match std::fs::write(&tmp, &blk.disk_image) {
+                            Ok(()) => {
+                                if let Err(e) = std::fs::rename(&tmp, &disk_path) {
+                                    warn!("Failed to rename disk image: {e}");
+                                }
+                                debug!(
+                                    "[bench] save_disk_image ({}MB): {:.1}ms",
+                                    blk.disk_image.len() / (1024 * 1024),
+                                    t_disk.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            Err(e) => warn!("Failed to save disk image: {e}"),
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to save snapshot: {e}"),
+        }
+        debug!(
+            "[bench] snapshot+disk: {:.1}ms, inject_command at: {:.0}ms",
+            t_total.elapsed().as_secs_f64() * 1000.0,
+            trc.elapsed().as_secs_f64() * 1000.0,
+        );
+        self.inject_command();
+        Ok(())
     }
 
     /// Build the device state snapshot from current device states.
@@ -1353,13 +1323,6 @@ impl VmInstance {
     fn handle_sysreg_trap(&self, vcpu: &Vcpu, _pc: u64, iss: u64) -> Result<()> {
         let is_read = (iss & 1) != 0; // Bit 0: direction (1=read/MRS, 0=write/MSR)
         let rt = ((iss >> 5) & 0x1F) as u8;
-        let crm = (iss >> 1) & 0xF;
-        let crn = (iss >> 10) & 0xF;
-        let op0 = (iss >> 20) & 0x3;
-        let op1 = (iss >> 14) & 0x7;
-        let op2 = (iss >> 17) & 0x7;
-
-        let _sys_reg_id = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
 
         if is_read {
             // MRS - provide emulated value
@@ -1383,19 +1346,6 @@ impl VmInstance {
 
             if is_write {
                 let value = Self::read_guest_register(vcpu, rt)?;
-
-                // Exit code register at UART_BASE + 0x100.
-                // The init script writes the exit code here via devmem
-                // as a fallback when the UART TTY path is broken
-                // (e.g. after snapshot restore).
-                if reg_offset == 0x100 {
-                    let code = value as i32;
-                    debug!("Exit code register written: {code}");
-                    if self.exit_code.is_none() {
-                        self.exit_code = Some(code);
-                    }
-                    return Ok(());
-                }
 
                 // Both PL011 DR and 8250 THR are at offset 0x00
                 if reg_offset == 0 {
@@ -1485,7 +1435,7 @@ impl VmInstance {
                                     ris |= 1 << 4; // RXIS
                                 }
                                 let mis = ris & state.imsc;
-                                debug!(
+                                trace!(
                                     "PL011 IMSC: 0x{:x} -> 0x{:x}, RIS=0x{:x}, MIS=0x{:x}, rx_buf={}",
                                     old_imsc, state.imsc, ris, mis, rx_len
                                 );
@@ -1949,23 +1899,11 @@ pub fn run(args: Args) -> Result<()> {
     // Detect UART type from kernel (needed for initramfs device nodes)
     vm.detect_uart_type(&kernel_data);
 
-    // Check kernel capabilities to decide rootfs strategy
-    let has_virtio_blk = kernel_data.windows(10).any(|w| w == b"virtio_blk");
-    // Check if the kernel supports initramfs (BLK_DEV_INITRD).
-    // We look for multiple signatures: the config string (if IKCONFIG is enabled),
-    // internal symbols, and the "Unpacking initramfs" log message which is only
-    // compiled in when CONFIG_BLK_DEV_INITRD=y. Note: "rdinit" is NOT reliable
-    // as the command-line parser always contains it regardless of initramfs support.
-    let has_initrd_strings = kernel_data
-        .windows(18)
-        .any(|w| w == b"BLK_DEV_INITRD=y\r\n" || w == b"BLK_DEV_INITRD=y\n\x00")
-        || kernel_data.windows(17).any(|w| w == b"BLK_DEV_INITRD=y\n")
-        || kernel_data.windows(14).any(|w| w == b"initramfs_data")
-        || kernel_data.windows(9).any(|w| w == b"cpio_data")
-        || kernel_data.windows(19).any(|w| w == b"Unpacking initramfs");
-    // Default to initramfs support (most kernels have it); only use virtio-blk if we can
-    // confirm virtio-blk support AND cannot confirm initramfs support
-    let prefer_virtio_blk = has_virtio_blk && !has_initrd_strings;
+    // Check kernel capabilities to decide rootfs strategy.
+    // Prefer virtio-blk when the kernel supports it: mounting /dev/vda directly
+    // avoids the ext2-to-cpio conversion on the host and initramfs unpacking
+    // in the guest, saving ~10-20ms on cold start.
+    let prefer_virtio_blk = kernel_data.windows(10).any(|w| w == b"virtio_blk");
 
     // Parse and set up shared directories (virtiofs).
     // We always create MAX_FS_DEVICES VirtioFsDevice instances so the
@@ -2390,35 +2328,20 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         virtiofs: virtiofs_devices,
     };
 
-    // Inject the command into the UART RX buffer.
-    // The snapshot was taken during UART polling (port lock held), so
-    // we must NOT assert the UART SPI — that would cause the interrupt
-    // handler to try acquiring the already-held lock → deadlock.
-    // Instead, the kernel's UART polling code will naturally find the
-    // injected data in the buffer via MMIO reads.
+    // Inject the command into the UART RX buffer.  The snapshot was
+    // taken in userspace (EL0) at the BRK instruction — no kernel
+    // locks are held and IRQs are enabled.  On resume the guest's
+    // sandal-signal process exits, the shell continues to `read`,
+    // and the UART driver finds the injected data via normal MMIO reads.
     vm.inject_command();
 
-    let restore_time = t0.elapsed();
-    info!(
+    debug!(
         "Snapshot restored in {:.2}ms",
-        restore_time.as_secs_f64() * 1000.0
+        t0.elapsed().as_secs_f64() * 1000.0
     );
 
     // Run the VM from the restored state
-    debug!(
-        "[bench] total restore (before run): {:.2}ms",
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
-    let t1 = Instant::now();
     let exit_code = vm.run_command(&args.command)?;
-    debug!(
-        "[bench] run_command wall time: {:.2}ms",
-        t1.elapsed().as_secs_f64() * 1000.0
-    );
-    debug!(
-        "[bench] total (restore + run): {:.2}ms",
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
 
     debug!("VM exited with code: {exit_code}");
     std::process::exit(exit_code);

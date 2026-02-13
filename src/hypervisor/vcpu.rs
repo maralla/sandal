@@ -72,29 +72,6 @@ impl Vcpu {
         self.id
     }
 
-    /// Get exit info (ARM64 only - for debugging)
-    #[cfg(target_arch = "aarch64")]
-    pub fn read_exit_info(&self) -> String {
-        if self.exit_info.is_null() {
-            return "Exit info is NULL".to_string();
-        }
-
-        unsafe {
-            let exit = &*self.exit_info;
-            let syndrome = exit.exception.syndrome;
-            let ec = (syndrome >> 26) & 0x3F;
-
-            format!(
-                "Exit reason: {}, EC: 0x{:x}, Syndrome: 0x{:x}, VirtAddr: 0x{:x}, PhysAddr: 0x{:x}",
-                exit.reason,
-                ec,
-                syndrome,
-                exit.exception.virtual_address,
-                exit.exception.physical_address
-            )
-        }
-    }
-
     pub fn read_exception_syndrome(&self) -> Result<u64> {
         if self.exit_info.is_null() {
             anyhow::bail!("Exit info is NULL");
@@ -109,14 +86,6 @@ impl Vcpu {
         }
 
         unsafe { Ok((*self.exit_info).exception.physical_address) }
-    }
-
-    pub fn read_virtual_fault_address(&self) -> Result<u64> {
-        if self.exit_info.is_null() {
-            anyhow::bail!("Exit info is NULL");
-        }
-
-        unsafe { Ok((*self.exit_info).exception.virtual_address) }
     }
 
     /// Read an ARM64 system register

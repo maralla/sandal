@@ -15,7 +15,7 @@ use log::debug;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::mem;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -170,23 +170,22 @@ fn is_zero_page(page: &[u8]) -> bool {
         .all(|c| u128::from_ne_bytes(c.try_into().unwrap()) == 0)
 }
 
-/// Save the complete VM state to a snapshot file.
+/// Save the complete VM state to a snapshot file directly from memory.
+/// Used in forked child processes where memory is accessed via COW.
 pub fn save_snapshot(
     path: &Path,
     memory: &[u8],
-    vcpu: &Vcpu,
+    cpu_state: &CpuState,
     device_state: &DeviceState,
     fingerprint: u64,
 ) -> Result<()> {
-    let cpu_state = read_cpu_state(vcpu)?;
-    let cpu_bytes = cpu_state_as_bytes(&cpu_state);
+    let cpu_bytes = cpu_state_as_bytes(cpu_state);
     let device_bytes = serialize_device_state(device_state);
 
     let memory_size = memory.len() as u64;
     let cpu_state_offset = mem::size_of::<SnapshotHeader>() as u64;
     let device_state_offset = cpu_state_offset + cpu_bytes.len() as u64;
     let memory_offset = device_state_offset + device_bytes.len() as u64;
-    // Align memory_offset to page boundary for efficient mmap
     let memory_offset = (memory_offset + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
 
     let header = SnapshotHeader {
@@ -201,9 +200,8 @@ pub fn save_snapshot(
         memory_offset,
     };
 
-    // Write to a temp file, then rename for atomicity
     let tmp_path = path.with_extension("tmp");
-    let mut file = File::create(&tmp_path).context("Failed to create snapshot file")?;
+    let file = File::create(&tmp_path).context("Failed to create snapshot file")?;
 
     // Write header
     let header_bytes = unsafe {
@@ -212,18 +210,16 @@ pub fn save_snapshot(
             mem::size_of::<SnapshotHeader>(),
         )
     };
-    file.write_all(header_bytes)?;
+    file.write_all_at(header_bytes, 0)?;
+    file.write_all_at(cpu_bytes, cpu_state_offset)?;
+    file.write_all_at(&device_bytes, device_state_offset)?;
 
-    // Write CPU state
-    file.seek(SeekFrom::Start(cpu_state_offset))?;
-    file.write_all(cpu_bytes)?;
-
-    // Write device state
-    file.seek(SeekFrom::Start(device_state_offset))?;
-    file.write_all(&device_bytes)?;
-
-    // Write memory (sparse: skip zero pages, batch contiguous non-zero runs)
-    let num_pages = memory.len() / PAGE_SIZE;
+    // Write memory (sparse: skip zero pages, batch contiguous non-zero runs).
+    // We scan the entire memory region because the kernel's buddy allocator
+    // can place page tables and other critical structures anywhere in RAM.
+    // Zero pages are skipped (not written), keeping the file sparse.
+    let scan_bytes = memory.len();
+    let num_pages = scan_bytes / PAGE_SIZE;
     let mut written_pages = 0u64;
     let mut run_start: Option<usize> = None;
 
@@ -232,7 +228,7 @@ pub fn save_snapshot(
             let offset = page_idx * PAGE_SIZE;
             !is_zero_page(&memory[offset..offset + PAGE_SIZE])
         } else {
-            false // sentinel to flush any trailing run
+            false
         };
 
         if is_nonzero {
@@ -241,21 +237,18 @@ pub fn save_snapshot(
                 run_start = Some(page_idx);
             }
         } else if let Some(start) = run_start {
-            // Flush contiguous run as a single write
             let byte_start = start * PAGE_SIZE;
             let byte_end = page_idx * PAGE_SIZE;
-            file.seek(SeekFrom::Start(memory_offset + byte_start as u64))?;
-            file.write_all(&memory[byte_start..byte_end])?;
+            file.write_all_at(
+                &memory[byte_start..byte_end],
+                memory_offset + byte_start as u64,
+            )?;
             run_start = None;
         }
     }
 
-    // Ensure file is the full size (so mmap works)
     file.set_len(memory_offset + memory_size)?;
-    file.sync_all()?;
     drop(file);
-
-    // Atomic rename
     fs::rename(&tmp_path, path)?;
 
     debug!(
@@ -418,10 +411,9 @@ pub fn restore_cpu_state(vcpu: &Vcpu, state: &CpuState) -> Result<()> {
     //
     // Without this adjustment the virtual counter jumps forward by the
     // wall-clock time elapsed, all pending timers appear past-due, and
-    // the vtimer fires immediately.  Because the snapshot is taken
-    // inside spin_lock_irqsave (IRQs disabled), the timer interrupt
-    // cannot be delivered, causing an infinite vtimer-fire-mask-unmask
-    // loop that hangs the VM.
+    // the vtimer fires immediately — potentially causing a storm of
+    // spurious timer interrupts that degrades performance or hangs
+    // the guest.
     let current_cntpct = unsafe { mach_absolute_time() };
     let adjusted_offset = if state.saved_cntpct != 0 {
         // new_offset = old_offset + (current_phys - saved_phys)
@@ -700,7 +692,7 @@ impl SnapWriter {
 
 // ── Internal serialization ────────────────────────────────────────────
 
-fn read_cpu_state(vcpu: &Vcpu) -> Result<CpuState> {
+pub fn read_cpu_state(vcpu: &Vcpu) -> Result<CpuState> {
     let mut state = CpuState::default();
 
     // GPRs

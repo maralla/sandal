@@ -45,6 +45,12 @@ stty -echo 2>/dev/null
 # Signal boot complete to host (triggers direct UART output)
 echo "{BOOT_MARKER}"
 
+# Signal snapshot-ready to VMM via BRK instruction.
+# sandal-signal executes BRK #0x5D1 which the VMM traps from EL0.
+# At this point IRQs are enabled and no kernel locks are held,
+# giving the VMM a clean, deterministic snapshot point.
+/usr/sbin/sandal-signal 2>/dev/null
+
 # Read mount setup + command from the UART.  The host writes two lines:
 #   1. Mount commands (or empty for no shares)
 #   2. Shell-escaped command line
@@ -82,14 +88,8 @@ else
     SANDAL_RC=$?
 fi
 
-# Signal exit code to host.
-# Primary: write EXIT_MARKER via the normal UART path (works on cold boot).
-# Fallback: write exit code directly to a special MMIO register at
-# UART_BASE + 0x100 that the VMM intercepts.  This bypasses the
-# TTY layer and works even after snapshot restore when the serial
-# driver's interrupt-driven TX path may be broken.
+# Signal exit code to host via UART.
 echo "{EXIT_MARKER}$SANDAL_RC"
-devmem 0x09000100 32 "$SANDAL_RC" 2>/dev/null
 
 # Power off
 exec /sbin/poweroff -f

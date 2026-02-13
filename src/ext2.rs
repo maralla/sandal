@@ -1606,6 +1606,17 @@ pub fn inject_runtime_files(
     let ctty_bin = initramfs::generate_ctty_helper();
     inject_file(image, &sb, &bgd, "usr/sbin/sandal-ctty", &ctty_bin, 0o755)?;
 
+    // Snapshot signal helper binary (BRK-based)
+    let signal_bin = initramfs::generate_signal_helper();
+    inject_file(
+        image,
+        &sb,
+        &bgd,
+        "usr/sbin/sandal-signal",
+        &signal_bin,
+        0o755,
+    )?;
+
     // /init script
     let init_script = initramfs::generate_init_script_ext(command, network);
     inject_file(image, &sb, &bgd, "init", init_script.as_bytes(), 0o755)?;

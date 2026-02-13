@@ -271,3 +271,34 @@ pub fn generate_ctty_helper() -> Vec<u8> {
 
     elf.build()
 }
+
+/// Snapshot-ready signal immediate value for BRK instruction.
+/// The VMM detects `BRK #SNAPSHOT_SIGNAL_IMM` (EC=0x3C) from EL0
+/// and uses it as the trigger to save a snapshot.
+pub const SNAPSHOT_SIGNAL_IMM: u32 = 0x5D1; // "SanDal 1"
+
+/// Generate a minimal static ARM64 ELF binary that signals
+/// snapshot-readiness to the VMM via a BRK instruction.
+///
+/// The binary is just 3 instructions (12 bytes of code):
+///   BRK  #0x5D1    — trapped by HVF, VMM handles it
+///   MOV  x0, #0    — exit code 0
+///   MOV  x8, #93   — __NR_exit
+///   SVC  #0        — exit(0)
+///
+/// The BRK causes an immediate VM exit (EC=0x3C) while the guest
+/// is in EL0 with IRQs enabled and no kernel locks held — a clean,
+/// deterministic snapshot point.
+pub fn generate_signal_helper() -> Vec<u8> {
+    let mut elf = ElfBuilder::new();
+
+    // BRK #SNAPSHOT_SIGNAL_IMM — triggers VM exit from EL0
+    elf.emit(brk(SNAPSHOT_SIGNAL_IMM));
+
+    // exit(0) — reached after snapshot+restore
+    elf.emit(movz_x(0, 0));
+    elf.emit(movz_x(8, 93)); // __NR_exit
+    elf.emit(svc0());
+
+    elf.build()
+}

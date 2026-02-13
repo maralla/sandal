@@ -199,17 +199,6 @@ impl Vm {
         }
         Ok(())
     }
-
-    /// Unmap guest physical memory
-    pub fn unmap_memory(&self, guest_addr: u64, size: usize) -> Result<()> {
-        let ret = unsafe { hv_vm_unmap_wrapper(guest_addr, size) };
-
-        if ret != HV_SUCCESS {
-            anyhow::bail!("Failed to unmap memory at 0x{guest_addr:x}: error code {ret}");
-        }
-
-        Ok(())
-    }
 }
 
 impl Drop for Vm {

@@ -70,6 +70,12 @@ pub fn b_lt(offset_insns: i32) -> u32 {
     0x54000000 | (((offset_insns as u32) & 0x7FFFF) << 5) | 0xB
 }
 
+/// `BRK #imm16` — breakpoint instruction.
+/// Causes an exception trapped by the hypervisor (EC=0x3C).
+pub fn brk(imm16: u32) -> u32 {
+    0xD4200000 | (imm16 << 5)
+}
+
 /// `SVC #0` — supervisor call (syscall).
 pub fn svc0() -> u32 {
     0xD4000001

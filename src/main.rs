@@ -19,9 +19,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// Check if a valid snapshot exists and try to restore from it.
-/// Returns None if no snapshot is available, Some(Ok(())) if restore succeeded
-/// (note: process exits inside), or Some(Err) if restore failed.
-/// Check if a valid snapshot exists and try to restore from it.
 /// Returns `(Option<Result<()>>, Option<PathBuf>)`:
 /// - First element: None if no snapshot found, Some(Ok/Err) if attempted.
 /// - Second element: snapshot path if one was found (for cleanup on failure).
@@ -163,6 +160,7 @@ fn main() -> Result<()> {
                     e.exit();
                 })
                 .unwrap();
+
             run_vm(args)
         }
     }
