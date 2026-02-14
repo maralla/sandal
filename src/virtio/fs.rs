@@ -96,7 +96,6 @@ const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
 const EINVAL: i32 = 22;
 const ENOSYS: i32 = 38;
-const ENOTEMPTY: i32 = 39;
 const ENODATA: i32 = 61;
 const EOPNOTSUPP: i32 = 95;
 

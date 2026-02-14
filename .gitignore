@@ -11,3 +11,4 @@ rootfs.ext2*
 rootfs/
 kernels
 PROGRESS.md
+*.layer

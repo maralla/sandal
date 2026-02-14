@@ -19,6 +19,13 @@ pub const EXIT_MARKER: &str = "SANDAL_EXIT:";
 /// from suppressed (pre-boot) output to direct character output.
 pub const BOOT_MARKER: &str = "SANDAL_BOOT_COMPLETE";
 
+/// Mount point and device path constants.
+pub const MNT_LOWER: &str = "/mnt/lower"; // bind-mount of the original root
+pub const MNT_OVL: &str = "/mnt/overlay"; // final overlay mount (becomes new root)
+pub const MNT_TMP: &str = "/mnt/tmpupper"; // tmpfs-backed upper (layer + default)
+pub const MNT_DISK: &str = "/mnt/diskupper"; // ext2-backed upper (disk mode)
+pub const DATA_DEV: &str = "/dev/vdb"; // secondary virtio-blk device
+
 /// Public version of init script generator for use by ext2 builder.
 pub fn generate_init_script_ext(command: &[String], network: bool) -> String {
     generate_init_script(command, network)
@@ -51,22 +58,33 @@ fn generate_init_script(_command: &[String], network: bool) -> String {
         net_setup = net_setup,
         BOOT_MARKER = BOOT_MARKER,
         EXIT_MARKER = EXIT_MARKER,
+        MNT_LOWER = MNT_LOWER,
+        MNT_OVL = MNT_OVL,
+        MNT_TMP = MNT_TMP,
+        MNT_DISK = MNT_DISK,
+        DATA_DEV = DATA_DEV,
     )
 }
 
 /// Build the mount setup line injected via UART before the command.
 /// Returns a single line of shell commands (or empty string for no shares).
-pub fn build_mount_setup_line(shares: &[(String, String)]) -> String {
-    if shares.is_empty() {
-        return String::new();
+///
+/// If `disk_mode` is provided (e.g. "disk" or "layer"), it sets
+/// `SANDAL_DISK_MODE` so the init script knows how to handle /dev/vdb.
+pub fn build_mount_setup_line(shares: &[(String, String)], disk_mode: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(mode) = disk_mode {
+        parts.push(format!("export SANDAL_DISK_MODE={mode}"));
     }
-    shares
-        .iter()
-        .map(|(tag, guest_path)| {
-            format!("mkdir -p {guest_path} && mount -t virtiofs {tag} {guest_path} 2>/dev/null")
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+
+    for (tag, guest_path) in shares {
+        parts.push(format!(
+            "mkdir -p {guest_path} && mount -t virtiofs {tag} {guest_path} 2>/dev/null"
+        ));
+    }
+
+    parts.join("; ")
 }
 
 /// Build the shell-escaped command line that the host sends to the guest
@@ -277,6 +295,19 @@ pub fn generate_ctty_helper() -> Vec<u8> {
 /// and uses it as the trigger to save a snapshot.
 pub const SNAPSHOT_SIGNAL_IMM: u32 = 0x5D1; // "SanDal 1"
 
+/// Export resize signal: guest requests the VMM to grow /dev/vdb to 128 MB
+/// so it can write a tar archive for `sandal-export`.
+pub const EXPORT_RESIZE_IMM: u32 = 0x5D2; // "SanDal 2"
+
+/// Export done signal: guest has finished writing tar data to /dev/vdb.
+/// The VMM reads it, gzip-compresses, and saves as a .layer file.
+pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
+
+/// UART marker prefix for communicating the export save path from guest to VMM.
+/// The guest echoes `SANDAL_EXPORT_PATH:<path>` to /dev/console before the
+/// BRK #EXPORT_DONE signal, and the VMM intercepts this line.
+pub const EXPORT_PATH_MARKER: &str = "SANDAL_EXPORT_PATH:";
+
 /// Generate a minimal static ARM64 ELF binary that signals
 /// snapshot-readiness to the VMM via a BRK instruction.
 ///
@@ -301,4 +332,56 @@ pub fn generate_signal_helper() -> Vec<u8> {
     elf.emit(svc0());
 
     elf.build()
+}
+
+/// Generate a minimal static ARM64 ELF binary that triggers
+/// BRK #EXPORT_RESIZE_IMM — asks the VMM to grow /dev/vdb.
+///
+/// After the BRK returns, the kernel will process the virtio config
+/// change and resize the block device asynchronously.
+pub fn generate_export_resize_helper() -> Vec<u8> {
+    let mut elf = ElfBuilder::new();
+
+    elf.emit(brk(EXPORT_RESIZE_IMM));
+    elf.emit(movz_x(0, 0));
+    elf.emit(movz_x(8, 93)); // __NR_exit
+    elf.emit(svc0());
+
+    elf.build()
+}
+
+/// Generate a minimal static ARM64 ELF binary that triggers
+/// BRK #EXPORT_DONE_IMM — tells the VMM the tar data is ready on /dev/vdb.
+pub fn generate_export_done_helper() -> Vec<u8> {
+    let mut elf = ElfBuilder::new();
+
+    elf.emit(brk(EXPORT_DONE_IMM));
+    elf.emit(movz_x(0, 0));
+    elf.emit(movz_x(8, 93)); // __NR_exit
+    elf.emit(svc0());
+
+    elf.build()
+}
+
+/// Generate the `sandal-export` shell script for the guest.
+///
+/// Usage: sandal-export [path]
+///
+/// The script:
+/// 1. Optionally sends the export save path to the VMM via UART marker
+/// 2. If in disk mode (ext2 overlay), signals EXPORT_DONE directly
+///    (the VMM reads the ext2 /upper subtree)
+/// 3. If in tmpfs mode, signals EXPORT_RESIZE to grow /dev/vdb,
+///    waits for resize, tars the overlay upper dir to /dev/vdb,
+///    then signals EXPORT_DONE
+pub fn generate_export_script() -> String {
+    let data_dev_name = DATA_DEV.strip_prefix("/dev/").unwrap_or(DATA_DEV);
+    format!(
+        include_str!("export.sh"),
+        EXPORT_PATH_MARKER = EXPORT_PATH_MARKER,
+        MNT_DISK = MNT_DISK,
+        MNT_TMP = MNT_TMP,
+        DATA_DEV = DATA_DEV,
+        DATA_DEV_NAME = data_dev_name,
+    )
 }

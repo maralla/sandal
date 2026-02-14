@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod blk;
 pub mod fs;
 /// Virtio MMIO transport implementation (virtio v2 / modern).
@@ -45,13 +43,6 @@ pub const REG_SHM_BASE_LOW: u64 = 0x0B8; // Read: shared memory region base (low
 pub const REG_SHM_BASE_HIGH: u64 = 0x0BC; // Read: shared memory region base (high 32 bits)
 pub const REG_CONFIG_GENERATION: u64 = 0x0FC;
 pub const REG_CONFIG_BASE: u64 = 0x100;
-
-// Virtio status bits
-pub const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
-pub const VIRTIO_STATUS_DRIVER: u32 = 2;
-pub const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
-pub const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
-pub const VIRTIO_STATUS_FAILED: u32 = 128;
 
 // Virtio features
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;

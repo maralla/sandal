@@ -23,6 +23,7 @@ use std::path::Path;
 use std::slice;
 
 use crate::initramfs;
+use crate::tar::{TarEntry, TarEntryType};
 
 const BLOCK_SIZE: usize = 4096;
 const INODE_SIZE: usize = 128;
@@ -1763,6 +1764,117 @@ fn inject_chardev(
     Ok(())
 }
 
+/// Inject a symbolic link into the ext2 image.
+fn inject_symlink(
+    image: &mut [u8],
+    sb: &Ext2Superblock,
+    bgd: &Ext2Bgd,
+    path: &str,
+    target: &str,
+) -> Result<()> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let (dir_parts, link_name) = parts.split_at(parts.len() - 1);
+    let link_name = link_name[0];
+
+    let dir_path = dir_parts.join("/");
+    let dir_ino = if dir_path.is_empty() {
+        ROOT_INO
+    } else {
+        ensure_dir_path(image, sb, bgd, &dir_path)?
+    };
+
+    // Skip if already exists
+    if dir_lookup(image, sb, bgd, dir_ino, link_name)?.is_some() {
+        return Ok(());
+    }
+
+    let new_ino = alloc_inode(image, sb, bgd)?;
+    let target_bytes = target.as_bytes();
+
+    if target_bytes.len() < 60 {
+        // Short symlink: target stored inline in i_block[] (fast symlink)
+        write_inode_raw(
+            image,
+            sb,
+            bgd,
+            new_ino,
+            S_IFLNK | 0o777,
+            target_bytes.len() as u32,
+            1,
+            &[],
+            0,
+        );
+        // Write target into i_block area of the inode
+        let idx = (new_ino - 1) as usize;
+        let inode_off = bgd.inode_table as usize * sb.block_size + idx * sb.inode_size;
+        image[inode_off + 40..inode_off + 40 + target_bytes.len()].copy_from_slice(target_bytes);
+    } else {
+        // Long symlink: target stored in a data block
+        let blk = alloc_block(image, sb, bgd)?;
+        let blk_off = blk as usize * sb.block_size;
+        for b in &mut image[blk_off..blk_off + sb.block_size] {
+            *b = 0;
+        }
+        image[blk_off..blk_off + target_bytes.len()].copy_from_slice(target_bytes);
+        write_inode_raw(
+            image,
+            sb,
+            bgd,
+            new_ino,
+            S_IFLNK | 0o777,
+            target_bytes.len() as u32,
+            1,
+            &[blk],
+            (sb.block_size / 512) as u32,
+        );
+    }
+
+    add_dir_entry(image, sb, bgd, dir_ino, new_ino, link_name, EXT2_FT_SYMLINK)?;
+
+    Ok(())
+}
+
+/// Inject tar entries (from a parsed .layer file) into an ext2 image.
+///
+/// Creates directories, writes files, and creates symlinks as needed.
+/// All entry paths are placed under `upper/` to match the overlayfs
+/// directory layout expected by the guest init script.
+pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> {
+    let sb = Ext2Superblock::parse(image)?;
+    let bgd = Ext2Bgd::parse(image, &sb)?;
+
+    // Ensure the overlayfs directories exist
+    ensure_dir_path(image, &sb, &bgd, "upper")?;
+    ensure_dir_path(image, &sb, &bgd, "work")?;
+
+    for entry in entries {
+        let raw_path = entry.path.trim_start_matches('/');
+        if raw_path.is_empty() {
+            continue;
+        }
+        let path = format!("upper/{}", raw_path);
+
+        match entry.entry_type {
+            TarEntryType::Directory => {
+                ensure_dir_path(image, &sb, &bgd, &path)?;
+            }
+            TarEntryType::File => {
+                let perm = if entry.mode & 0o111 != 0 {
+                    0o755
+                } else {
+                    0o644
+                };
+                inject_file(image, &sb, &bgd, &path, &entry.data, perm)?;
+            }
+            TarEntryType::Symlink => {
+                inject_symlink(image, &sb, &bgd, &path, &entry.link_target)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Remove a directory entry by name from a directory's data block.
 fn remove_dir_entry(
     image: &mut [u8],
@@ -1871,6 +1983,35 @@ pub fn inject_runtime_files(
         &bgd,
         "usr/sbin/sandal-signal",
         &signal_bin,
+        0o755,
+    )?;
+
+    // Export helpers: resize + done BRK binaries, and the sandal-export script
+    let export_resize_bin = initramfs::generate_export_resize_helper();
+    inject_file(
+        image,
+        &sb,
+        &bgd,
+        "usr/sbin/sandal-export-resize",
+        &export_resize_bin,
+        0o755,
+    )?;
+    let export_done_bin = initramfs::generate_export_done_helper();
+    inject_file(
+        image,
+        &sb,
+        &bgd,
+        "usr/sbin/sandal-export-done",
+        &export_done_bin,
+        0o755,
+    )?;
+    let export_script = initramfs::generate_export_script();
+    inject_file(
+        image,
+        &sb,
+        &bgd,
+        "usr/sbin/sandal-export",
+        export_script.as_bytes(),
         0o755,
     )?;
 

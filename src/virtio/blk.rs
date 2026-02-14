@@ -62,6 +62,12 @@ impl VirtioBlkDevice {
         }
     }
 
+    /// Recalculate the capacity (in 512-byte sectors) from the current disk image size.
+    /// Call after resizing `disk_image`.
+    pub fn update_capacity(&mut self) {
+        self.capacity_sectors = (self.disk_image.len() / SECTOR_SIZE) as u64;
+    }
+
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         match offset {

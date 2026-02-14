@@ -7,17 +7,23 @@ use crate::net::NetworkFilter;
 use crate::snapshot::{
     self, read_cpu_state, CpuState, DeviceState, SnapshotRestore, VirtioMmioSnapshot,
 };
+use crate::tar;
 use crate::unet::UserNet;
 use crate::virtio::blk::VirtioBlkDevice;
 use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
+use crate::virtio::REG_INTERRUPT_ACK;
 use crate::{ext2, initramfs, rootfs};
 use anyhow::{Context, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use log::{debug, error, info, trace, warn};
 use memmap2::MmapMut;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -143,8 +149,9 @@ pub struct VmInstance {
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
-    data_blk: Option<VirtioBlkDevice>, // Overlay data disk (--disk-size)
+    data_blk: Option<VirtioBlkDevice>, // Overlay data disk (--disk-size / --layer / export)
     data_blk_config_changed: bool,     // Trigger config change SPI after GIC restore
+    export_save_path: Option<String>,  // Path from SANDAL_EXPORT_PATH marker (for sandal-export)
     virtio_rng: Option<VirtioRngDevice>,
     virtiofs: Vec<VirtioFsDevice>,
     use_virtio_blk: bool,
@@ -293,6 +300,7 @@ impl VmInstance {
             virtio_blk: None,
             data_blk: None,
             data_blk_config_changed: false,
+            export_save_path: None,
             virtio_rng: None,
             virtiofs: Vec::new(),
             use_virtio_blk: false,
@@ -921,6 +929,14 @@ impl VmInstance {
                                     debug!("Snapshot-ready BRK signal received from guest");
                                     self.snapshot_pending = 1;
                                 }
+                            } else if imm == initramfs::EXPORT_RESIZE_IMM as u64 {
+                                // Export resize: grow /dev/vdb to 128 MB for tar writing.
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
+                                self.handle_export_resize();
+                            } else if imm == initramfs::EXPORT_DONE_IMM as u64 {
+                                // Export done: read tar from /dev/vdb, gzip, save as .layer.
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
+                                self.handle_export_done();
                             } else if imm == 0xF000 {
                                 // ARM semihosting
                                 let op = vcpu.read_register(HvReg::X0)?;
@@ -1115,7 +1131,7 @@ impl VmInstance {
     }
 
     /// Process a complete line of UART output.
-    /// Extracts exit code marker and detects boot completion.
+    /// Extracts exit code marker, export path marker, and detects boot completion.
     fn process_uart_line(&mut self, line: &str) {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
@@ -1126,6 +1142,17 @@ impl VmInstance {
                 self.exit_code = Some(code);
             }
             return;
+        }
+
+        // Check for export path marker (from sandal-export <path>)
+        if let Some(marker_pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
+            let path = &trimmed[marker_pos + initramfs::EXPORT_PATH_MARKER.len()..];
+            let path = path.trim();
+            if !path.is_empty() {
+                debug!("Export path received from guest: {path}");
+                self.export_save_path = Some(path.to_string());
+            }
+            return; // Don't forward to stdout
         }
 
         // Detect boot completion — the init script prints this marker
@@ -1248,6 +1275,102 @@ impl VmInstance {
         );
         self.inject_command();
         Ok(())
+    }
+
+    /// Handle BRK #EXPORT_RESIZE: grow /dev/vdb to 128 MB so the guest
+    /// can write a tar archive for `sandal-export`.
+    fn handle_export_resize(&mut self) {
+        const EXPORT_DISK_SIZE: usize = 128 * 1024 * 1024; // 128 MB
+
+        if let Some(ref mut dev) = self.data_blk {
+            let current_size = dev.disk_image.len();
+            if current_size < EXPORT_DISK_SIZE {
+                debug!(
+                    "Export resize: growing data_blk from {} to {} bytes",
+                    current_size, EXPORT_DISK_SIZE
+                );
+                dev.disk_image.resize(EXPORT_DISK_SIZE, 0);
+                // Update the capacity reported by the device
+                dev.update_capacity();
+                // Signal config change so the kernel re-reads the block count
+                dev.config_generation = dev.config_generation.wrapping_add(1);
+                dev.interrupt_status |= 2; // VIRTIO_MMIO_INT_CONFIG
+                                           // Assert the config change SPI so the kernel processes it
+                Vm::set_gic_spi(DATA_BLK_SPI, true);
+                debug!("Export resize complete, config change SPI asserted");
+            }
+        } else {
+            warn!("Export resize: no data_blk device");
+        }
+    }
+
+    /// Handle BRK #EXPORT_DONE: read the tar archive from /dev/vdb,
+    /// gzip-compress it, and save as a .layer file.
+    fn handle_export_done(&mut self) {
+        let disk_data = if let Some(ref dev) = self.data_blk {
+            &dev.disk_image
+        } else {
+            warn!("Export done: no data_blk device");
+            return;
+        };
+
+        // Determine the end of the tar archive in the raw disk data.
+        // The guest writes an uncompressed tar to /dev/vdb.
+        let tar_end = tar::find_tar_end(disk_data);
+        if tar_end == 0 || tar_end > disk_data.len() {
+            warn!("Export done: no valid tar archive found on data_blk");
+            return;
+        }
+        let tar_data = &disk_data[..tar_end];
+        debug!("Export: found {} bytes of tar data on data_blk", tar_end);
+
+        // Gzip-compress the tar data
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        if let Err(e) = std::io::Write::write_all(&mut encoder, tar_data) {
+            error!("Export: failed to gzip tar data: {e}");
+            return;
+        }
+        let gz_data = match encoder.finish() {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Export: failed to finish gzip: {e}");
+                return;
+            }
+        };
+
+        // Determine save path
+        let save_path = if let Some(ref path) = self.export_save_path {
+            PathBuf::from(path)
+        } else {
+            // Auto-generate: layer-<hash>.layer in CWD
+            let hash = {
+                let mut h = DefaultHasher::new();
+                gz_data.hash(&mut h);
+                h.finish()
+            };
+            PathBuf::from(format!("layer-{hash:016x}.layer"))
+        };
+
+        // Save to disk
+        match std::fs::write(&save_path, &gz_data) {
+            Ok(()) => {
+                info!(
+                    "Layer exported: {} ({} bytes, {:.1}x compression)",
+                    save_path.display(),
+                    gz_data.len(),
+                    tar_end as f64 / gz_data.len() as f64,
+                );
+                // Print to stderr so the user sees it even without --verbose
+                eprintln!("Layer saved to: {}", save_path.display());
+            }
+            Err(e) => {
+                error!("Export: failed to write layer file: {e}");
+                eprintln!("sandal: failed to save layer: {e}");
+            }
+        }
+
+        // Reset export path for next use
+        self.export_save_path = None;
     }
 
     /// Build the device state snapshot from current device states.
@@ -1389,23 +1512,33 @@ impl VmInstance {
                         // the exit marker here.
                         if self.boot_complete && !self.uart_suppress_line {
                             let buf_len = self.uart_line_buf.len();
-                            let marker = initramfs::EXIT_MARKER.as_bytes();
-                            if buf_len <= marker.len()
-                                && self.uart_line_buf.as_bytes() == &marker[..buf_len]
+                            let buf_bytes = self.uart_line_buf.as_bytes();
+                            // Check if the current buffer is a prefix of any
+                            // suppressed marker (EXIT_MARKER, EXPORT_PATH_MARKER).
+                            let is_prefix_of_marker = |buf: &[u8]| -> bool {
+                                let markers: &[&[u8]] = &[
+                                    initramfs::EXIT_MARKER.as_bytes(),
+                                    initramfs::EXPORT_PATH_MARKER.as_bytes(),
+                                ];
+                                markers
+                                    .iter()
+                                    .any(|m| buf.len() <= m.len() && buf == &m[..buf.len()])
+                            };
+                            let is_full_marker = |buf: &[u8]| -> bool {
+                                buf == initramfs::EXIT_MARKER.as_bytes()
+                                    || buf == initramfs::EXPORT_PATH_MARKER.as_bytes()
+                            };
+
+                            if is_full_marker(buf_bytes) {
+                                // Exact marker match — suppress rest of line.
+                                self.uart_suppress_line = true;
+                            } else if is_prefix_of_marker(buf_bytes) {
+                                // Still matching a marker prefix — keep buffering.
+                            } else if buf_len > 1 && is_prefix_of_marker(&buf_bytes[..buf_len - 1])
                             {
-                                // Matches exit marker prefix — keep buffering.
-                                // Once fully matched, suppress the rest of the line.
-                                if buf_len == marker.len() {
-                                    self.uart_suppress_line = true;
-                                }
-                            } else if buf_len <= marker.len()
-                                && buf_len > 1
-                                && self.uart_line_buf.as_bytes()[..buf_len - 1]
-                                    == marker[..buf_len - 1]
-                            {
-                                // Was matching marker prefix but diverged —
+                                // Was matching a marker prefix but diverged —
                                 // flush all buffered characters as user output.
-                                let buffered = self.uart_line_buf.as_bytes().to_vec();
+                                let buffered = buf_bytes.to_vec();
                                 std::io::stdout().write_all(&buffered).ok();
                                 std::io::stdout().flush().ok();
                             } else {
@@ -1615,7 +1748,7 @@ impl VmInstance {
                         }
                     }
                     // After InterruptACK, deassert SPI if no more pending interrupts
-                    if offset == crate::virtio::REG_INTERRUPT_ACK && net.interrupt_status == 0 {
+                    if offset == REG_INTERRUPT_ACK && net.interrupt_status == 0 {
                         Vm::set_gic_spi(VIRTIO_NET_SPI, false);
                     }
                 } else {
@@ -1641,7 +1774,7 @@ impl VmInstance {
                             Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
                         }
                     }
-                    if offset == crate::virtio::REG_INTERRUPT_ACK && blk.interrupt_status == 0 {
+                    if offset == REG_INTERRUPT_ACK && blk.interrupt_status == 0 {
                         Vm::set_gic_spi(VIRTIO_BLK_SPI, false);
                     }
                 } else {
@@ -1663,7 +1796,7 @@ impl VmInstance {
                             Vm::set_gic_spi(DATA_BLK_SPI, true);
                         }
                     }
-                    if offset == crate::virtio::REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
+                    if offset == REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
                         Vm::set_gic_spi(DATA_BLK_SPI, false);
                     }
                 } else {
@@ -1686,7 +1819,7 @@ impl VmInstance {
                             Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
                         }
                     }
-                    if offset == crate::virtio::REG_INTERRUPT_ACK && rng.interrupt_status == 0 {
+                    if offset == REG_INTERRUPT_ACK && rng.interrupt_status == 0 {
                         Vm::set_gic_spi(VIRTIO_RNG_SPI, false);
                     }
                 } else {
@@ -1715,7 +1848,7 @@ impl VmInstance {
                             Vm::set_gic_spi(spi, true);
                         }
                     }
-                    if offset == crate::virtio::REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
+                    if offset == REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
                         Vm::set_gic_spi(spi, false);
                     }
                 } else {
@@ -2057,10 +2190,9 @@ pub fn run(args: Args) -> Result<()> {
 
     // Always create a second virtio-blk device so the kernel probes /dev/vdb
     // during cold boot.  This ensures the same snapshot works regardless of
-    // whether --disk-size is specified on subsequent warm restores.
-    // With --disk-size: create a real-sized ext2 disk.
-    // Without: create a minimal 1MB stub (enough for the kernel to register
-    // the device; the init script will fall back to tmpfs overlay).
+    // whether --disk-size or --layer is specified on subsequent warm restores.
+    // Cold boot always uses a 1MB stub — layers and disk-size are applied
+    // post-snapshot on warm restore.
     {
         let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
         let disk_image = ext2::create_empty_ext2(data_blk_bytes)?;
@@ -2073,9 +2205,20 @@ pub fn run(args: Args) -> Result<()> {
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(&kernel_data)?;
 
+    // Determine disk mode for the init script.
+    // When both --layer and --disk-size are given, layers are merged into
+    // the ext2 disk on the host side, so the guest sees mode = "disk".
+    let disk_mode = if args.disk_size.is_some() {
+        Some("disk")
+    } else if !args.layers.is_empty() {
+        Some("layer")
+    } else {
+        None
+    };
+
     // Set mount setup + command to be injected via UART after BOOT_MARKER.
     // The init script reads two lines: mount setup, then the command.
-    let mount_setup = initramfs::build_mount_setup_line(&shares);
+    let mount_setup = initramfs::build_mount_setup_line(&shares, disk_mode);
     vm.pending_mount_setup = Some(mount_setup);
     let cmd_line = initramfs::build_command_line(&args.command);
     vm.pending_command = Some(cmd_line.clone());
@@ -2358,8 +2501,23 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         t1.elapsed().as_secs_f64() * 1000.0
     );
 
+    // Determine disk mode for the init script.
+    //
+    // When both --layer and --disk-size are specified, we merge layers into
+    // the ext2 disk on the host side, so the guest sees a plain ext2 disk
+    // (mode = "disk") with the layer contents pre-populated.
+    let has_layers = !args.layers.is_empty();
+    let has_disk_size = args.disk_size.is_some();
+    let disk_mode = if has_disk_size {
+        Some("disk")
+    } else if has_layers {
+        Some("layer")
+    } else {
+        None
+    };
+
     // Build mount setup + command line to inject via UART
-    let mount_setup = initramfs::build_mount_setup_line(&shares);
+    let mount_setup = initramfs::build_mount_setup_line(&shares, disk_mode);
     let cmd_line = initramfs::build_command_line(&args.command);
 
     // Build the VmInstance struct with restored state
@@ -2391,6 +2549,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         virtio_blk,
         data_blk: None, // Restored below with fresh disk
         data_blk_config_changed: false,
+        export_save_path: None,
         use_virtio_blk,
         virtiofs: virtiofs_devices,
     };
@@ -2398,11 +2557,68 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
     // Restore second virtio-blk device (overlay disk).  The disk data is
     // ephemeral (fresh ext2 on every run), but the MMIO state must match
     // what the kernel's driver saw during cold boot.
-    // With --disk-size N: create an N MB disk.
-    // Without: create a 1 MB stub (init script will fall back to tmpfs).
+    //
+    // Four modes:
+    //   --disk-size N + --layer: merge layers into N MB ext2 disk (or larger)
+    //   --disk-size N:           create an N MB ext2 disk
+    //   --layer:                 load raw .layer (tar.gz) bytes into vdb
+    //   (neither):               1 MB stub, init script uses tmpfs overlay
     {
-        let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
-        let disk_image = crate::ext2::create_empty_ext2(data_blk_bytes)?;
+        let disk_image = if has_layers && has_disk_size {
+            // Both: parse layers, choose disk size = max(disk_size, layer needs + headroom),
+            // create ext2, inject layer content.
+            let mut all_entries = Vec::new();
+            for layer_path in &args.layers {
+                let gz_data = std::fs::read(layer_path).with_context(|| {
+                    format!("Failed to read layer file: {}", layer_path.display())
+                })?;
+                info!(
+                    "Loading layer: {} ({} bytes)",
+                    layer_path.display(),
+                    gz_data.len()
+                );
+                let entries = tar::read_tar_gz(&gz_data)
+                    .with_context(|| format!("Failed to parse layer: {}", layer_path.display()))?;
+                all_entries.extend(entries);
+            }
+            let layer_data_size = tar::total_data_size(&all_entries);
+            // Headroom: layer data * 2 (for ext2 metadata + free space), minimum 16 MB
+            let layer_need_bytes = ((layer_data_size * 2) + 16 * 1024 * 1024).max(16 * 1024 * 1024);
+            let disk_size_bytes = args.disk_size.unwrap() * 1024 * 1024;
+            let final_size = disk_size_bytes.max(layer_need_bytes);
+            info!(
+                "Creating {}MB disk with {} layer entries (layer data: {} bytes)",
+                final_size / (1024 * 1024),
+                all_entries.len(),
+                layer_data_size,
+            );
+            let mut image = ext2::create_empty_ext2(final_size)?;
+            ext2::inject_tar_entries(&mut image, &all_entries)?;
+            image
+        } else if has_layers {
+            // Layer-only: load raw layer tar.gz bytes as the block device content.
+            // The guest init script detects the gzip magic and extracts it.
+            let mut layer_data = Vec::new();
+            for layer_path in &args.layers {
+                let data = std::fs::read(layer_path).with_context(|| {
+                    format!("Failed to read layer file: {}", layer_path.display())
+                })?;
+                info!(
+                    "Loading layer: {} ({} bytes)",
+                    layer_path.display(),
+                    data.len()
+                );
+                layer_data = data; // Last layer wins (TODO: support stacking)
+            }
+            // Pad to 512-byte boundary (block device alignment)
+            let padded_len = (layer_data.len() + 511) & !511;
+            layer_data.resize(padded_len, 0);
+            layer_data
+        } else {
+            let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
+            ext2::create_empty_ext2(data_blk_bytes)?
+        };
+
         let mut device = VirtioBlkDevice::new(disk_image);
 
         // Restore MMIO state from snapshot so the kernel driver stays consistent
@@ -2430,7 +2646,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         // If the new disk has a different capacity than the cold-boot stub,
         // signal a virtio config change so the kernel re-reads the size.
         // The interrupt will be delivered when the vCPU resumes.
-        if args.disk_size.is_some() {
+        if has_disk_size || has_layers {
             device.config_generation = device.config_generation.wrapping_add(1);
             // Bit 1 = config change notification (VIRTIO_MMIO_INT_CONFIG)
             device.interrupt_status |= 2;
@@ -2438,8 +2654,19 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         }
 
         vm.data_blk = Some(device);
-        if let Some(mb) = args.disk_size {
-            info!("Created {}MB overlay disk (/dev/vdb)", mb);
+        if has_layers && has_disk_size {
+            info!(
+                "Created {}MB overlay disk with {} layer(s) pre-populated",
+                args.disk_size.unwrap(),
+                args.layers.len()
+            );
+        } else if has_disk_size {
+            info!(
+                "Created {}MB overlay disk (/dev/vdb)",
+                args.disk_size.unwrap()
+            );
+        } else if has_layers {
+            info!("Loaded {} layer(s) into /dev/vdb", args.layers.len());
         }
     }
 

@@ -66,9 +66,16 @@ pub struct RunArgs {
     #[arg(long = "no-cache")]
     pub no_cache: bool,
 
-    /// Extra writable disk size in MB (creates /dev/vdb with overlayfs)
+    /// Extra writable disk size in MB (creates /dev/vdb with overlayfs).
+    /// Can be combined with --layer: layers are pre-populated into the disk.
     #[arg(long = "disk-size", value_name = "MB")]
     pub disk_size: Option<usize>,
+
+    /// Load a .layer file (gzip-compressed tar) into the overlay filesystem.
+    /// Can be specified multiple times; layers are applied in order.
+    /// When combined with --disk-size, layers are injected into the ext2 disk.
+    #[arg(long = "layer", value_name = "PATH")]
+    pub layers: Vec<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]

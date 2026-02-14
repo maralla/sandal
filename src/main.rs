@@ -7,6 +7,7 @@ mod initramfs;
 mod net;
 mod rootfs;
 mod snapshot;
+mod tar;
 mod unet;
 mod virtio;
 mod vm;

@@ -1,12 +1,9 @@
-#![allow(dead_code)]
-
 use std::ffi::c_void;
 
 pub type HvReturn = i32;
 pub type HvVcpu = u32;
 
 pub const HV_SUCCESS: HvReturn = 0;
-pub const HV_ERROR: HvReturn = -1;
 
 // Memory permissions
 pub const HV_MEMORY_READ: u64 = 1 << 0;
@@ -15,8 +12,8 @@ pub const HV_MEMORY_EXEC: u64 = 1 << 2;
 
 // CPU registers - ARM64 architecture
 #[repr(u32)]
-#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub enum HvReg {
     X0 = 0,
     X1 = 1,
@@ -70,7 +67,6 @@ impl HvReg {
 
 // CPU registers - x86_64 architecture
 #[repr(u32)]
-#[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 pub enum HvReg {
     Rip = 0,
@@ -121,7 +117,6 @@ extern "C" {
     pub fn hv_vm_create_wrapper(flags: u64) -> HvReturn;
     pub fn hv_vm_destroy_wrapper() -> HvReturn;
     pub fn hv_vm_map_wrapper(addr: *mut c_void, gpa: u64, size: usize, flags: u64) -> HvReturn;
-    pub fn hv_vm_unmap_wrapper(gpa: u64, size: usize) -> HvReturn;
     pub fn hv_vcpu_create_wrapper(vcpu: *mut HvVcpu, exit_info: *mut *mut HvVcpuExit) -> HvReturn;
     pub fn hv_vcpu_destroy_wrapper(vcpu: HvVcpu) -> HvReturn;
     pub fn hv_vcpu_run_wrapper(vcpu: HvVcpu) -> HvReturn;
@@ -183,8 +178,6 @@ extern "C" {
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_get_redistributor_base_alignment_wrapper(alignment: *mut usize) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
-    pub fn hv_gic_get_redistributor_base_wrapper(vcpu: HvVcpu, base: *mut u64) -> HvReturn;
-    #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_get_spi_interrupt_range_wrapper(base: *mut u32, count: *mut u32) -> HvReturn;
 
     #[cfg(target_arch = "aarch64")]
@@ -206,11 +199,9 @@ extern "C" {
 // ARM64 system registers
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 pub enum HvSysReg {
     // System info
-    MidrEl1 = 0xc000,  // Main ID Register
     MpidrEl1 = 0xc005, // Multiprocessor Affinity Register
 
     // Memory management
@@ -243,9 +234,6 @@ pub enum HvSysReg {
     // Context ID
     ContextidrEl1 = 0xc681, // Context ID Register (EL1)
 
-    // Auxiliary Control
-    ActlrEl1 = 0xc081, // Auxiliary Control Register (EL1)
-
     // Address translation
     ParEl1 = 0xc3a0, // Physical Address Register (EL1)
 
@@ -259,7 +247,6 @@ pub enum HvSysReg {
 /// These are separate from HvSysReg and require dedicated hv_gic_{get,set}_icc_reg API.
 #[repr(u16)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 pub enum HvGicIccReg {
     PmrEl1 = 0xc230,     // Priority Mask Register

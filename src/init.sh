@@ -52,51 +52,71 @@ echo "{BOOT_MARKER}"
 /usr/sbin/sandal-signal 2>/dev/null
 
 # --- Set up overlayfs writable root (post-snapshot) ---
-# Detect whether /dev/vdb has a usable disk (>2MB = --disk-size was given).
-# The VMM always creates a small 1MB stub at /dev/vdb during cold boot so
-# the kernel probes the device.  On warm restore with --disk-size, the VMM
-# swaps in a real disk and triggers a config-change interrupt to resize it.
-# This runs AFTER the snapshot point so the same snapshot is reusable
-# regardless of whether --disk-size is supplied.
-VDB_SECTORS=0
-if [ -b /dev/vdb ]; then
-    # Read device size in 512-byte sectors from sysfs.
-    # On warm restore with --disk-size, the VMM triggers a virtio
-    # config-change to resize /dev/vdb.  The kernel processes this
-    # asynchronously, so retry briefly to let the resize complete.
-    # Each retry forks (cat), yielding CPU to the kworker thread.
+# The VMM always creates a small 1MB stub at DATA_DEV during cold boot so
+# the kernel probes the device.  This runs AFTER the snapshot point so the
+# same snapshot is reusable regardless of --disk-size or --layer flags.
+#
+# Modes (set via SANDAL_DISK_MODE in the mount setup line):
+#   disk  — DATA_DEV is a real ext2 overlay disk (--disk-size)
+#   layer — DATA_DEV contains raw gzip-compressed tar data (--layer)
+#   (empty) — default tmpfs overlay
+
+# Mount point / device constants (values injected from Rust — see initramfs.rs)
+MNT_LOWER={MNT_LOWER}
+MNT_OVL={MNT_OVL}
+MNT_TMP={MNT_TMP}
+MNT_DISK={MNT_DISK}
+DATA_DEV={DATA_DEV}
+
+mkdir -p "$MNT_LOWER" "$MNT_OVL" "$MNT_TMP" "$MNT_DISK" 2>/dev/null
+mount --bind / "$MNT_LOWER" 2>/dev/null
+
+# Read mount setup (line 1 of UART) early — it may set SANDAL_DISK_MODE.
+# Extract the disk mode without running the full eval (virtiofs mounts need
+# to happen after pivot_root).
+IFS= read -r SANDAL_MOUNT_SETUP
+case "$SANDAL_MOUNT_SETUP" in
+    *SANDAL_DISK_MODE=disk*) SANDAL_DISK_MODE=disk ;;
+    *SANDAL_DISK_MODE=layer*) SANDAL_DISK_MODE=layer ;;
+esac
+
+# Wait briefly for the virtio config-change resize to complete (disk/layer).
+if [ -n "$SANDAL_DISK_MODE" ] && [ -b "$DATA_DEV" ]; then
     N=0
     while [ "$N" -lt 5 ]; do
-        VDB_SECTORS=$(cat /sys/block/vdb/size 2>/dev/null || echo 0)
+        VDB_SECTORS=$(cat "/sys/block/${{DATA_DEV#/dev/}}/size" 2>/dev/null || echo 0)
+        # 4096 sectors = 2MB, larger than the initial 1MB stub
         [ "$VDB_SECTORS" -gt 4096 ] 2>/dev/null && break
         N=$((N + 1))
     done
 fi
 
-mkdir -p /mnt/lower /mnt/overlay /mnt/tmpupper /mnt/upper_disk 2>/dev/null
-mount --bind / /mnt/lower 2>/dev/null
-
 OVL_OK=0
-if [ "$VDB_SECTORS" -gt 4096 ] 2>/dev/null; then
-    # /dev/vdb is larger than 2MB — use it as the overlay upper layer
-    mkdir -p /mnt/upper_disk 2>/dev/null
-    mount -t ext2 /dev/vdb /mnt/upper_disk 2>/dev/null
-    mkdir -p /mnt/upper_disk/upper /mnt/upper_disk/work 2>/dev/null
-    mount -t overlay overlay \
-        -o lowerdir=/mnt/lower,upperdir=/mnt/upper_disk/upper,workdir=/mnt/upper_disk/work \
-        /mnt/overlay 2>/dev/null && OVL_OK=1
+if [ "$SANDAL_DISK_MODE" = "disk" ] && [ -b "$DATA_DEV" ]; then
+    # --disk-size: DATA_DEV is a real ext2 overlay disk.
+    mount -t ext2 "$DATA_DEV" "$MNT_DISK" 2>/dev/null
+    mkdir -p "$MNT_DISK/upper" "$MNT_DISK/work" 2>/dev/null
+    OVL_UPPER="$MNT_DISK/upper"
+    OVL_WORK="$MNT_DISK/work"
 else
-    # Default: tmpfs (RAM) upper layer
-    mount -t tmpfs tmpfs /mnt/tmpupper 2>/dev/null
-    mkdir -p /mnt/tmpupper/upper /mnt/tmpupper/work 2>/dev/null
-    mount -t overlay overlay \
-        -o lowerdir=/mnt/lower,upperdir=/mnt/tmpupper/upper,workdir=/mnt/tmpupper/work \
-        /mnt/overlay 2>/dev/null && OVL_OK=1
+    # tmpfs (RAM) upper layer — used for both --layer and default mode.
+    mount -t tmpfs tmpfs "$MNT_TMP" 2>/dev/null
+    mkdir -p "$MNT_TMP/upper" "$MNT_TMP/work" 2>/dev/null
+    # --layer: extract gzip-compressed tar from DATA_DEV into the upper dir.
+    # The VMM writes raw .layer (tar.gz) bytes starting at byte 0 of DATA_DEV.
+    if [ "$SANDAL_DISK_MODE" = "layer" ] && [ -b "$DATA_DEV" ]; then
+        gzip -d < "$DATA_DEV" 2>/dev/null | tar xf - -C "$MNT_TMP/upper" 2>/dev/null
+    fi
+    OVL_UPPER="$MNT_TMP/upper"
+    OVL_WORK="$MNT_TMP/work"
 fi
+mount -t overlay overlay \
+    -o "lowerdir=$MNT_LOWER,upperdir=$OVL_UPPER,workdir=$OVL_WORK" \
+    "$MNT_OVL" 2>/dev/null && OVL_OK=1
 
 if [ "$OVL_OK" = "1" ]; then
-    mkdir -p /mnt/overlay/mnt/root 2>/dev/null
-    cd /mnt/overlay
+    mkdir -p "$MNT_OVL/mnt/root" 2>/dev/null
+    cd "$MNT_OVL"
     pivot_root . mnt/root 2>/dev/null
     # Re-mount essential filesystems in the new overlay root
     mount -t proc proc /proc 2>/dev/null
@@ -106,10 +126,8 @@ if [ "$OVL_OK" = "1" ]; then
     cd /
 fi
 
-# Read mount setup + command from the UART.  The host writes two lines:
-#   1. Mount commands (or empty for no shares)
-#   2. Shell-escaped command line
-IFS= read -r SANDAL_MOUNT_SETUP
+# Evaluate mount setup (already read before overlay setup).
+# Then read the command line (line 2 from UART).
 eval "$SANDAL_MOUNT_SETUP"
 IFS= read -r SANDAL_CMD_LINE
 
