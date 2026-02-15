@@ -23,8 +23,10 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run cargo check
-        run: cargo check --all-targets
+      - name: Build rootfs and check
+        run: |
+          make build
+          cargo check --all-targets
 
   test:
     name: Test
@@ -38,8 +40,10 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --all
+      - name: Build rootfs and test
+        run: |
+          make build
+          cargo test --all
 
   fmt:
     name: Format
@@ -69,8 +73,10 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build rootfs and run clippy
+        run: |
+          make build
+          cargo clippy --all-targets --all-features -- -D warnings
 
   build:
     name: Build Release
@@ -85,7 +91,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release
+        run: make build
 
       - name: Check binary size
         run: |
