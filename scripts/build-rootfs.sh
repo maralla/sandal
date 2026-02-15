@@ -18,6 +18,17 @@ OUTPUT="$1"
 PACK_BIN="$2"
 SRCDIR="rootfs"
 
+# Bootstrap: if the pack binary doesn't exist yet (fresh checkout / CI),
+# build it with a stub rootfs so we can use `sandal pack`.
+if [ ! -x "$PACK_BIN" ]; then
+    echo "Bootstrapping: building binary with stub rootfs..."
+    touch "$OUTPUT"
+    cargo build --release
+    if [ -f sandal.entitlements ]; then
+        codesign --entitlements sandal.entitlements -s - "$PACK_BIN" --force
+    fi
+fi
+
 _R=$(mktemp -d)
 trap 'rm -rf "$_R"' EXIT
 
