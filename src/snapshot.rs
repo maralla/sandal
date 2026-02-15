@@ -23,6 +23,7 @@ use std::ptr;
 
 use crate::hypervisor::{HvGicIccReg, HvReg, HvSysReg, Vcpu};
 use crate::virtio::blk::VirtioBlkDevice;
+use crate::virtio::console::VirtioConsoleDevice;
 use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
@@ -33,8 +34,10 @@ extern "C" {
 
 // ── Snapshot file format ──────────────────────────────────────────────
 
+/// Bump this version whenever the snapshot format or the init binary changes
+/// to automatically invalidate stale caches.
+const SNAPSHOT_VERSION: u32 = 11;
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
-const SNAPSHOT_VERSION: u32 = 2;
 /// Page size for snapshot memory alignment.  macOS on Apple Silicon uses
 /// 16 KB pages, so the memory section offset in the snapshot file must be
 /// 16 KB-aligned for `mmap(MAP_PRIVATE)` to work.
@@ -148,9 +151,6 @@ pub struct VirtioMmioSnapshot {
 /// All device state needed for restore.
 #[derive(Clone, Debug)]
 pub struct DeviceState {
-    pub uart_is_8250: bool,
-    pub uart_8250_ier: u8, // 8250 IER register value (interrupt enables)
-    pub pl011_imsc: u32,
     pub network_enabled: bool,
     pub net_mmio: Option<VirtioMmioSnapshot>,
     pub rng_mmio: Option<VirtioMmioSnapshot>,
@@ -159,6 +159,7 @@ pub struct DeviceState {
     pub fs_mmio: Vec<VirtioMmioSnapshot>, // virtiofs device MMIO state (one per --share)
     pub gic_state: Option<Vec<u8>>,       // Opaque GIC state blob (macOS 15+)
     pub data_blk_mmio: Option<VirtioMmioSnapshot>, // Overlay data disk (--disk-size)
+    pub console_mmio: Option<VirtioMmioSnapshot>, // Virtio-console MMIO state
 }
 
 // ── Save ──────────────────────────────────────────────────────────────
@@ -540,10 +541,6 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
 ///
 /// Both `kernel_fingerprint` and `rootfs_fingerprint` should be produced
 /// by [`hash_file_content`].
-/// Bump this version whenever the snapshot format or the init binary changes
-/// to automatically invalidate stale caches.
-const SNAPSHOT_CACHE_VERSION: u32 = 10;
-
 pub fn compute_fingerprint(
     kernel_fingerprint: u64,
     rootfs_fingerprint: u64,
@@ -552,7 +549,7 @@ pub fn compute_fingerprint(
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
-    SNAPSHOT_CACHE_VERSION.hash(&mut hasher);
+    SNAPSHOT_VERSION.hash(&mut hasher);
     kernel_fingerprint.hash(&mut hasher);
     rootfs_fingerprint.hash(&mut hasher);
 
@@ -620,10 +617,6 @@ struct SnapReader<'a> {
 impl<'a> SnapReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, off: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.off)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -807,9 +800,6 @@ fn cpu_state_from_bytes(data: &[u8]) -> Result<CpuState> {
 fn serialize_device_state(state: &DeviceState) -> Vec<u8> {
     let mut w = SnapWriter::with_capacity(256);
 
-    w.write_bool(state.uart_is_8250);
-    w.write_u8(state.uart_8250_ier);
-    w.write_u32(state.pl011_imsc);
     w.write_bool(state.network_enabled);
 
     // Net MMIO
@@ -851,6 +841,12 @@ fn serialize_device_state(state: &DeviceState) -> Vec<u8> {
         write_virtio_mmio(&mut w, mmio);
     }
 
+    // Virtio-console MMIO — appended after data_blk for backward compat
+    w.write_bool(state.console_mmio.is_some());
+    if let Some(ref mmio) = state.console_mmio {
+        write_virtio_mmio(&mut w, mmio);
+    }
+
     w.into_vec()
 }
 
@@ -877,9 +873,6 @@ fn write_virtio_mmio(w: &mut SnapWriter, mmio: &VirtioMmioSnapshot) {
 fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
     let mut r = SnapReader::new(data);
 
-    let uart_is_8250 = r.read_bool()?;
-    let uart_8250_ier = r.read_u8()?;
-    let pl011_imsc = r.read_u32()?;
     let network_enabled = r.read_bool()?;
 
     let net_mmio = if r.read_bool()? {
@@ -895,29 +888,19 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
     };
 
     // Blk MMIO + use_virtio_blk flag
-    let (use_virtio_blk, blk_mmio) = if r.remaining() > 0 {
-        let use_blk = r.read_bool()?;
-        let blk = if r.read_bool()? {
-            Some(read_virtio_mmio(&mut r)?)
-        } else {
-            None
-        };
-        (use_blk, blk)
+    let use_virtio_blk = r.read_bool()?;
+    let blk_mmio = if r.read_bool()? {
+        Some(read_virtio_mmio(&mut r)?)
     } else {
-        (false, None)
+        None
     };
 
     // Virtiofs MMIO state
-    let fs_mmio = if r.remaining() >= 4 {
-        let num_fs = r.read_u32()? as usize;
-        let mut fs = Vec::with_capacity(num_fs);
-        for _ in 0..num_fs {
-            fs.push(read_virtio_mmio(&mut r)?);
-        }
-        fs
-    } else {
-        Vec::new()
-    };
+    let num_fs = r.read_u32()? as usize;
+    let mut fs_mmio = Vec::with_capacity(num_fs);
+    for _ in 0..num_fs {
+        fs_mmio.push(read_virtio_mmio(&mut r)?);
+    }
 
     // GIC state
     let gic_len = r.read_u32()? as usize;
@@ -927,21 +910,21 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         None
     };
 
-    // Data block MMIO (overlay disk) — added after GIC; absent in old snapshots
-    let data_blk_mmio = if r.remaining() > 0 {
-        if r.read_bool()? {
-            Some(read_virtio_mmio(&mut r)?)
-        } else {
-            None
-        }
+    // Data block MMIO (overlay disk)
+    let data_blk_mmio = if r.read_bool()? {
+        Some(read_virtio_mmio(&mut r)?)
+    } else {
+        None
+    };
+
+    // Virtio-console MMIO
+    let console_mmio = if r.read_bool()? {
+        Some(read_virtio_mmio(&mut r)?)
     } else {
         None
     };
 
     Ok(DeviceState {
-        uart_is_8250,
-        uart_8250_ier,
-        pl011_imsc,
         network_enabled,
         net_mmio,
         rng_mmio,
@@ -950,6 +933,7 @@ fn deserialize_device_state(data: &[u8]) -> Result<DeviceState> {
         fs_mmio,
         gic_state,
         data_blk_mmio,
+        console_mmio,
     })
 }
 
@@ -1075,6 +1059,31 @@ impl VirtioMmioSnapshot {
             status: dev.status,
             interrupt_status: dev.interrupt_status,
             config_generation: dev.config_generation,
+            queues: dev
+                .queues
+                .iter()
+                .map(|q| VirtqSnapshot {
+                    num_max: q.num_max,
+                    num: q.num,
+                    ready: if q.ready { 1 } else { 0 },
+                    desc_addr: q.desc_addr,
+                    avail_addr: q.avail_addr,
+                    used_addr: q.used_addr,
+                    last_avail_idx: q.last_avail_idx,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_console(dev: &VirtioConsoleDevice) -> Self {
+        VirtioMmioSnapshot {
+            device_features_sel: dev.device_features_sel,
+            driver_features: dev.driver_features,
+            driver_features_sel: dev.driver_features_sel,
+            queue_sel: dev.queue_sel,
+            status: dev.status,
+            interrupt_status: dev.interrupt_status,
+            config_generation: 0,
             queues: dev
                 .queues
                 .iter()

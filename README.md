@@ -9,7 +9,6 @@ Sandal executes commands in a hardware-isolated environment with sub-second star
 - **Fast** — launches and runs your command in under one second
 - **Secure** — every execution runs in a dedicated hardware-isolated environment
 - **Flexible** — run shell scripts, or any Linux binary
-- **Networked** — built-in TCP/UDP/ICMP/DNS stack with internet access
 - **Unprivileged** — runs entirely in user space, no `sudo` required
 
 ## Quick Start

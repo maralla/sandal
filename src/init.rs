@@ -17,17 +17,12 @@ use crate::initramfs;
 
 // ── Pre-computed ELF binaries (evaluated at compile time) ───────────────
 
-const INIT_PL011: ([u8; ElfBuilder::MAX_ELF], usize) = build_init("/dev/ttyAMA0");
-const INIT_8250: ([u8; ElfBuilder::MAX_ELF], usize) = build_init("/dev/ttyS0");
+const INIT_HVC0: ([u8; ElfBuilder::MAX_ELF], usize) = build_init("/dev/hvc0");
 
 /// Return the pre-computed init binary for the given TTY device.
-/// This is a zero-cost lookup into compile-time constants.
-pub fn init_binary(tty_device: &str) -> &'static [u8] {
-    if matches!(tty_device, "/dev/ttyS0") {
-        &INIT_8250.0[..INIT_8250.1]
-    } else {
-        &INIT_PL011.0[..INIT_PL011.1]
-    }
+/// With virtio-console, only /dev/hvc0 is used.
+pub fn init_binary(_tty_device: &str) -> &'static [u8] {
+    &INIT_HVC0.0[..INIT_HVC0.1]
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -44,6 +39,7 @@ const MOD_NET_FAILOVER: &str = "drivers/net/net_failover.ko";
 const MOD_VIRTIO_NET: &str = "drivers/net/virtio_net.ko";
 const MOD_VIRTIO_RNG: &str = "drivers/char/hw_random/virtio-rng.ko";
 const MOD_VIRTIO_BLK: &str = "drivers/block/virtio_blk.ko";
+const MOD_VIRTIO_CONSOLE: &str = "drivers/char/virtio_console.ko";
 const MOD_FUSE: &str = "fs/fuse/fuse.ko";
 const MOD_VIRTIOFS: &str = "fs/fuse/virtiofs.ko";
 const MOD_SUFFIXES: &[&str] = &[
@@ -53,6 +49,7 @@ const MOD_SUFFIXES: &[&str] = &[
     MOD_VIRTIO_NET,
     MOD_VIRTIO_RNG,
     MOD_VIRTIO_BLK,
+    MOD_VIRTIO_CONSOLE,
     MOD_FUSE,
     MOD_VIRTIOFS,
 ];

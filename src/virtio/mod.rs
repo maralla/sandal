@@ -1,4 +1,5 @@
 pub mod blk;
+pub mod console;
 pub mod fs;
 /// Virtio MMIO transport implementation (virtio v2 / modern).
 ///

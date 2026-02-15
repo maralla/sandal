@@ -11,4 +11,5 @@ rootfs.ext2*
 rootfs/
 kernels
 PROGRESS.md
+AGENTS.md
 *.layer

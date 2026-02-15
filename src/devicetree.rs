@@ -42,7 +42,7 @@ impl DeviceTree {
         data_blk: Option<(u64, u32)>,
         virtio_rng: Option<(u64, u32)>,
         virtiofs: &[(u64, u32)],
-        use_8250_uart: bool,
+        virtio_console: Option<(u64, u32)>,
         verbose: bool,
         overlay_bootarg: Option<&str>,
     ) -> Result<Vec<u8>> {
@@ -60,11 +60,9 @@ impl DeviceTree {
         // Chosen node (boot arguments)
         dt.begin_node("chosen");
         {
-            let earlycon = if use_8250_uart {
-                "earlycon=uart8250,mmio32,0x9000000 console=ttyS0"
-            } else {
-                "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0"
-            };
+            // earlycon=pl011 for early boot / panic messages on the MMIO UART.
+            // console=hvc0 makes the virtio-console the primary interactive console.
+            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0";
             let rootfs = if virtio_blk.is_some() {
                 " root=/dev/vda rw init=/init"
             } else if initrd.is_some() {
@@ -81,11 +79,8 @@ impl DeviceTree {
                 .unwrap_or_default();
             dt.prop_string("bootargs", &format!("{earlycon}{rootfs}{quiet}{overlay}"));
         }
-        if use_8250_uart {
-            dt.prop_string("stdout-path", "/serial@9000000");
-        } else {
-            dt.prop_string("stdout-path", "/pl011@9000000");
-        }
+        // stdout-path points to the UART node for earlycon
+        dt.prop_string("stdout-path", "/pl011@9000000");
         if let Some((initrd_start, initrd_end)) = initrd {
             dt.prop_u64("linux,initrd-start", initrd_start);
             dt.prop_u64("linux,initrd-end", initrd_end);
@@ -165,47 +160,28 @@ impl DeviceTree {
         dt.prop_bytes("interrupts", &interrupts);
         dt.end_node();
 
-        // UART node — either 8250/16550 or PL011
-        if use_8250_uart {
-            dt.begin_node("serial@9000000");
-            dt.prop_string("compatible", "ns16550a");
-            let mut uart_reg = Vec::new();
-            uart_reg.extend_from_slice(&uart_base.to_be_bytes());
-            uart_reg.extend_from_slice(&0x1000u64.to_be_bytes());
-            dt.prop_bytes("reg", &uart_reg);
-            dt.prop_u32("reg-shift", 2); // Registers are 4-byte aligned
-            dt.prop_u32("reg-io-width", 4); // 32-bit MMIO access
-                                            // UART interrupt: SPI 1, level triggered
-            let mut uart_irq = Vec::new();
-            uart_irq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            uart_irq.extend_from_slice(&1u32.to_be_bytes()); // IRQ 1
-            uart_irq.extend_from_slice(&4u32.to_be_bytes()); // level triggered
-            dt.prop_bytes("interrupts", &uart_irq);
-            dt.prop_u32("clock-frequency", 1843200); // Standard 16550 clock
-            dt.end_node();
-        } else {
-            dt.begin_node("pl011@9000000");
-            dt.prop_stringlist("compatible", &["arm,pl011", "arm,primecell"]);
-            let mut uart_reg = Vec::new();
-            uart_reg.extend_from_slice(&uart_base.to_be_bytes());
-            uart_reg.extend_from_slice(&0x1000u64.to_be_bytes());
-            dt.prop_bytes("reg", &uart_reg);
-            // UART interrupt: SPI 1, level triggered
-            let mut uart_irq = Vec::new();
-            uart_irq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            uart_irq.extend_from_slice(&1u32.to_be_bytes()); // IRQ 1
-            uart_irq.extend_from_slice(&4u32.to_be_bytes()); // level triggered
-            dt.prop_bytes("interrupts", &uart_irq);
-            dt.prop_stringlist("clock-names", &["uartclk", "apb_pclk"]);
-            // Minimal fixed clocks (24MHz)
-            let clocks: [u32; 2] = [0x8000, 0x8000]; // phandles to clock nodes
-            let mut clk_bytes = Vec::new();
-            for c in &clocks {
-                clk_bytes.extend_from_slice(&c.to_be_bytes());
-            }
-            dt.prop_bytes("clocks", &clk_bytes);
-            dt.end_node();
+        // UART node — PL011 earlycon-only stub (for early boot & panic messages)
+        dt.begin_node("pl011@9000000");
+        dt.prop_stringlist("compatible", &["arm,pl011", "arm,primecell"]);
+        let mut uart_reg = Vec::new();
+        uart_reg.extend_from_slice(&uart_base.to_be_bytes());
+        uart_reg.extend_from_slice(&0x1000u64.to_be_bytes());
+        dt.prop_bytes("reg", &uart_reg);
+        // UART interrupt: SPI 1, level triggered
+        let mut uart_irq = Vec::new();
+        uart_irq.extend_from_slice(&0u32.to_be_bytes()); // SPI
+        uart_irq.extend_from_slice(&1u32.to_be_bytes()); // IRQ 1
+        uart_irq.extend_from_slice(&4u32.to_be_bytes()); // level triggered
+        dt.prop_bytes("interrupts", &uart_irq);
+        dt.prop_stringlist("clock-names", &["uartclk", "apb_pclk"]);
+        // Minimal fixed clocks (24MHz)
+        let clocks: [u32; 2] = [0x8000, 0x8000]; // phandles to clock nodes
+        let mut clk_bytes = Vec::new();
+        for c in &clocks {
+            clk_bytes.extend_from_slice(&c.to_be_bytes());
         }
+        dt.prop_bytes("clocks", &clk_bytes);
+        dt.end_node();
 
         // Virtio-net MMIO node (optional)
         if let Some((virtio_base, virtio_spi)) = virtio_net {
@@ -298,16 +274,32 @@ impl DeviceTree {
             dt.end_node();
         }
 
-        // Fixed clock node (only needed for PL011 UART)
-        if !use_8250_uart {
-            dt.begin_node("apb-pclk");
-            dt.prop_string("compatible", "fixed-clock");
-            dt.prop_u32("#clock-cells", 0);
-            dt.prop_u32("clock-frequency", 24000000); // 24 MHz
-            dt.prop_string("clock-output-names", "clk24mhz");
-            dt.prop_u32("phandle", 0x8000);
+        // Virtio-console MMIO node (interactive terminal I/O — hvc0)
+        if let Some((console_base, console_spi)) = virtio_console {
+            let node_name = format!("virtio_mmio@{console_base:x}");
+            dt.begin_node(&node_name);
+            dt.prop_string("compatible", "virtio,mmio");
+            let mut vreg = Vec::new();
+            vreg.extend_from_slice(&console_base.to_be_bytes());
+            vreg.extend_from_slice(&0x200u64.to_be_bytes());
+            dt.prop_bytes("reg", &vreg);
+            let mut virq = Vec::new();
+            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
+            virq.extend_from_slice(&console_spi.to_be_bytes());
+            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
+            dt.prop_bytes("interrupts", &virq);
+            dt.prop_empty("dma-coherent");
             dt.end_node();
         }
+
+        // Fixed clock node (needed for PL011 earlycon UART)
+        dt.begin_node("apb-pclk");
+        dt.prop_string("compatible", "fixed-clock");
+        dt.prop_u32("#clock-cells", 0);
+        dt.prop_u32("clock-frequency", 24000000); // 24 MHz
+        dt.prop_string("clock-output-names", "clk24mhz");
+        dt.prop_u32("phandle", 0x8000);
+        dt.end_node();
 
         dt.end_node(); // root
 

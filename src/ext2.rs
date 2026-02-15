@@ -2027,7 +2027,7 @@ fn remove_dir_entry(
 
 /// Inject all runtime files into a pre-built ext2 image.
 /// This adds /init, device nodes, CA certificates, entropy seeder, ctty helper.
-pub fn inject_runtime_files(image: &mut [u8], network: bool, use_8250_uart: bool) -> Result<()> {
+pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
 
@@ -2041,11 +2041,8 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, use_8250_uart: bool
     inject_chardev(image, &sb, &bgdt, "dev/null", 0o666, 1, 3)?;
     inject_chardev(image, &sb, &bgdt, "dev/zero", 0o666, 1, 5)?;
     inject_chardev(image, &sb, &bgdt, "dev/tty", 0o666, 5, 0)?;
-    if use_8250_uart {
-        inject_chardev(image, &sb, &bgdt, "dev/ttyS0", 0o666, 4, 64)?;
-    } else {
-        inject_chardev(image, &sb, &bgdt, "dev/ttyAMA0", 0o666, 204, 64)?;
-    }
+    // hvc0: virtio-console device (major 229, minor 0)
+    inject_chardev(image, &sb, &bgdt, "dev/hvc0", 0o666, 229, 0)?;
 
     // CA certificates
     if network {
@@ -2109,12 +2106,7 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, use_8250_uart: bool
     )?;
 
     // /init binary (compiled ARM64 ELF)
-    let tty_device = if use_8250_uart {
-        "/dev/ttyS0"
-    } else {
-        "/dev/ttyAMA0"
-    };
-    let init_binary = crate::init::init_binary(tty_device);
+    let init_binary = crate::init::init_binary("/dev/hvc0");
     inject_file(image, &sb, &bgdt, "init", init_binary, 0o755)?;
 
     Ok(())

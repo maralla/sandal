@@ -10,6 +10,7 @@ use crate::snapshot::{
 use crate::tar;
 use crate::unet::UserNet;
 use crate::virtio::blk::VirtioBlkDevice;
+use crate::virtio::console::VirtioConsoleDevice;
 use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
@@ -21,13 +22,13 @@ use flate2::Compression;
 use log::{debug, error, info, trace, warn};
 use memmap2::MmapMut;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::{env, fs, mem, process, thread, time};
 
 // ARM64 guest physical memory layout.
 // All addresses are GPAs (Guest Physical Addresses) — the address space as seen by the
@@ -85,50 +86,19 @@ mod mem_layout {
     pub const DATA_BLK_SIZE: u64 = 0x200;
     pub const DATA_BLK_SPI: u32 = 27; // After virtiofs SPIs (19..26)
 
-    pub const UART_SPI: u32 = 1;
+    // Virtio-console device for interactive terminal I/O (hvc0).
+    // Replaces MMIO UART for all interactive I/O; UART is earlycon-only.
+    pub const VIRTIO_CONSOLE_BASE: u64 = 0x0A001A00;
+    pub const VIRTIO_CONSOLE_SIZE: u64 = 0x200;
+    pub const VIRTIO_CONSOLE_SPI: u32 = 28;
 }
 
 use mem_layout::*;
-
-/// Interrupt state for the 8250/16550 UART emulation.
-#[derive(Debug, Default)]
-pub(crate) struct Uart8250State {
-    /// Interrupt Enable Register: bit 0 = receive data available, bit 1 = THRE.
-    ier: u8,
-    /// Transmit Holding Register (THR) was written; a THRE (Transmit Holding Register
-    /// Empty) interrupt will be raised after the ISR exits.
-    thr_written: bool,
-    /// THRE interrupt is pending, ready to be reported via IIR (Interrupt Identification
-    /// Register).
-    thre_pending: bool,
-    /// SPI has been asserted to the GIC, waiting for the ISR to acknowledge by reading IIR.
-    irq_asserted: bool,
-}
-
-/// Interrupt state for the PL011 UART emulation.
-#[derive(Debug, Default)]
-pub(crate) struct Pl011State {
-    /// IMSC (Interrupt Mask Set/Clear): bits set here enable the corresponding interrupt.
-    ///   Bit 4: RXIM (receive)
-    ///   Bit 5: TXIM (transmit)
-    ///   Bit 6: RTIM (receive timeout)
-    imsc: u32,
-}
-
-/// UART type detected from the kernel binary
-#[derive(Debug)]
-pub enum UartType {
-    /// ARM PL011 UART, the standard ARM serial controller.
-    PL011(Pl011State),
-    /// 8250/16550-compatible UART, the legacy PC serial standard.
-    Uart8250(Uart8250State),
-}
 
 pub struct VmInstance {
     vm: Vm,
     memory: MmapMut,
     memory_size: usize,
-    uart_type: UartType,
     kernel_entry: u64,
     initrd_info: Option<(u64, u64)>, // (start GPA, end GPA)
     exit_code: Option<i32>,          // Set when guest signals exit via UART marker
@@ -147,9 +117,8 @@ pub struct VmInstance {
     snapshot_pending: u32, // Flag: set to 1 by BRK handler to trigger snapshot save
     restored_cpu_state: Option<CpuState>, // If set, restore these registers instead of boot state
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
-    uart_line_buf: String, // Buffer for current line being received
+    uart_line_buf: String, // Buffer for current line being received from virtio-console TX
     uart_suppress_line: bool, // True if rest of line is suppressed (kernel/marker)
-    uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read (shared by both UART types)
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
@@ -157,6 +126,8 @@ pub struct VmInstance {
     data_blk_config_changed: bool,     // Trigger config change SPI after GIC restore
     export_save_path: Option<String>,  // Path from SANDAL_EXPORT_PATH marker (for sandal-export)
     virtio_rng: Option<VirtioRngDevice>,
+    virtio_console: Option<VirtioConsoleDevice>, // Interactive terminal I/O (hvc0)
+    virtio_console_config_changed: bool,         // Trigger config change SPI after GIC restore
     virtiofs: Vec<VirtioFsDevice>,
     use_virtio_blk: bool,
 }
@@ -165,12 +136,13 @@ pub struct VmInstance {
 
 mod termios {
     use super::RawFd;
+    use std::mem;
 
     /// Put the terminal in raw mode: disable echo, canonical mode, signals.
     /// Returns the original termios for restoring later.
     pub fn enable_raw_mode(fd: RawFd) -> Option<libc::termios> {
         unsafe {
-            let mut orig: libc::termios = std::mem::zeroed();
+            let mut orig: libc::termios = mem::zeroed();
             if libc::tcgetattr(fd, &mut orig) != 0 {
                 return None;
             }
@@ -241,35 +213,6 @@ impl VmInstance {
         }
     }
 
-    /// Returns true if using the 8250 UART.
-    fn is_uart_8250(&self) -> bool {
-        matches!(self.uart_type, UartType::Uart8250(_))
-    }
-
-    /// Compute PL011 raw interrupt status from current hardware state.
-    ///   Bit 4: RXIS — RX FIFO has data
-    ///   Bit 5: TXIS — TX FIFO ready (always true — we process TX instantly)
-    fn pl011_ris(&self) -> u32 {
-        let mut ris = 1u32 << 5; // TXIS: TX always ready
-        if !self.uart_rx_buf.is_empty() {
-            ris |= 1 << 4; // RXIS: data available
-        }
-        ris
-    }
-
-    /// Update the GIC SPI level for PL011 based on current MIS.
-    /// Must be called whenever RIS or IMSC changes.
-    fn pl011_update_irq(&mut self) {
-        if let UartType::PL011(ref state) = self.uart_type {
-            let mis = self.pl011_ris() & state.imsc;
-            if mis != 0 {
-                Vm::set_gic_spi(UART_SPI, true);
-            } else {
-                Vm::set_gic_spi(UART_SPI, false);
-            }
-        }
-    }
-
     pub fn new(memory_mb: usize) -> Result<Self> {
         // Initialize hypervisor
         hypervisor::init().context("Failed to initialize hypervisor")?;
@@ -285,7 +228,6 @@ impl VmInstance {
             vm,
             memory,
             memory_size,
-            uart_type: UartType::PL011(Pl011State::default()), // Default, auto-detected in detect_uart_type
             kernel_entry: 0,
             initrd_info: None,
             exit_code: None,
@@ -305,7 +247,6 @@ impl VmInstance {
             gic_state_to_restore: None,
             uart_line_buf: String::new(),
             uart_suppress_line: false,
-            uart_rx_buf: VecDeque::new(),
             network_enabled: false,
             virtio_net: None,
             virtio_blk: None,
@@ -313,28 +254,11 @@ impl VmInstance {
             data_blk_config_changed: false,
             export_save_path: None,
             virtio_rng: None,
+            virtio_console: None,
+            virtio_console_config_changed: false,
             virtiofs: Vec::new(),
             use_virtio_blk: false,
         })
-    }
-
-    /// Detect the UART type from the kernel binary data.
-    /// Must be called before building the initramfs if using rootfs.
-    pub fn detect_uart_type(&mut self, kernel_data: &[u8]) {
-        let has_pl011 = kernel_data.windows(5).any(|w| w == b"pl011");
-        let has_8250 = kernel_data.windows(4).any(|w| w == b"8250")
-            || kernel_data.windows(10).any(|w| w == b"serial8250");
-
-        if has_8250 && !has_pl011 {
-            self.uart_type = UartType::Uart8250(Uart8250State::default());
-        } else {
-            self.uart_type = UartType::PL011(Pl011State::default());
-        }
-
-        debug!(
-            "UART type: {:?} (pl011={}, 8250={})",
-            self.uart_type, has_pl011, has_8250
-        );
     }
 
     pub fn setup(&mut self) -> Result<()> {
@@ -507,7 +431,9 @@ impl VmInstance {
         // snapshot reusable regardless of whether --disk-size is supplied.
         let data_blk_dt = Some((DATA_BLK_BASE, DATA_BLK_SPI));
 
-        let use_8250 = self.is_uart_8250();
+        // Virtio-console device for interactive terminal I/O
+        let virtio_console_dt = Some((VIRTIO_CONSOLE_BASE, VIRTIO_CONSOLE_SPI));
+
         let dtb = DeviceTree::build(
             self.memory_size as u64,
             UART_BASE,
@@ -521,7 +447,7 @@ impl VmInstance {
             data_blk_dt,
             virtio_rng_dt,
             &virtiofs_dt,
-            use_8250,
+            virtio_console_dt,
             log::log_enabled!(log::Level::Debug),
             None, // no overlay bootarg — init script detects via /dev/vdb size
         )?;
@@ -622,7 +548,7 @@ impl VmInstance {
 
         // Put the terminal in raw mode so we can forward stdin to the guest
         // character-by-character (needed for interactive programs like Python REPL).
-        let stdin_fd = std::io::stdin().as_raw_fd();
+        let stdin_fd = io::stdin().as_raw_fd();
         let stdin_is_tty = unsafe { libc::isatty(stdin_fd) } != 0;
         let orig_termios = if stdin_is_tty {
             let orig = termios::enable_raw_mode(stdin_fd);
@@ -657,7 +583,7 @@ impl VmInstance {
         // poll()-based poller is the only reliable approach.
         let stdin_poller_thread = {
             let vcpu_id = vcpu.id() as u64;
-            Some(std::thread::spawn(move || {
+            Some(thread::spawn(move || {
                 Self::stdin_poller(vcpu_id, stdin_fd);
             }))
         };
@@ -671,7 +597,7 @@ impl VmInstance {
                 let fd_tx = poller.fd_sender();
                 fd_tx.send(stdin_fd).ok();
             }
-            Some(std::thread::spawn(move || poller.run()))
+            Some(thread::spawn(move || poller.run()))
         } else {
             None
         };
@@ -737,16 +663,12 @@ impl VmInstance {
                     }
                 }
 
-                // On restore, assert the UART RX interrupt so the
-                // guest can read the injected command data.
-                if !self.uart_rx_buf.is_empty() {
-                    if let UartType::Uart8250(ref state) = self.uart_type {
-                        if (state.ier & 0x01) != 0 {
-                            Vm::set_gic_spi(UART_SPI, true);
-                        }
-                    } else {
-                        self.pl011_update_irq();
-                    }
+                // If the virtio-console config changed (e.g. on restore),
+                // assert the SPI so the kernel re-reads the config.
+                if self.virtio_console_config_changed {
+                    self.virtio_console_config_changed = false;
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
+                    debug!("Asserted virtio-console config change SPI");
                 }
 
                 // If the overlay disk capacity changed (--disk-size on a
@@ -1047,33 +969,14 @@ impl VmInstance {
                 self.save_snapshot(&vcpu, &trc)?;
             }
 
-            // Poll stdin for input and buffer it for the guest UART.
+            // Poll stdin for input and inject into the virtio-console RX queue.
             // Delay until after the command has been injected so that
             // (a) piped data isn't consumed by the kernel's console
-            //     driver during init (PL011 polls DR during probe), and
+            //     driver during init, and
             // (b) stdin EOF (Ctrl-D) doesn't reach the guest's `read`
             //     before the command data when running without a TTY.
             if self.boot_complete && self.command_injected {
                 self.poll_stdin(stdin_fd, &mut stdin_eof);
-            }
-
-            // Fire UART interrupt if any source is pending.
-            {
-                if let UartType::Uart8250(ref mut state) = self.uart_type {
-                    let rx_pending = !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0;
-                    let tx_pending =
-                        state.thre_pending && (state.ier & 0x02) != 0 && !state.irq_asserted;
-                    if rx_pending || tx_pending {
-                        if tx_pending {
-                            state.irq_asserted = true;
-                        }
-                        Vm::set_gic_spi(UART_SPI, true);
-                    }
-                } else {
-                    // PL011: update IRQ level based on current state.
-                    // Asserts SPI when MIS != 0, deasserts when MIS == 0.
-                    self.pl011_update_irq();
-                }
             }
 
             // Poll network backend and deliver incoming packets to guest RX queue
@@ -1120,7 +1023,7 @@ impl VmInstance {
 
         // Flush any remaining partial line in the UART buffer
         if !self.uart_line_buf.is_empty() {
-            let line = std::mem::take(&mut self.uart_line_buf);
+            let line = mem::take(&mut self.uart_line_buf);
             self.process_uart_line(&line);
         }
 
@@ -1151,9 +1054,9 @@ impl VmInstance {
         }
     }
 
-    /// Read available bytes from host stdin into the UART RX buffer.
-    /// When stdin reaches EOF (pipe closed), sends Ctrl-D (0x04) so the
-    /// guest's TTY layer signals end-of-file to user-space readers.
+    /// Read available bytes from host stdin and inject into the
+    /// virtio-console RX queue.  When stdin reaches EOF (pipe closed),
+    /// sends Ctrl-D (0x04) so the guest's TTY layer signals end-of-file.
     fn poll_stdin(&mut self, stdin_fd: RawFd, stdin_eof: &mut bool) {
         if *stdin_eof {
             return;
@@ -1161,18 +1064,73 @@ impl VmInstance {
         let mut buf = [0u8; 256];
         let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n > 0 {
-            for &b in &buf[..n as usize] {
-                self.uart_rx_buf.push_back(b);
+            if let Some(ref mut console) = self.virtio_console {
+                if console.inject_rx(&mut self.memory, RAM_BASE, &buf[..n as usize]) {
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
+                }
             }
         } else if n == 0 {
             // EOF — send Ctrl-D to guest
-            self.uart_rx_buf.push_back(0x04);
+            if let Some(ref mut console) = self.virtio_console {
+                if console.inject_rx(&mut self.memory, RAM_BASE, &[0x04]) {
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
+                }
+            }
             *stdin_eof = true;
         }
         // n < 0 → EAGAIN (no data), ignore
     }
 
-    /// Process a complete line of UART output.
+    /// Process bytes received from the virtio-console TX queue.
+    /// Feeds them through the same line-buffered marker detection and output
+    /// filtering that previously ran per-byte in the UART TX handler.
+    fn process_console_tx(&mut self, data: &[u8]) {
+        for &ch in data {
+            if ch.is_ascii() || ch == b'\n' || ch == b'\r' {
+                self.uart_line_buf.push(ch as char);
+
+                if self.forward_output && !self.uart_suppress_line {
+                    let buf_len = self.uart_line_buf.len();
+                    let buf_bytes = self.uart_line_buf.as_bytes();
+                    let is_prefix_of_marker = |buf: &[u8]| -> bool {
+                        let markers: &[&[u8]] = &[
+                            initramfs::EXIT_MARKER.as_bytes(),
+                            initramfs::EXPORT_PATH_MARKER.as_bytes(),
+                        ];
+                        markers
+                            .iter()
+                            .any(|m| buf.len() <= m.len() && buf == &m[..buf.len()])
+                    };
+                    let is_full_marker = |buf: &[u8]| -> bool {
+                        buf == initramfs::EXIT_MARKER.as_bytes()
+                            || buf == initramfs::EXPORT_PATH_MARKER.as_bytes()
+                    };
+
+                    if is_full_marker(buf_bytes) {
+                        self.uart_suppress_line = true;
+                    } else if is_prefix_of_marker(buf_bytes) {
+                        // Still matching a marker prefix — keep buffering.
+                    } else if buf_len > 1 && is_prefix_of_marker(&buf_bytes[..buf_len - 1]) {
+                        let buffered = buf_bytes.to_vec();
+                        io::stdout().write_all(&buffered).ok();
+                        io::stdout().flush().ok();
+                    } else {
+                        let out = [ch];
+                        io::stdout().write_all(&out).ok();
+                        io::stdout().flush().ok();
+                    }
+                }
+
+                if ch == b'\n' {
+                    self.uart_suppress_line = false;
+                    let line = mem::take(&mut self.uart_line_buf);
+                    self.process_uart_line(&line);
+                }
+            }
+        }
+    }
+
+    /// Process a complete line of console output.
     /// Extracts exit code marker, export path marker, and detects boot completion.
     fn process_uart_line(&mut self, line: &str) {
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
@@ -1207,14 +1165,14 @@ impl VmInstance {
         // by the UART write handler, so nothing more to print here.
     }
 
-    /// Handle BRK #INIT_CONFIG: build the config blob and push it into the
-    /// UART RX buffer.  Sets x0 = blob size so the guest knows how much to read.
+    /// Handle BRK #INIT_CONFIG: build the config blob and inject it into
+    /// the virtio-console RX queue.  Sets x0 = blob size so the guest knows how much to read.
     fn handle_init_config(&mut self, vcpu: &Vcpu) -> Result<()> {
         if self.init_config_injected {
             return Ok(());
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        let now = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let blob = initramfs::build_init_config(
@@ -1233,8 +1191,10 @@ impl VmInstance {
             self.init_network,
         );
         let blob_len = blob.len() as u64;
-        for byte in &blob {
-            self.uart_rx_buf.push_back(*byte);
+        if let Some(ref mut console) = self.virtio_console {
+            if console.inject_rx(&mut self.memory, RAM_BASE, &blob) {
+                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
+            }
         }
         vcpu.write_register(HvReg::X0, blob_len)?;
         self.init_config_injected = true;
@@ -1279,9 +1239,9 @@ impl VmInstance {
                     if let Ok(disk_path) = snapshot::disk_image_path(self.snapshot_fingerprint) {
                         let t_disk = Instant::now();
                         let tmp = disk_path.with_extension("tmp");
-                        match std::fs::write(&tmp, &blk.disk_image) {
+                        match fs::write(&tmp, &blk.disk_image) {
                             Ok(()) => {
-                                if let Err(e) = std::fs::rename(&tmp, &disk_path) {
+                                if let Err(e) = fs::rename(&tmp, &disk_path) {
                                     warn!("Failed to rename disk image: {e}");
                                 }
                                 debug!(
@@ -1356,7 +1316,7 @@ impl VmInstance {
 
         // Gzip-compress the tar data
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        if let Err(e) = std::io::Write::write_all(&mut encoder, tar_data) {
+        if let Err(e) = io::Write::write_all(&mut encoder, tar_data) {
             error!("Export: failed to gzip tar data: {e}");
             return;
         }
@@ -1382,7 +1342,7 @@ impl VmInstance {
         };
 
         // Save to disk
-        match std::fs::write(&save_path, &gz_data) {
+        match fs::write(&save_path, &gz_data) {
             Ok(()) => {
                 info!(
                     "Layer exported: {} ({} bytes, {:.1}x compression)",
@@ -1405,22 +1365,14 @@ impl VmInstance {
 
     /// Build the device state snapshot from current device states.
     fn capture_device_state(&self) -> DeviceState {
-        let uart_is_8250 = matches!(self.uart_type, UartType::Uart8250(_));
-        let uart_8250_ier = if let UartType::Uart8250(ref state) = self.uart_type {
-            state.ier
-        } else {
-            0
-        };
-        let pl011_imsc = if let UartType::PL011(ref state) = self.uart_type {
-            state.imsc
-        } else {
-            0
-        };
-
         let net_mmio = self.virtio_net.as_ref().map(VirtioMmioSnapshot::from_net);
         let rng_mmio = self.virtio_rng.as_ref().map(VirtioMmioSnapshot::from_rng);
         let blk_mmio = self.virtio_blk.as_ref().map(VirtioMmioSnapshot::from_blk);
         let data_blk_mmio = self.data_blk.as_ref().map(VirtioMmioSnapshot::from_blk);
+        let console_mmio = self
+            .virtio_console
+            .as_ref()
+            .map(VirtioMmioSnapshot::from_console);
 
         // Save GIC state (macOS 15.0+)
         let gic_state = Vm::save_gic_state();
@@ -1437,9 +1389,6 @@ impl VmInstance {
             .collect();
 
         DeviceState {
-            uart_is_8250,
-            uart_8250_ier,
-            pl011_imsc,
             network_enabled: self.network_enabled,
             net_mmio,
             rng_mmio,
@@ -1448,6 +1397,7 @@ impl VmInstance {
             fs_mmio,
             gic_state,
             data_blk_mmio,
+            console_mmio,
         }
     }
 
@@ -1521,247 +1471,78 @@ impl VmInstance {
         let _sas = (iss >> 22) & 0x3; // Access size: 0=byte, 1=halfword, 2=word, 3=doubleword
         let rt = ((iss >> 16) & 0x1F) as u8;
 
-        // UART at 0x09000000
+        // UART at 0x09000000 — earlycon-only PL011 stub.
+        // TX writes go to stderr only when debug logging is enabled.
+        // This keeps early boot messages hidden by default (like before)
+        // but makes kernel panic messages visible via RUST_LOG=debug.
+        // No RX, no interrupt state machine.
         if (UART_BASE..UART_BASE + 0x1000).contains(&fault_addr) {
             let reg_offset = fault_addr - UART_BASE;
 
             if is_write {
                 let value = Self::read_guest_register(vcpu, rt)?;
 
-                // Both PL011 DR and 8250 THR are at offset 0x00
-                if reg_offset == 0 {
+                // PL011 DR (offset 0x00): TX write — send to stderr in debug mode
+                if reg_offset == 0 && log::log_enabled!(log::Level::Debug) {
                     let ch = (value & 0xFF) as u8;
-
-                    if ch.is_ascii() || ch == b'\n' || ch == b'\r' {
-                        self.uart_line_buf.push(ch as char);
-
-                        // After init ready: write each character directly to
-                        // stdout so interactive echo and prompts appear
-                        // immediately.  Kernel console messages and the
-                        // config blob echo are suppressed because
-                        // forward_output is only set by BRK #INIT_READY,
-                        // which fires after the init binary has finished
-                        // reading and processing the config.
-                        if self.forward_output && !self.uart_suppress_line {
-                            let buf_len = self.uart_line_buf.len();
-                            let buf_bytes = self.uart_line_buf.as_bytes();
-                            // Check if the current buffer is a prefix of any
-                            // suppressed marker (EXIT_MARKER, EXPORT_PATH_MARKER).
-                            let is_prefix_of_marker = |buf: &[u8]| -> bool {
-                                let markers: &[&[u8]] = &[
-                                    initramfs::EXIT_MARKER.as_bytes(),
-                                    initramfs::EXPORT_PATH_MARKER.as_bytes(),
-                                ];
-                                markers
-                                    .iter()
-                                    .any(|m| buf.len() <= m.len() && buf == &m[..buf.len()])
-                            };
-                            let is_full_marker = |buf: &[u8]| -> bool {
-                                buf == initramfs::EXIT_MARKER.as_bytes()
-                                    || buf == initramfs::EXPORT_PATH_MARKER.as_bytes()
-                            };
-
-                            if is_full_marker(buf_bytes) {
-                                // Exact marker match — suppress rest of line.
-                                self.uart_suppress_line = true;
-                            } else if is_prefix_of_marker(buf_bytes) {
-                                // Still matching a marker prefix — keep buffering.
-                            } else if buf_len > 1 && is_prefix_of_marker(&buf_bytes[..buf_len - 1])
-                            {
-                                // Was matching a marker prefix but diverged —
-                                // flush all buffered characters as user output.
-                                let buffered = buf_bytes.to_vec();
-                                std::io::stdout().write_all(&buffered).ok();
-                                std::io::stdout().flush().ok();
-                            } else {
-                                let out = [ch];
-                                std::io::stdout().write_all(&out).ok();
-                                std::io::stdout().flush().ok();
-                            }
-                        }
-
-                        // Process complete lines (for exit marker detection
-                        // and pre-boot filtering)
-                        if ch == b'\n' {
-                            self.uart_suppress_line = false;
-                            let line = std::mem::take(&mut self.uart_line_buf);
-                            self.process_uart_line(&line);
-                        }
-                    }
-                    // Mark that THR was written.  In our emulation the
-                    // character is "transmitted" immediately (written to
-                    // host stdout), so the Transmit Holding Register is
-                    // empty again.  Set thre_pending directly so the
-                    // post-exit interrupt check fires the THRE SPI,
-                    // driving the kernel's TTY output path.
-                    if let UartType::Uart8250(ref mut state) = self.uart_type {
-                        state.thr_written = true;
-                        if (state.ier & 0x02) != 0 {
-                            state.thre_pending = true;
-                        }
-                    }
-                } else if reg_offset == 0x04 {
-                    if let UartType::Uart8250(ref mut state) = self.uart_type {
-                        // IER write — track interrupt enable state
-                        let old_ier = state.ier;
-                        state.ier = value as u8;
-                        // If THRE interrupt just enabled, set pending immediately
-                        // (TX holding register is always empty in our emulation)
-                        if (old_ier & 0x02) == 0 && (state.ier & 0x02) != 0 {
-                            state.thre_pending = true;
-                        }
-                    }
-                } else if matches!(self.uart_type, UartType::PL011(_)) {
-                    let mut update_irq = false;
-                    if let UartType::PL011(ref mut state) = self.uart_type {
-                        match reg_offset {
-                            // IMSC (Interrupt Mask Set/Clear): enable/disable interrupt
-                            // sources.  Changing the mask can make MIS transition
-                            // to/from zero, so update the IRQ level afterward.
-                            0x38 => {
-                                let old_imsc = state.imsc;
-                                state.imsc = value as u32;
-                                update_irq = true;
-                                let rx_len = self.uart_rx_buf.len();
-                                let mut ris = 1u32 << 5; // TXIS
-                                if rx_len > 0 {
-                                    ris |= 1 << 4; // RXIS
-                                }
-                                let mis = ris & state.imsc;
-                                trace!(
-                                    "PL011 IMSC: 0x{:x} -> 0x{:x}, RIS=0x{:x}, MIS=0x{:x}, rx_buf={}",
-                                    old_imsc, state.imsc, ris, mis, rx_len
-                                );
-                            }
-                            // ICR (Interrupt Clear Register): on real hardware,
-                            // write-1-to-clear latches in RIS.  Our RIS is purely
-                            // combinational (derived from buffer state), so ICR is
-                            // effectively a no-op.  We still update the IRQ level
-                            // in case the driver expects the SPI to deassert.
-                            0x44 => {
-                                update_irq = true;
-                            }
-                            // Other PL011 registers (LCR_H, CR, IFLS, etc.) - ignored
-                            _ => {}
-                        }
-                    }
-                    if update_irq {
-                        self.pl011_update_irq();
-                    }
+                    let buf = [ch];
+                    io::stderr().write_all(&buf).ok();
                 }
-                // Other UART registers (control, baud rate, etc.) - ignored
+                // All other writes (IMSC, ICR, LCR_H, CR, etc.) — silently ignored
             } else {
-                // UART read — handle both PL011 and 8250 register layouts
-                let has_rx_data = !self.uart_rx_buf.is_empty();
-                let value = if let UartType::Uart8250(ref mut state) = self.uart_type {
-                    // 8250/16550 registers (reg-shift=2, so 4-byte aligned)
-                    match reg_offset {
-                        0x00 => {
-                            // RBR: read the next byte from the input buffer.
-                            // The RX interrupt clears naturally when the buffer
-                            // is drained (checked via is_empty() in the IIR path).
-                            self.uart_rx_buf.pop_front().unwrap_or(0) as u64
-                        }
-                        0x04 => state.ier as u64, // IER: return current state
-                        0x08 => {
-                            // IIR (Interrupt Identification Register)
-                            // Priority: RX data ready > THRE
-                            if !self.uart_rx_buf.is_empty() && (state.ier & 0x01) != 0 {
-                                // RX data available (ID bits = 10, highest priority).
-                                // Reading IIR does NOT clear this — reading RBR does.
-                                0xC4u64 // FIFO enabled + RX data available
-                            } else if state.thre_pending && (state.ier & 0x02) != 0 {
-                                // THRE interrupt pending → report it, clear, and deassert SPI
-                                state.thre_pending = false;
-                                state.irq_asserted = false;
-                                Vm::set_gic_spi(UART_SPI, false);
-                                0xC2u64 // FIFO enabled + THRE (ID bits = 01)
-                            } else {
-                                // No interrupt pending — deassert the SPI line so
-                                // the GIC doesn't re-trigger after EOI.
-                                Vm::set_gic_spi(UART_SPI, false);
-                                state.irq_asserted = false;
-                                // If a THR was written, promote it to THRE pending
-                                // for the NEXT interrupt cycle.
-                                if state.thr_written {
-                                    state.thr_written = false;
-                                    state.thre_pending = true;
-                                }
-                                0xC1u64 // FIFO enabled + no interrupt pending
-                            }
-                        }
-                        0x0C => 0x00, // LCR: line control
-                        0x10 => 0x00, // MCR: modem control
-                        // LSR (Line Status Register):
-                        //   Bit 0: DR  (Data Ready) = 1 if rx_buf has data
-                        //   Bit 5: THRE (TX Holding Register Empty) = 1
-                        //   Bit 6: TEMT (Transmitter Empty) = 1
-                        0x14 => {
-                            let mut lsr = 0x60u64; // THRE | TEMT
-                            if has_rx_data {
-                                lsr |= 0x01;
-                            } // DR
-                            lsr
-                        }
-                        0x18 => 0x00, // MSR: modem status
-                        0x1C => 0x00, // SCR: scratch
-                        _ => 0x00,
-                    }
-                } else if let UartType::PL011(ref state) = self.uart_type {
-                    // PL011 registers (ARM PrimeCell UART)
-                    // RIS and MIS are computed dynamically from hardware state:
-                    //   Bit 4: RXIS — RX FIFO has data
-                    //   Bit 5: TXIS — TX FIFO ready (always true)
-                    let ris = self.pl011_ris();
-                    let mis = ris & state.imsc;
-
-                    match reg_offset {
-                        0x00 => {
-                            // DR: read the next byte from the input buffer.
-                            // After popping, update IRQ level since RXIS may clear.
-                            let byte = self.uart_rx_buf.pop_front().unwrap_or(0) as u64;
-                            // Deassert SPI immediately if buffer is now empty and
-                            // no other masked interrupts remain, preventing an
-                            // interrupt storm between the ISR exit and main loop.
-                            if self.uart_rx_buf.is_empty() {
-                                self.pl011_update_irq();
-                            }
-                            byte
-                        }
-                        // FR (Flags Register):
-                        //   Bit 4: RXFE (RX FIFO Empty)
-                        //   Bit 5: TXFF (TX FIFO Full) — never set
-                        //   Bit 7: TXFE (TX FIFO Empty) — always set
-                        0x18 => {
-                            let mut fr = 0x80u64; // TXFE
-                            if !has_rx_data {
-                                fr |= 0x10;
-                            } // RXFE
-                            fr
-                        }
-                        0x24 => 0x00,              // IBRD: integer baud rate
-                        0x28 => 0x00,              // FBRD: fractional baud rate
-                        0x2C => 0x00,              // LCR_H: line control
-                        0x30 => 0x0301,            // CR: UART enabled, TX enabled, RX enabled
-                        0x34 => 0x12,              // IFLS: interrupt FIFO level (default 1/2)
-                        0x38 => state.imsc as u64, // IMSC: interrupt mask
-                        0x3C => ris as u64,        // RIS: raw interrupt status
-                        0x40 => mis as u64,        // MIS: masked interrupt status
-                        0x44 => 0x00,              // ICR: write-only, reads as 0
-                        0xFE0 => 0x11,             // PeriphID0: PL011 identification
-                        0xFE4 => 0x10,             // PeriphID1
-                        0xFE8 => 0x34,             // PeriphID2: revision 3, PL011
-                        0xFEC => 0x00,             // PeriphID3
-                        0xFF0 => 0x0D,             // CellID0 (PrimeCell component ID)
-                        0xFF4 => 0xF0,             // CellID1
-                        0xFF8 => 0x05,             // CellID2
-                        0xFFC => 0xB1,             // CellID3
-                        _ => 0x00,
-                    }
-                } else {
-                    0x00
+                // UART reads — return safe earlycon defaults
+                let value = match reg_offset {
+                    // FR (Flags Register): TX empty, RX empty
+                    0x18 => 0x90u64, // TXFE | RXFE
+                    // PL011 identification registers (earlycon probes these)
+                    0xFE0 => 0x11, // PeriphID0
+                    0xFE4 => 0x10, // PeriphID1
+                    0xFE8 => 0x34, // PeriphID2
+                    0xFEC => 0x00, // PeriphID3
+                    0xFF0 => 0x0D, // CellID0
+                    0xFF4 => 0xF0, // CellID1
+                    0xFF8 => 0x05, // CellID2
+                    0xFFC => 0xB1, // CellID3
+                    _ => 0x00,
                 };
                 Self::write_guest_register(vcpu, rt, value)?;
+            }
+        }
+        // Virtio-console MMIO region (interactive terminal I/O)
+        else if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE)
+            .contains(&fault_addr)
+        {
+            let offset = fault_addr - VIRTIO_CONSOLE_BASE;
+            // Handle the MMIO access and collect any TX bytes, then process
+            // them after releasing the virtio_console borrow.
+            let mut tx_bytes = Vec::new();
+            if let Some(ref mut console) = self.virtio_console {
+                if is_write {
+                    let value = Self::read_guest_register(vcpu, rt)? as u32;
+                    if let Some(queue_idx) = console.mmio_write(offset, value) {
+                        if queue_idx == 1 {
+                            // TX queue notification — collect output bytes
+                            tx_bytes = console.process_tx(&mut self.memory, RAM_BASE);
+                            if !tx_bytes.is_empty() {
+                                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
+                            }
+                        }
+                        // queue_idx == 0 (RX): guest posted new buffers — no-op
+                    }
+                    // After InterruptACK, deassert SPI if no more pending interrupts
+                    if offset == REG_INTERRUPT_ACK && console.interrupt_status == 0 {
+                        Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, false);
+                    }
+                } else {
+                    let value = console.mmio_read(offset);
+                    Self::write_guest_register(vcpu, rt, value as u64)?;
+                }
+            } else if !is_write {
+                Self::write_guest_register(vcpu, rt, 0)?;
+            }
+            // Process TX output after releasing the borrow on self.virtio_console
+            if !tx_bytes.is_empty() {
+                self.process_console_tx(&tx_bytes);
             }
         }
         // Virtio-net MMIO region
@@ -2039,7 +1820,7 @@ impl VmInstance {
 /// Resolve a default data path by searching relative to the executable directory,
 /// then two levels up (for target/release/sandal -> project root), then CWD.
 pub fn resolve_data_path(relative: &str) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = env::current_exe() {
         // Use parent() directly instead of canonicalize() to avoid the
         // expensive realpath() syscall chain (resolves every symlink
         // component).  For finding sibling data files, the raw exe
@@ -2112,10 +1893,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     // Read kernel once and reuse for detection and loading
-    let kernel_data = std::fs::read(&kernel_path)?;
-
-    // Detect UART type from kernel (needed for initramfs device nodes)
-    vm.detect_uart_type(&kernel_data);
+    let kernel_data = fs::read(&kernel_path)?;
 
     // Check kernel capabilities to decide rootfs strategy.
     // Prefer virtio-blk when the kernel supports it: mounting /dev/vda directly
@@ -2171,7 +1949,6 @@ pub fn run(args: Args) -> Result<()> {
     };
     let rootfs_arg = args.rootfs.as_ref().or(default_rootfs.as_ref());
 
-    let use_8250 = vm.is_uart_8250();
     let mut disk_image = if let Some(rootfs_path) = rootfs_arg {
         if !rootfs_path.is_file() {
             anyhow::bail!(
@@ -2179,7 +1956,7 @@ pub fn run(args: Args) -> Result<()> {
             );
         }
         info!("Loading ext2 rootfs from {rootfs_path:?}...");
-        std::fs::read(rootfs_path)
+        fs::read(rootfs_path)
             .with_context(|| format!("Failed to read rootfs image {rootfs_path:?}"))?
     } else {
         info!("Using built-in rootfs");
@@ -2193,7 +1970,7 @@ pub fn run(args: Args) -> Result<()> {
 
     {
         // Inject runtime files (/init, device nodes, CA certs, etc.)
-        ext2::inject_runtime_files(&mut disk_image, network_enabled, use_8250)
+        ext2::inject_runtime_files(&mut disk_image, network_enabled)
             .context("Failed to inject runtime files into ext2 image")?;
 
         if prefer_virtio_blk {
@@ -2222,6 +1999,9 @@ pub fn run(args: Args) -> Result<()> {
 
     // Always provide a virtio-rng device for guest entropy
     vm.virtio_rng = Some(VirtioRngDevice::new());
+
+    // Always provide a virtio-console device for interactive terminal I/O (hvc0)
+    vm.virtio_console = Some(VirtioConsoleDevice::new(80, 24));
 
     // Always create a second virtio-blk device so the kernel probes /dev/vdb
     // during cold boot.  This ensures the same snapshot works regardless of
@@ -2285,7 +2065,7 @@ pub fn run(args: Args) -> Result<()> {
 
     debug!("VM exited with code: {exit_code}");
 
-    std::process::exit(exit_code);
+    process::exit(exit_code);
 }
 
 /// Fast-path: restore a VM from a snapshot file and run a command.
@@ -2347,18 +2127,6 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         "[bench] map_memory: {:.2}ms",
         t1.elapsed().as_secs_f64() * 1000.0
     );
-
-    // Set up UART type from snapshot, restoring interrupt enable state
-    let uart_type = if snapshot_device_state.uart_is_8250 {
-        UartType::Uart8250(Uart8250State {
-            ier: snapshot_device_state.uart_8250_ier,
-            ..Uart8250State::default()
-        })
-    } else {
-        UartType::PL011(Pl011State {
-            imsc: snapshot_device_state.pl011_imsc,
-        })
-    };
 
     // Restore virtio-net device
     let t1 = Instant::now();
@@ -2438,7 +2206,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
                 disk_path.display()
             );
         }
-        let disk_image = std::fs::read(&disk_path).context("Failed to read snapshot disk image")?;
+        let disk_image = fs::read(&disk_path).context("Failed to read snapshot disk image")?;
         debug!(
             "Disk image loaded ({} MB)",
             disk_image.len() / (1024 * 1024)
@@ -2543,12 +2311,33 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         None
     };
 
+    // Restore virtio-console device
+    let mut virtio_console = VirtioConsoleDevice::new(80, 24);
+    if let Some(ref mmio) = snapshot_device_state.console_mmio {
+        virtio_console.device_features_sel = mmio.device_features_sel;
+        virtio_console.driver_features = mmio.driver_features;
+        virtio_console.driver_features_sel = mmio.driver_features_sel;
+        virtio_console.queue_sel = mmio.queue_sel;
+        virtio_console.status = mmio.status;
+        virtio_console.interrupt_status = mmio.interrupt_status;
+        for (i, q) in mmio.queues.iter().enumerate() {
+            if i < virtio_console.queues.len() {
+                virtio_console.queues[i].num_max = q.num_max;
+                virtio_console.queues[i].num = q.num;
+                virtio_console.queues[i].ready = q.ready != 0;
+                virtio_console.queues[i].desc_addr = q.desc_addr;
+                virtio_console.queues[i].avail_addr = q.avail_addr;
+                virtio_console.queues[i].used_addr = q.used_addr;
+                virtio_console.queues[i].last_avail_idx = q.last_avail_idx;
+            }
+        }
+    }
+
     // Build the VmInstance struct with restored state
     let mut vm = VmInstance {
         vm: vm_handle,
         memory,
         memory_size,
-        uart_type,
         kernel_entry: 0, // Not needed for restore
         initrd_info: None,
         exit_code: None,
@@ -2568,7 +2357,6 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         gic_state_to_restore: snapshot_device_state.gic_state,
         uart_line_buf: String::new(),
         uart_suppress_line: false,
-        uart_rx_buf: VecDeque::new(),
         network_enabled,
         virtio_net,
         virtio_rng: Some(virtio_rng),
@@ -2576,6 +2364,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         data_blk: None, // Restored below with fresh disk
         data_blk_config_changed: false,
         export_save_path: None,
+        virtio_console: Some(virtio_console),
+        virtio_console_config_changed: false,
         use_virtio_blk,
         virtiofs: virtiofs_devices,
     };
@@ -2648,7 +2438,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
     let exit_code = vm.run_command(&args.command)?;
 
     debug!("VM exited with code: {exit_code}");
-    std::process::exit(exit_code);
+    process::exit(exit_code);
 }
 
 /// Build the data disk (overlay /dev/vdb) from layers and/or --disk-size.
@@ -2665,7 +2455,7 @@ fn build_data_disk(layers: &[PathBuf], disk_size: Option<usize>) -> Result<Vec<u
     if has_layers {
         let mut all_entries = Vec::new();
         for layer_path in layers {
-            let gz_data = std::fs::read(layer_path)
+            let gz_data = fs::read(layer_path)
                 .with_context(|| format!("Failed to read layer file: {}", layer_path.display()))?;
             info!(
                 "Loading layer: {} ({} bytes)",
