@@ -7,6 +7,8 @@ pub mod fs;
 pub mod net;
 pub mod rng;
 
+use std::sync::atomic::{fence, Ordering};
+
 // Virtio MMIO magic value ("virt")
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
 pub const VIRTIO_MMIO_VERSION: u32 = 2;
@@ -77,6 +79,41 @@ impl VirtqState {
     }
 }
 
+// ── Volatile helpers for guest-shared memory ────────────────────────────
+// Guest memory is concurrently written by the guest vCPU through the
+// hypervisor's stage-2 mapping.  Normal Rust reads may be cached or
+// reordered by the compiler.  Use volatile reads + SeqCst fences to
+// ensure we always observe the latest values.
+//
+// On ARM64, fence(Acquire) compiles to `dmb ishld` (load-only barrier)
+// which does NOT guarantee that stores from the guest CPU are visible.
+// fence(SeqCst) compiles to `dmb ish` (full barrier) which ensures all
+// preceding stores from any agent are visible before subsequent loads.
+
+#[inline(always)]
+fn volatile_read_u16(memory: &[u8], offset: usize) -> u16 {
+    unsafe {
+        let ptr = memory.as_ptr().add(offset) as *const u16;
+        u16::from_le(std::ptr::read_volatile(ptr))
+    }
+}
+
+#[inline(always)]
+fn volatile_read_u32(memory: &[u8], offset: usize) -> u32 {
+    unsafe {
+        let ptr = memory.as_ptr().add(offset) as *const u32;
+        u32::from_le(std::ptr::read_volatile(ptr))
+    }
+}
+
+#[inline(always)]
+fn volatile_read_u64(memory: &[u8], offset: usize) -> u64 {
+    unsafe {
+        let ptr = memory.as_ptr().add(offset) as *const u64;
+        u64::from_le(std::ptr::read_volatile(ptr))
+    }
+}
+
 /// Read a descriptor from the descriptor table in guest memory
 pub fn read_descriptor(
     memory: &[u8],
@@ -90,10 +127,11 @@ pub fn read_descriptor(
         return None;
     }
 
-    let addr = u64::from_le_bytes(memory[offset..offset + 8].try_into().ok()?);
-    let len = u32::from_le_bytes(memory[offset + 8..offset + 12].try_into().ok()?);
-    let flags = u16::from_le_bytes(memory[offset + 12..offset + 14].try_into().ok()?);
-    let next = u16::from_le_bytes(memory[offset + 14..offset + 16].try_into().ok()?);
+    fence(Ordering::SeqCst);
+    let addr = volatile_read_u64(memory, offset);
+    let len = volatile_read_u32(memory, offset + 8);
+    let flags = volatile_read_u16(memory, offset + 12);
+    let next = volatile_read_u16(memory, offset + 14);
 
     Some((addr, len, flags, next))
 }
@@ -104,9 +142,8 @@ pub fn read_avail_idx(memory: &[u8], ram_base: u64, avail_addr: u64) -> Option<u
     if offset + 2 > memory.len() {
         return None;
     }
-    Some(u16::from_le_bytes(
-        memory[offset..offset + 2].try_into().ok()?,
-    ))
+    fence(Ordering::SeqCst);
+    Some(volatile_read_u16(memory, offset))
 }
 
 /// Read an entry from the available ring
@@ -122,9 +159,24 @@ pub fn read_avail_ring(
     if offset + 2 > memory.len() {
         return None;
     }
-    Some(u16::from_le_bytes(
-        memory[offset..offset + 2].try_into().ok()?,
-    ))
+    fence(Ordering::SeqCst);
+    Some(volatile_read_u16(memory, offset))
+}
+
+#[inline(always)]
+fn volatile_write_u16(memory: &mut [u8], offset: usize, value: u16) {
+    unsafe {
+        let ptr = memory.as_mut_ptr().add(offset) as *mut u16;
+        std::ptr::write_volatile(ptr, value.to_le());
+    }
+}
+
+#[inline(always)]
+fn volatile_write_u32(memory: &mut [u8], offset: usize, value: u32) {
+    unsafe {
+        let ptr = memory.as_mut_ptr().add(offset) as *mut u32;
+        std::ptr::write_volatile(ptr, value.to_le());
+    }
 }
 
 /// Write an entry to the used ring
@@ -143,8 +195,8 @@ pub fn write_used_ring(
         return None;
     }
 
-    memory[offset..offset + 4].copy_from_slice(&desc_id.to_le_bytes());
-    memory[offset + 4..offset + 8].copy_from_slice(&len.to_le_bytes());
+    volatile_write_u32(memory, offset, desc_id);
+    volatile_write_u32(memory, offset + 4, len);
     Some(())
 }
 
@@ -154,7 +206,9 @@ pub fn write_used_idx(memory: &mut [u8], ram_base: u64, used_addr: u64, idx: u16
     if offset + 2 > memory.len() {
         return None;
     }
-    memory[offset..offset + 2].copy_from_slice(&idx.to_le_bytes());
+    // Ensure used ring entry writes are visible before updating the index
+    fence(Ordering::Release);
+    volatile_write_u16(memory, offset, idx);
     Some(())
 }
 
@@ -164,7 +218,5 @@ pub fn read_used_idx(memory: &[u8], ram_base: u64, used_addr: u64) -> Option<u16
     if offset + 2 > memory.len() {
         return None;
     }
-    Some(u16::from_le_bytes(
-        memory[offset..offset + 2].try_into().ok()?,
-    ))
+    Some(volatile_read_u16(memory, offset))
 }

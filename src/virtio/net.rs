@@ -7,6 +7,7 @@
 use super::*;
 use crate::net::NetworkFilter;
 use crate::unet::{NetPoller, UserNet};
+use log::debug;
 
 // Virtio-net device ID
 const VIRTIO_ID_NET: u32 = 1;
@@ -383,6 +384,7 @@ impl VirtioNetDevice {
         self.queues[RX_QUEUE as usize].last_avail_idx = last_avail;
 
         if used_count > 0 {
+            debug!("[net] RX delivered {used_count} packet(s) to guest");
             write_used_idx(
                 memory,
                 ram_base,

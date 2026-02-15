@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::debug;
 /// User-space network stack (SLIRP-style NAT).
 ///
 /// Provides VM networking **without root privileges** by proxying
@@ -302,6 +303,25 @@ impl UserNet {
         let dst_ip: [u8; 4] = data[16..20].try_into().unwrap();
         let payload = &data[ihl..];
 
+        let proto_name = match protocol {
+            IP_TCP => "TCP",
+            IP_UDP => "UDP",
+            IP_ICMP => "ICMP",
+            _ => "?",
+        };
+        debug!(
+            "[net] TX {proto_name} {}.{}.{}.{}→{}.{}.{}.{} len={}",
+            src_ip[0],
+            src_ip[1],
+            src_ip[2],
+            src_ip[3],
+            dst_ip[0],
+            dst_ip[1],
+            dst_ip[2],
+            dst_ip[3],
+            data.len()
+        );
+
         match protocol {
             IP_TCP => self.handle_tcp(src_ip, dst_ip, payload),
             IP_UDP => self.handle_udp(src_ip, dst_ip, payload),
@@ -587,6 +607,10 @@ impl UserNet {
         }
 
         let dns_id = u16::from_be_bytes([payload[0], payload[1]]);
+        debug!(
+            "[net] DNS query id={dns_id} forwarding to {:?}",
+            self.host_dns
+        );
 
         // Forward DNS query to host DNS server
         if self.dns_socket.send_to(payload, self.host_dns).is_ok() {
@@ -607,6 +631,7 @@ impl UserNet {
                 continue;
             }
             let dns_id = u16::from_be_bytes([buf[0], buf[1]]);
+            debug!("[net] DNS reply id={dns_id} len={len}");
 
             if let Some(pending) = self.pending_dns.remove(&dns_id) {
                 let dns_data = &buf[..len];
@@ -743,9 +768,17 @@ impl UserNet {
     fn handle_tcp_syn(&mut self, key: TcpConnKey, guest_isn: u32, dst_ip: [u8; 4], dst_port: u16) {
         // Don't start duplicate connections
         if self.tcp_conns.contains_key(&key) || self.pending_connects.contains(&key) {
+            debug!(
+                "[net] TCP SYN to {}.{}.{}.{}:{} (duplicate, ignoring)",
+                dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
+            );
             return;
         }
 
+        debug!(
+            "[net] TCP SYN to {}.{}.{}.{}:{} — spawning connect thread",
+            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
+        );
         self.pending_connects.insert(key.clone());
 
         // Spawn a thread to connect (non-blocking from the VM loop's perspective)
@@ -787,6 +820,15 @@ impl UserNet {
 
             match cr.result {
                 Ok(stream) => {
+                    debug!(
+                        "[net] TCP connect OK to {}.{}.{}.{}:{} fd={}",
+                        cr.key.dst_ip[0],
+                        cr.key.dst_ip[1],
+                        cr.key.dst_ip[2],
+                        cr.key.dst_ip[3],
+                        cr.key.dst_port,
+                        stream.as_raw_fd()
+                    );
                     let our_isn = self.next_isn;
                     self.next_isn = self.next_isn.wrapping_add(64000);
 
@@ -828,10 +870,22 @@ impl UserNet {
                         &mss_option,
                         &mut self.ip_id,
                     );
+                    debug!(
+                        "[net] TCP SYN-ACK queued for guest port {}",
+                        cr.key.guest_port
+                    );
                     self.rx_queue.push_back(syn_ack);
                     self.tcp_conns.insert(cr.key, conn);
                 }
-                Err(_) => {
+                Err(ref e) => {
+                    debug!(
+                        "[net] TCP connect FAILED to {}.{}.{}.{}:{}: {e}",
+                        cr.key.dst_ip[0],
+                        cr.key.dst_ip[1],
+                        cr.key.dst_ip[2],
+                        cr.key.dst_ip[3],
+                        cr.key.dst_port
+                    );
                     // Connection failed — send RST
                     let rst = make_tcp_packet(
                         cr.key.dst_ip,

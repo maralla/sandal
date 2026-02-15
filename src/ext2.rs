@@ -30,9 +30,17 @@ const INODE_SIZE: usize = 128;
 const SUPERBLOCK_OFFSET: usize = 1024;
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 
+// Block group flags
+const EXT4_BG_INODE_ZEROED: u16 = 0x0004; // inode table zeroed on disk
+
 // Inode numbers
 const ROOT_INO: u32 = 2;
 const FIRST_FREE_INO: u32 = 11; // First non-reserved inode
+
+/// Essential directories that must exist in every rootfs image.
+const ESSENTIAL_DIRS: &[&str] = &[
+    "dev", "proc", "sys", "tmp", "etc", "root", "sbin", "bin", "mnt",
+];
 
 /// On-disk ext2 superblock — exact binary layout (136 bytes).
 /// All multi-byte fields stored in native little-endian order via `.to_le()`.
@@ -88,19 +96,23 @@ impl Ext2Sb {
     }
 }
 
-/// On-disk ext2 block group descriptor — exact binary layout (32 bytes).
+/// On-disk ext2/ext4 block group descriptor — exact binary layout (32 bytes).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Ext2Bgdt {
-    bg_block_bitmap: u32,      // 0
-    bg_inode_bitmap: u32,      // 4
-    bg_inode_table: u32,       // 8
-    bg_free_blocks_count: u16, // 12
-    bg_free_inodes_count: u16, // 14
-    bg_used_dirs_count: u16,   // 16
-    bg_pad: u16,               // 18
-    bg_reserved: [u8; 12],     // 20
-                               // total: 32 bytes
+    bg_block_bitmap: u32,         // 0
+    bg_inode_bitmap: u32,         // 4
+    bg_inode_table: u32,          // 8
+    bg_free_blocks_count: u16,    // 12
+    bg_free_inodes_count: u16,    // 14
+    bg_used_dirs_count: u16,      // 16
+    bg_flags: u16,                // 18
+    bg_exclude_bitmap_lo: u32,    // 20
+    bg_block_bitmap_csum_lo: u16, // 24
+    bg_inode_bitmap_csum_lo: u16, // 26
+    bg_itable_unused_lo: u16,     // 28 — inodes in group never allocated
+    bg_checksum: u16,             // 30
+                                  // total: 32 bytes
 }
 
 const _: () = assert!(size_of::<Ext2Bgdt>() == 32);
@@ -212,9 +224,11 @@ pub fn pack_directory(dir: &Path) -> Result<Vec<u8>> {
     builder.add_directory_recursive(dir, dir, ROOT_INO)?;
 
     // Ensure essential directories exist
-    for subdir in &[
-        "dev", "proc", "sys", "tmp", "etc", "root", "sbin", "bin", "usr", "usr/sbin",
-    ] {
+    for subdir in ESSENTIAL_DIRS {
+        builder.ensure_dir(ROOT_INO, subdir);
+    }
+
+    for subdir in &["usr", "usr/sbin"] {
         builder.ensure_dir(ROOT_INO, subdir);
     }
 
@@ -240,9 +254,9 @@ pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
     let blocks_per_group = total_blocks.min(MAX_BPG);
     let num_groups = total_blocks.div_ceil(blocks_per_group);
 
-    // Distribute inodes evenly across groups.
+    // Distribute inodes evenly across groups (rounded to multiple of 8 for clean bitmaps).
     let total_inodes_target = (total_blocks / 4).clamp(256, 65536);
-    let inodes_per_group = total_inodes_target.div_ceil(num_groups);
+    let inodes_per_group = ((total_inodes_target.div_ceil(num_groups) + 7) & !7).max(8);
     let num_inodes = inodes_per_group * num_groups;
     let inode_table_blocks = (inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE);
 
@@ -310,18 +324,21 @@ pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
         let used_in_group = meta_per_group + if g == 0 { 1 } else { 0 };
 
         // Write BGDT entry (32 bytes each, in primary BGDT at block 1).
+        let free_inodes = if g == 0 {
+            (inodes_per_group - (FIRST_FREE_INO as usize - 1)) as u16
+        } else {
+            inodes_per_group as u16
+        };
         (Ext2Bgdt {
             bg_block_bitmap: ((group_start + 2) as u32).to_le(),
             bg_inode_bitmap: ((group_start + 3) as u32).to_le(),
             bg_inode_table: ((group_start + 4) as u32).to_le(),
             bg_free_blocks_count: ((group_blocks - used_in_group) as u16).to_le(),
-            bg_free_inodes_count: (if g == 0 {
-                (inodes_per_group - (FIRST_FREE_INO as usize - 1)) as u16
-            } else {
-                inodes_per_group as u16
-            })
-            .to_le(),
+            bg_free_inodes_count: free_inodes.to_le(),
             bg_used_dirs_count: (if g == 0 { 1u16 } else { 0u16 }).to_le(),
+            bg_flags: EXT4_BG_INODE_ZEROED.to_le(),
+            // bg_itable_unused_lo must be 0 for plain ext2 without GDT_CSUM feature
+            bg_itable_unused_lo: 0,
             ..Default::default()
         })
         .write_to(&mut image[BLOCK_SIZE + g * 32..]);
@@ -598,7 +615,8 @@ impl Ext2Builder {
     fn build(&self) -> Result<Vec<u8>> {
         // Ensure enough free inodes for runtime file creation (wget, tmp files, etc.)
         // At least 256 extra inodes beyond what the rootfs uses
-        let num_inodes = (self.next_ino as usize + 256).max(512);
+        // Round up to a multiple of 8 so the inode bitmap has no partial-byte padding
+        let num_inodes = ((self.next_ino as usize + 256).max(512) + 7) & !7;
         let inode_table_blocks = (num_inodes * INODE_SIZE).div_ceil(BLOCK_SIZE);
         let first_data_block = 4 + inode_table_blocks; // after superblock, bgdt, bitmaps, inode table
 
@@ -616,7 +634,8 @@ impl Ext2Builder {
 
         // Add extra free space: at least 2MB (512 blocks) for temporary files, wget output, etc.
         let extra_blocks = 512.max(data_blocks_needed / 4); // 2MB or 25% of data, whichever is larger
-        let total_blocks = first_data_block + data_blocks_needed + extra_blocks;
+                                                            // Round up to a multiple of 8 so the block bitmap has no partial-byte padding
+        let total_blocks = ((first_data_block + data_blocks_needed + extra_blocks) + 7) & !7;
         let image_size = total_blocks * BLOCK_SIZE;
         let mut image = vec![0u8; image_size];
 
@@ -709,18 +728,22 @@ impl Ext2Builder {
 
     fn write_bgdt(&self, image: &mut [u8], num_inodes: usize, used_blocks: usize) {
         let total_blocks = image.len() / BLOCK_SIZE;
+        let free_inodes = (num_inodes - (self.next_ino as usize - 1)) as u16;
         (Ext2Bgdt {
             bg_block_bitmap: 2u32.to_le(),
             bg_inode_bitmap: 3u32.to_le(),
             bg_inode_table: 4u32.to_le(),
             bg_free_blocks_count: ((total_blocks - used_blocks) as u16).to_le(),
-            bg_free_inodes_count: ((num_inodes - (self.next_ino as usize - 1)) as u16).to_le(),
+            bg_free_inodes_count: free_inodes.to_le(),
             bg_used_dirs_count: (self
                 .entries
                 .values()
                 .filter(|e| e.mode & 0xF000 == S_IFDIR)
                 .count() as u16)
                 .to_le(),
+            bg_flags: EXT4_BG_INODE_ZEROED.to_le(),
+            // bg_itable_unused_lo must be 0 for plain ext2 without GDT_CSUM feature
+            bg_itable_unused_lo: 0,
             ..Default::default()
         })
         .write_to(&mut image[BLOCK_SIZE..]);
@@ -1022,6 +1045,8 @@ fn read_le32(buf: &[u8], offset: usize) -> u32 {
 struct Ext2Superblock {
     inodes_count: u32,
     blocks_count: u32,
+    blocks_per_group: u32,
+    inodes_per_group: u32,
     block_size: usize,
     inode_size: usize,
     first_ino: u32,
@@ -1048,10 +1073,17 @@ impl Ext2Superblock {
         Ok(Ext2Superblock {
             inodes_count: read_le32(sb, 0),
             blocks_count: read_le32(sb, 4),
+            blocks_per_group: read_le32(sb, 32),
+            inodes_per_group: read_le32(sb, 40),
             block_size,
             inode_size,
             first_ino: read_le32(sb, 84),
         })
+    }
+
+    /// Number of block groups in this filesystem.
+    fn num_groups(&self) -> u32 {
+        self.blocks_count.div_ceil(self.blocks_per_group)
     }
 }
 
@@ -1062,19 +1094,39 @@ struct Ext2Bgd {
     inode_table: u32,
 }
 
-impl Ext2Bgd {
+/// All block group descriptors for the filesystem.
+struct Ext2BgdTable {
+    groups: Vec<Ext2Bgd>,
+}
+
+impl Ext2BgdTable {
     fn parse(image: &[u8], sb: &Ext2Superblock) -> Result<Self> {
         // Block group descriptor table is in the block after the superblock.
         let bgdt_offset = sb.block_size; // Block 1 for 4K blocks, or block 2 for 1K blocks
-        if bgdt_offset + 32 > image.len() {
-            anyhow::bail!("Image too small for block group descriptor");
+        let num_groups = sb.num_groups() as usize;
+        if bgdt_offset + num_groups * 32 > image.len() {
+            anyhow::bail!("Image too small for block group descriptors");
         }
-        let bg = &image[bgdt_offset..];
-        Ok(Ext2Bgd {
-            block_bitmap: read_le32(bg, 0),
-            inode_bitmap: read_le32(bg, 4),
-            inode_table: read_le32(bg, 8),
-        })
+        let mut groups = Vec::with_capacity(num_groups);
+        for g in 0..num_groups {
+            let bg = &image[bgdt_offset + g * 32..];
+            groups.push(Ext2Bgd {
+                block_bitmap: read_le32(bg, 0),
+                inode_bitmap: read_le32(bg, 4),
+                inode_table: read_le32(bg, 8),
+            });
+        }
+        Ok(Ext2BgdTable { groups })
+    }
+
+    /// Get the byte offset in the image for a given inode number.
+    /// Accounts for multi-group layouts where inodes are spread across groups.
+    fn inode_offset(&self, sb: &Ext2Superblock, ino: u32) -> usize {
+        let ipg = sb.inodes_per_group as usize;
+        let idx = (ino - 1) as usize;
+        let group = idx / ipg;
+        let local_idx = idx % ipg;
+        self.groups[group].inode_table as usize * sb.block_size + local_idx * sb.inode_size
     }
 }
 
@@ -1089,12 +1141,11 @@ struct Ext2Inode {
 }
 
 impl Ext2Inode {
-    fn parse(image: &[u8], sb: &Ext2Superblock, bgd: &Ext2Bgd, ino: u32) -> Result<Self> {
+    fn parse(image: &[u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable, ino: u32) -> Result<Self> {
         if ino < 1 || ino > sb.inodes_count {
             anyhow::bail!("Inode number {} out of range (1..{})", ino, sb.inodes_count);
         }
-        let idx = (ino - 1) as usize;
-        let offset = bgd.inode_table as usize * sb.block_size + idx * sb.inode_size;
+        let offset = bgdt.inode_offset(sb, ino);
         if offset + sb.inode_size > image.len() {
             anyhow::bail!(
                 "Inode {} at offset 0x{:x} extends past image (len=0x{:x})",
@@ -1274,12 +1325,12 @@ pub struct Ext2Entry {
 }
 
 /// Walk the entire ext2 filesystem starting from root and collect all entries.
-fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<Vec<Ext2Entry>> {
+fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<Vec<Ext2Entry>> {
     let mut entries = Vec::new();
     let mut stack: Vec<(u32, String)> = vec![(ROOT_INO, String::new())];
 
     while let Some((ino, prefix)) = stack.pop() {
-        let inode = Ext2Inode::parse(image, sb, bgd, ino)?;
+        let inode = Ext2Inode::parse(image, sb, bgdt, ino)?;
         if !inode.is_dir() {
             continue;
         }
@@ -1308,7 +1359,7 @@ fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<Vec<Ext
                 format!("{}/{}", prefix, ent.name)
             };
 
-            let child_inode = Ext2Inode::parse(image, sb, bgd, ent.inode)?;
+            let child_inode = Ext2Inode::parse(image, sb, bgdt, ent.inode)?;
 
             if child_inode.is_dir() {
                 // Push directory for later traversal
@@ -1344,49 +1395,68 @@ fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<Vec<Ext
 // ── ext2 In-place Modification ──────────────────────────────────────
 
 /// Allocate a free block from the block bitmap. Returns the block number.
-fn alloc_block(image: &mut [u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<u32> {
-    let bitmap_off = bgd.block_bitmap as usize * sb.block_size;
-    let total_blocks = sb.blocks_count as usize;
+/// Scans all block groups to find a free block.
+fn alloc_block(image: &mut [u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<u32> {
+    let blocks_per_group = sb.blocks_per_group as usize;
 
-    for i in 0..total_blocks {
-        let byte = image[bitmap_off + i / 8];
-        if byte & (1 << (i % 8)) == 0 {
-            // Free block found
-            image[bitmap_off + i / 8] |= 1 << (i % 8);
-            // Update superblock free_blocks_count
-            let sb_off = SUPERBLOCK_OFFSET;
-            let old = read_le32(image, sb_off + 12);
-            write_le32(image, sb_off + 12, old.saturating_sub(1));
-            // Update bgdt free_blocks_count
-            let bgdt_off = sb.block_size;
-            let old = read_le16(image, bgdt_off + 12);
-            write_le16(image, bgdt_off + 12, old.saturating_sub(1));
-            return Ok(i as u32);
+    for (g, bgd) in bgdt.groups.iter().enumerate() {
+        let bitmap_off = bgd.block_bitmap as usize * sb.block_size;
+        let group_start = g * blocks_per_group;
+        // Last group may have fewer blocks
+        let group_blocks = if g == bgdt.groups.len() - 1 {
+            (sb.blocks_count as usize) - group_start
+        } else {
+            blocks_per_group
+        };
+
+        for i in 0..group_blocks {
+            let byte = image[bitmap_off + i / 8];
+            if byte & (1 << (i % 8)) == 0 {
+                // Free block found
+                image[bitmap_off + i / 8] |= 1 << (i % 8);
+                // Update superblock free_blocks_count
+                let sb_off = SUPERBLOCK_OFFSET;
+                let old = read_le32(image, sb_off + 12);
+                write_le32(image, sb_off + 12, old.saturating_sub(1));
+                // Update bgdt free_blocks_count for this group
+                let bgdt_off = sb.block_size + g * 32;
+                let old = read_le16(image, bgdt_off + 12);
+                write_le16(image, bgdt_off + 12, old.saturating_sub(1));
+                return Ok((group_start + i) as u32);
+            }
         }
     }
     anyhow::bail!("No free blocks in ext2 image")
 }
 
 /// Allocate a free inode from the inode bitmap. Returns the inode number.
-fn alloc_inode(image: &mut [u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<u32> {
-    let bitmap_off = bgd.inode_bitmap as usize * sb.block_size;
-    let total_inodes = sb.inodes_count as usize;
+/// Scans all block groups to find a free inode.
+fn alloc_inode(image: &mut [u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<u32> {
+    let inodes_per_group = sb.inodes_per_group as usize;
 
-    // Start from first_ino (skip reserved inodes)
-    for i in (sb.first_ino as usize - 1)..total_inodes {
-        let byte = image[bitmap_off + i / 8];
-        if byte & (1 << (i % 8)) == 0 {
-            // Free inode found
-            image[bitmap_off + i / 8] |= 1 << (i % 8);
-            // Update superblock free_inodes_count
-            let sb_off = SUPERBLOCK_OFFSET;
-            let old = read_le32(image, sb_off + 16);
-            write_le32(image, sb_off + 16, old.saturating_sub(1));
-            // Update bgdt free_inodes_count
-            let bgdt_off = sb.block_size;
-            let old = read_le16(image, bgdt_off + 14);
-            write_le16(image, bgdt_off + 14, old.saturating_sub(1));
-            return Ok((i + 1) as u32); // inodes are 1-based
+    for (g, bgd) in bgdt.groups.iter().enumerate() {
+        let bitmap_off = bgd.inode_bitmap as usize * sb.block_size;
+        // In group 0, skip reserved inodes; in other groups, start from 0
+        let start = if g == 0 { sb.first_ino as usize - 1 } else { 0 };
+
+        for i in start..inodes_per_group {
+            let byte = image[bitmap_off + i / 8];
+            if byte & (1 << (i % 8)) == 0 {
+                // Free inode found
+                image[bitmap_off + i / 8] |= 1 << (i % 8);
+                // Update superblock free_inodes_count
+                let sb_off = SUPERBLOCK_OFFSET;
+                let old = read_le32(image, sb_off + 16);
+                write_le32(image, sb_off + 16, old.saturating_sub(1));
+                // Update bgdt free_inodes_count and itable_unused for this group
+                let bgdt_off = sb.block_size + g * 32;
+                let old = read_le16(image, bgdt_off + 14);
+                write_le16(image, bgdt_off + 14, old.saturating_sub(1));
+                let old = read_le16(image, bgdt_off + 28);
+                write_le16(image, bgdt_off + 28, old.saturating_sub(1));
+                // Inode number is 1-based: group_offset + local_index + 1
+                return Ok((g * inodes_per_group + i + 1) as u32);
+            }
         }
     }
     anyhow::bail!("No free inodes in ext2 image")
@@ -1397,7 +1467,7 @@ fn alloc_inode(image: &mut [u8], sb: &Ext2Superblock, bgd: &Ext2Bgd) -> Result<u
 fn write_inode_raw(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     ino: u32,
     mode: u16,
     size: u32,
@@ -1405,8 +1475,7 @@ fn write_inode_raw(
     block_ptrs: &[u32],
     blocks_512: u32,
 ) {
-    let idx = (ino - 1) as usize;
-    let offset = bgd.inode_table as usize * sb.block_size + idx * sb.inode_size;
+    let offset = bgdt.inode_offset(sb, ino);
 
     // Zero the inode first
     for b in &mut image[offset..offset + sb.inode_size] {
@@ -1430,11 +1499,11 @@ fn write_inode_raw(
 fn dir_lookup(
     image: &[u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     dir_ino: u32,
     name: &str,
 ) -> Result<Option<u32>> {
-    let inode = Ext2Inode::parse(image, sb, bgd, dir_ino)?;
+    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
     let entries = read_dir_entries(image, sb, &inode);
     for ent in entries {
         if ent.name == name {
@@ -1450,13 +1519,13 @@ fn dir_lookup(
 fn add_dir_entry(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     dir_ino: u32,
     child_ino: u32,
     child_name: &str,
     child_ft: u8,
 ) -> Result<()> {
-    let inode = Ext2Inode::parse(image, sb, bgd, dir_ino)?;
+    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
     if !inode.is_dir() || inode.block_ptrs[0] == 0 {
         anyhow::bail!(
             "add_dir_entry: inode {} is not a directory or has no data block",
@@ -1519,27 +1588,27 @@ fn add_dir_entry(
 fn ensure_dir_path(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     path: &str,
 ) -> Result<u32> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_ino = ROOT_INO;
 
     for part in parts {
-        match dir_lookup(image, sb, bgd, current_ino, part)? {
+        match dir_lookup(image, sb, bgdt, current_ino, part)? {
             Some(child_ino) => {
                 current_ino = child_ino;
             }
             None => {
                 // Create new directory
-                let new_ino = alloc_inode(image, sb, bgd)?;
-                let data_blk = alloc_block(image, sb, bgd)?;
+                let new_ino = alloc_inode(image, sb, bgdt)?;
+                let data_blk = alloc_block(image, sb, bgdt)?;
 
                 // Write inode for new directory
                 write_inode_raw(
                     image,
                     sb,
-                    bgd,
+                    bgdt,
                     new_ino,
                     S_IFDIR | 0o755,
                     sb.block_size as u32,
@@ -1571,17 +1640,16 @@ fn ensure_dir_path(
                 dir_block[21] = b'.';
 
                 // Add entry in parent directory
-                add_dir_entry(image, sb, bgd, current_ino, new_ino, part, EXT2_FT_DIR)?;
+                add_dir_entry(image, sb, bgdt, current_ino, new_ino, part, EXT2_FT_DIR)?;
 
                 // Update parent link count
-                let parent_idx = (current_ino - 1) as usize;
-                let parent_off =
-                    bgd.inode_table as usize * sb.block_size + parent_idx * sb.inode_size;
+                let parent_off = bgdt.inode_offset(sb, current_ino);
                 let old_links = read_le16(image, parent_off + 26);
                 write_le16(image, parent_off + 26, old_links + 1);
 
-                // Update bgdt used_dirs_count
-                let bgdt_off = sb.block_size;
+                // Update bgdt used_dirs_count for the group containing new_ino
+                let ino_group = ((new_ino - 1) as usize) / (sb.inodes_per_group as usize);
+                let bgdt_off = sb.block_size + ino_group * 32;
                 let old_dirs = read_le16(image, bgdt_off + 16);
                 write_le16(image, bgdt_off + 16, old_dirs + 1);
 
@@ -1599,7 +1667,7 @@ fn ensure_dir_path(
 fn inject_file(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     path: &str,
     data: &[u8],
     perm: u16,
@@ -1613,19 +1681,19 @@ fn inject_file(
     let dir_ino = if dir_path.is_empty() {
         ROOT_INO
     } else {
-        ensure_dir_path(image, sb, bgd, &dir_path)?
+        ensure_dir_path(image, sb, bgdt, &dir_path)?
     };
 
     // Check if file already exists
-    let existing = dir_lookup(image, sb, bgd, dir_ino, file_name)?;
+    let existing = dir_lookup(image, sb, bgdt, dir_ino, file_name)?;
     if existing.is_some() {
         // Remove existing entry from directory and rewrite the new one.
         // For simplicity, we don't reclaim old blocks. Just allocate a new inode.
-        remove_dir_entry(image, sb, bgd, dir_ino, file_name)?;
+        remove_dir_entry(image, sb, bgdt, dir_ino, file_name)?;
     }
 
     // Allocate inode
-    let new_ino = alloc_inode(image, sb, bgd)?;
+    let new_ino = alloc_inode(image, sb, bgdt)?;
 
     // Allocate data blocks
     let bs = sb.block_size;
@@ -1636,7 +1704,7 @@ fn inject_file(
     };
     let mut block_nums = Vec::with_capacity(num_blocks);
     for _ in 0..num_blocks {
-        block_nums.push(alloc_block(image, sb, bgd)?);
+        block_nums.push(alloc_block(image, sb, bgdt)?);
     }
 
     // Write data to blocks
@@ -1666,7 +1734,7 @@ fn inject_file(
             inode_block_ptrs[i] = blk;
         }
         // Single indirect
-        let ind_blk = alloc_block(image, sb, bgd)?;
+        let ind_blk = alloc_block(image, sb, bgdt)?;
         inode_block_ptrs[12] = ind_blk;
         let ind_off = ind_blk as usize * bs;
         for b in &mut image[ind_off..ind_off + bs] {
@@ -1679,7 +1747,7 @@ fn inject_file(
 
         if num_blocks > 12 + ptrs_per_block {
             // Double indirect
-            let dind_blk = alloc_block(image, sb, bgd)?;
+            let dind_blk = alloc_block(image, sb, bgdt)?;
             inode_block_ptrs[13] = dind_blk;
             let dind_off = dind_blk as usize * bs;
             for b in &mut image[dind_off..dind_off + bs] {
@@ -1687,7 +1755,7 @@ fn inject_file(
             }
             let remain_blocks = &block_nums[12 + ptrs_per_block..];
             for (ci, chunk) in remain_blocks.chunks(ptrs_per_block).enumerate() {
-                let l1_blk = alloc_block(image, sb, bgd)?;
+                let l1_blk = alloc_block(image, sb, bgdt)?;
                 write_le32(image, dind_off + ci * 4, l1_blk);
                 let l1_off = l1_blk as usize * bs;
                 for b in &mut image[l1_off..l1_off + bs] {
@@ -1700,11 +1768,21 @@ fn inject_file(
         }
     }
 
-    let blocks_512 = (num_blocks * (bs / 512)) as u32;
+    // Count total blocks including indirect meta-blocks for i_blocks
+    let mut total_blocks_count = num_blocks;
+    if num_blocks > 12 {
+        total_blocks_count += 1; // single indirect block
+    }
+    if num_blocks > 12 + ptrs_per_block {
+        let remain_blocks = &block_nums[12 + ptrs_per_block..];
+        total_blocks_count += 1; // double indirect top block
+        total_blocks_count += remain_blocks.chunks(ptrs_per_block).count(); // L1 blocks
+    }
+    let blocks_512 = (total_blocks_count * (bs / 512)) as u32;
     write_inode_raw(
         image,
         sb,
-        bgd,
+        bgdt,
         new_ino,
         S_IFREG | perm,
         data.len() as u32,
@@ -1717,7 +1795,7 @@ fn inject_file(
     add_dir_entry(
         image,
         sb,
-        bgd,
+        bgdt,
         dir_ino,
         new_ino,
         file_name,
@@ -1731,7 +1809,7 @@ fn inject_file(
 fn inject_chardev(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     path: &str,
     perm: u16,
     major: u8,
@@ -1745,21 +1823,31 @@ fn inject_chardev(
     let dir_ino = if dir_path.is_empty() {
         ROOT_INO
     } else {
-        ensure_dir_path(image, sb, bgd, &dir_path)?
+        ensure_dir_path(image, sb, bgdt, &dir_path)?
     };
 
     // Skip if already exists
-    if dir_lookup(image, sb, bgd, dir_ino, dev_name)?.is_some() {
+    if dir_lookup(image, sb, bgdt, dir_ino, dev_name)?.is_some() {
         return Ok(());
     }
 
-    let new_ino = alloc_inode(image, sb, bgd)?;
+    let new_ino = alloc_inode(image, sb, bgdt)?;
 
     // Device number encoded in block_ptrs[0]
     let dev_num = ((major as u32) << 8) | (minor as u32);
-    write_inode_raw(image, sb, bgd, new_ino, S_IFCHR | perm, 0, 1, &[dev_num], 0);
+    write_inode_raw(
+        image,
+        sb,
+        bgdt,
+        new_ino,
+        S_IFCHR | perm,
+        0,
+        1,
+        &[dev_num],
+        0,
+    );
 
-    add_dir_entry(image, sb, bgd, dir_ino, new_ino, dev_name, EXT2_FT_CHRDEV)?;
+    add_dir_entry(image, sb, bgdt, dir_ino, new_ino, dev_name, EXT2_FT_CHRDEV)?;
 
     Ok(())
 }
@@ -1768,7 +1856,7 @@ fn inject_chardev(
 fn inject_symlink(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     path: &str,
     target: &str,
 ) -> Result<()> {
@@ -1780,15 +1868,15 @@ fn inject_symlink(
     let dir_ino = if dir_path.is_empty() {
         ROOT_INO
     } else {
-        ensure_dir_path(image, sb, bgd, &dir_path)?
+        ensure_dir_path(image, sb, bgdt, &dir_path)?
     };
 
     // Skip if already exists
-    if dir_lookup(image, sb, bgd, dir_ino, link_name)?.is_some() {
+    if dir_lookup(image, sb, bgdt, dir_ino, link_name)?.is_some() {
         return Ok(());
     }
 
-    let new_ino = alloc_inode(image, sb, bgd)?;
+    let new_ino = alloc_inode(image, sb, bgdt)?;
     let target_bytes = target.as_bytes();
 
     if target_bytes.len() < 60 {
@@ -1796,7 +1884,7 @@ fn inject_symlink(
         write_inode_raw(
             image,
             sb,
-            bgd,
+            bgdt,
             new_ino,
             S_IFLNK | 0o777,
             target_bytes.len() as u32,
@@ -1805,12 +1893,11 @@ fn inject_symlink(
             0,
         );
         // Write target into i_block area of the inode
-        let idx = (new_ino - 1) as usize;
-        let inode_off = bgd.inode_table as usize * sb.block_size + idx * sb.inode_size;
+        let inode_off = bgdt.inode_offset(sb, new_ino);
         image[inode_off + 40..inode_off + 40 + target_bytes.len()].copy_from_slice(target_bytes);
     } else {
         // Long symlink: target stored in a data block
-        let blk = alloc_block(image, sb, bgd)?;
+        let blk = alloc_block(image, sb, bgdt)?;
         let blk_off = blk as usize * sb.block_size;
         for b in &mut image[blk_off..blk_off + sb.block_size] {
             *b = 0;
@@ -1819,7 +1906,7 @@ fn inject_symlink(
         write_inode_raw(
             image,
             sb,
-            bgd,
+            bgdt,
             new_ino,
             S_IFLNK | 0o777,
             target_bytes.len() as u32,
@@ -1829,7 +1916,15 @@ fn inject_symlink(
         );
     }
 
-    add_dir_entry(image, sb, bgd, dir_ino, new_ino, link_name, EXT2_FT_SYMLINK)?;
+    add_dir_entry(
+        image,
+        sb,
+        bgdt,
+        dir_ino,
+        new_ino,
+        link_name,
+        EXT2_FT_SYMLINK,
+    )?;
 
     Ok(())
 }
@@ -1841,11 +1936,11 @@ fn inject_symlink(
 /// directory layout expected by the guest init script.
 pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
-    let bgd = Ext2Bgd::parse(image, &sb)?;
+    let bgdt = Ext2BgdTable::parse(image, &sb)?;
 
     // Ensure the overlayfs directories exist
-    ensure_dir_path(image, &sb, &bgd, "upper")?;
-    ensure_dir_path(image, &sb, &bgd, "work")?;
+    ensure_dir_path(image, &sb, &bgdt, "upper")?;
+    ensure_dir_path(image, &sb, &bgdt, "work")?;
 
     for entry in entries {
         let raw_path = entry.path.trim_start_matches('/');
@@ -1856,7 +1951,7 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
 
         match entry.entry_type {
             TarEntryType::Directory => {
-                ensure_dir_path(image, &sb, &bgd, &path)?;
+                ensure_dir_path(image, &sb, &bgdt, &path)?;
             }
             TarEntryType::File => {
                 let perm = if entry.mode & 0o111 != 0 {
@@ -1864,10 +1959,10 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
                 } else {
                     0o644
                 };
-                inject_file(image, &sb, &bgd, &path, &entry.data, perm)?;
+                inject_file(image, &sb, &bgdt, &path, &entry.data, perm)?;
             }
             TarEntryType::Symlink => {
-                inject_symlink(image, &sb, &bgd, &path, &entry.link_target)?;
+                inject_symlink(image, &sb, &bgdt, &path, &entry.link_target)?;
             }
         }
     }
@@ -1879,11 +1974,11 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
 fn remove_dir_entry(
     image: &mut [u8],
     sb: &Ext2Superblock,
-    bgd: &Ext2Bgd,
+    bgdt: &Ext2BgdTable,
     dir_ino: u32,
     name: &str,
 ) -> Result<()> {
-    let inode = Ext2Inode::parse(image, sb, bgd, dir_ino)?;
+    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
     if !inode.is_dir() || inode.block_ptrs[0] == 0 {
         return Ok(());
     }
@@ -1932,29 +2027,24 @@ fn remove_dir_entry(
 
 /// Inject all runtime files into a pre-built ext2 image.
 /// This adds /init, device nodes, CA certificates, entropy seeder, ctty helper.
-pub fn inject_runtime_files(
-    image: &mut [u8],
-    command: &[String],
-    network: bool,
-    use_8250_uart: bool,
-) -> Result<()> {
+pub fn inject_runtime_files(image: &mut [u8], network: bool, use_8250_uart: bool) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
-    let bgd = Ext2Bgd::parse(image, &sb)?;
+    let bgdt = Ext2BgdTable::parse(image, &sb)?;
 
     // Ensure essential directories
-    for dir in &["dev", "proc", "sys", "tmp", "etc", "root", "sbin", "bin"] {
-        ensure_dir_path(image, &sb, &bgd, dir)?;
+    for dir in ESSENTIAL_DIRS {
+        ensure_dir_path(image, &sb, &bgdt, dir)?;
     }
 
     // Device nodes
-    inject_chardev(image, &sb, &bgd, "dev/console", 0o666, 5, 1)?;
-    inject_chardev(image, &sb, &bgd, "dev/null", 0o666, 1, 3)?;
-    inject_chardev(image, &sb, &bgd, "dev/zero", 0o666, 1, 5)?;
-    inject_chardev(image, &sb, &bgd, "dev/tty", 0o666, 5, 0)?;
+    inject_chardev(image, &sb, &bgdt, "dev/console", 0o666, 5, 1)?;
+    inject_chardev(image, &sb, &bgdt, "dev/null", 0o666, 1, 3)?;
+    inject_chardev(image, &sb, &bgdt, "dev/zero", 0o666, 1, 5)?;
+    inject_chardev(image, &sb, &bgdt, "dev/tty", 0o666, 5, 0)?;
     if use_8250_uart {
-        inject_chardev(image, &sb, &bgd, "dev/ttyS0", 0o666, 4, 64)?;
+        inject_chardev(image, &sb, &bgdt, "dev/ttyS0", 0o666, 4, 64)?;
     } else {
-        inject_chardev(image, &sb, &bgd, "dev/ttyAMA0", 0o666, 204, 64)?;
+        inject_chardev(image, &sb, &bgdt, "dev/ttyAMA0", 0o666, 204, 64)?;
     }
 
     // CA certificates
@@ -1963,7 +2053,7 @@ pub fn inject_runtime_files(
             inject_file(
                 image,
                 &sb,
-                &bgd,
+                &bgdt,
                 "etc/ssl/certs/ca-certificates.crt",
                 &ca_data,
                 0o644,
@@ -1972,52 +2062,60 @@ pub fn inject_runtime_files(
     }
 
     // Ctty helper binary
-    let ctty_bin = initramfs::generate_ctty_helper();
-    inject_file(image, &sb, &bgd, "usr/sbin/sandal-ctty", &ctty_bin, 0o755)?;
-
-    // Snapshot signal helper binary (BRK-based)
-    let signal_bin = initramfs::generate_signal_helper();
     inject_file(
         image,
         &sb,
-        &bgd,
+        &bgdt,
+        "usr/sbin/sandal-ctty",
+        initramfs::ctty_helper(),
+        0o755,
+    )?;
+
+    // Snapshot signal helper binary (BRK-based)
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
         "usr/sbin/sandal-signal",
-        &signal_bin,
+        initramfs::signal_helper(),
         0o755,
     )?;
 
     // Export helpers: resize + done BRK binaries, and the sandal-export script
-    let export_resize_bin = initramfs::generate_export_resize_helper();
     inject_file(
         image,
         &sb,
-        &bgd,
+        &bgdt,
         "usr/sbin/sandal-export-resize",
-        &export_resize_bin,
+        initramfs::export_resize_helper(),
         0o755,
     )?;
-    let export_done_bin = initramfs::generate_export_done_helper();
     inject_file(
         image,
         &sb,
-        &bgd,
+        &bgdt,
         "usr/sbin/sandal-export-done",
-        &export_done_bin,
+        initramfs::export_done_helper(),
         0o755,
     )?;
     let export_script = initramfs::generate_export_script();
     inject_file(
         image,
         &sb,
-        &bgd,
+        &bgdt,
         "usr/sbin/sandal-export",
         export_script.as_bytes(),
         0o755,
     )?;
 
-    // /init script
-    let init_script = initramfs::generate_init_script_ext(command, network);
-    inject_file(image, &sb, &bgd, "init", init_script.as_bytes(), 0o755)?;
+    // /init binary (compiled ARM64 ELF)
+    let tty_device = if use_8250_uart {
+        "/dev/ttyS0"
+    } else {
+        "/dev/ttyAMA0"
+    };
+    let init_binary = crate::init::init_binary(tty_device);
+    inject_file(image, &sb, &bgdt, "init", init_binary, 0o755)?;
 
     Ok(())
 }
@@ -2028,9 +2126,9 @@ pub fn inject_runtime_files(
 /// archive suitable for loading as initramfs.
 pub fn ext2_to_cpio(image: &[u8]) -> Result<Vec<u8>> {
     let sb = Ext2Superblock::parse(image)?;
-    let bgd = Ext2Bgd::parse(image, &sb)?;
+    let bgdt = Ext2BgdTable::parse(image, &sb)?;
 
-    let entries = walk_ext2(image, &sb, &bgd)?;
+    let entries = walk_ext2(image, &sb, &bgdt)?;
 
     let mut archive = Vec::new();
     let mut ino: u32 = 300000;

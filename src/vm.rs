@@ -130,20 +130,24 @@ pub struct VmInstance {
     memory_size: usize,
     uart_type: UartType,
     kernel_entry: u64,
-    initrd_info: Option<(u64, u64)>,       // (start GPA, end GPA)
-    exit_code: Option<i32>,                // Set when guest signals exit via UART marker
-    boot_complete: bool,                   // Set once kernel finishes booting and init runs
-    boot_complete_iter: u64,               // Iteration at which boot_complete became true
-    command_injected: bool, // Set once the command has been sent to the guest via UART
-    pending_mount_setup: Option<String>, // Mount setup line to inject before command
-    pending_command: Option<String>, // Shell-escaped command line to inject after BOOT_MARKER
+    initrd_info: Option<(u64, u64)>, // (start GPA, end GPA)
+    exit_code: Option<i32>,          // Set when guest signals exit via UART marker
+    boot_complete: bool,             // Set once kernel finishes booting and init runs
+    boot_complete_iter: u64,         // Iteration at which boot_complete became true
+    command_injected: bool,          // Set once config has been sent to the guest
+    // Init config fields for the compiled init binary (BRK #INIT_CONFIG protocol)
+    init_disk_mode: Option<String>,        // "disk" or None
+    init_shares: Vec<(String, String)>,    // virtiofs (tag, guest_path) pairs
+    init_command: Vec<String>,             // command argv
+    init_network: bool,                    // whether to set up networking
+    init_config_injected: bool,            // set once config blob pushed via INIT_CONFIG
+    forward_output: bool, // set by BRK #INIT_READY — start forwarding UART TX to stdout
     snapshot_save_path: Option<PathBuf>, // If set, save snapshot after boot
     snapshot_fingerprint: u64, // Fingerprint for the snapshot file
-    snapshot_pending: u32,  // Flag: set to 1 by BRK handler to trigger snapshot save
+    snapshot_pending: u32, // Flag: set to 1 by BRK handler to trigger snapshot save
     restored_cpu_state: Option<CpuState>, // If set, restore these registers instead of boot state
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
-    is_restored: bool,      // True if VM was restored from a snapshot
-    uart_line_buf: String,  // Buffer for current line being received
+    uart_line_buf: String, // Buffer for current line being received
     uart_suppress_line: bool, // True if rest of line is suppressed (kernel/marker)
     uart_rx_buf: VecDeque<u8>, // Buffered stdin data for the guest to read (shared by both UART types)
     network_enabled: bool,
@@ -255,10 +259,14 @@ impl VmInstance {
 
     /// Update the GIC SPI level for PL011 based on current MIS.
     /// Must be called whenever RIS or IMSC changes.
-    fn pl011_update_irq(&self) {
+    fn pl011_update_irq(&mut self) {
         if let UartType::PL011(ref state) = self.uart_type {
             let mis = self.pl011_ris() & state.imsc;
-            Vm::set_gic_spi(UART_SPI, mis != 0);
+            if mis != 0 {
+                Vm::set_gic_spi(UART_SPI, true);
+            } else {
+                Vm::set_gic_spi(UART_SPI, false);
+            }
         }
     }
 
@@ -284,14 +292,17 @@ impl VmInstance {
             boot_complete: false,
             boot_complete_iter: 0,
             command_injected: false,
-            pending_mount_setup: None,
-            pending_command: None,
+            init_disk_mode: None,
+            init_shares: Vec::new(),
+            init_command: Vec::new(),
+            init_network: false,
+            init_config_injected: false,
+            forward_output: false,
             snapshot_save_path: None,
             snapshot_fingerprint: 0,
             snapshot_pending: 0,
             restored_cpu_state: None,
             gic_state_to_restore: None,
-            is_restored: false,
             uart_line_buf: String::new(),
             uart_suppress_line: false,
             uart_rx_buf: VecDeque::new(),
@@ -917,15 +928,13 @@ impl VmInstance {
                             // BRK - breakpoint/semihosting/snapshot signal
                             let imm = iss & 0xFFFF;
                             if imm == initramfs::SNAPSHOT_SIGNAL_IMM as u64 {
-                                // Snapshot-ready signal from sandal-signal.
+                                // Snapshot-ready signal from init binary.
                                 // The guest is in EL0 with IRQs enabled and
                                 // no kernel locks — advance past BRK and
                                 // trigger snapshot save in this iteration.
                                 vcpu.write_register(HvReg::Pc, pc + 4)?;
-                                if self.boot_complete
-                                    && !self.command_injected
-                                    && self.snapshot_save_path.is_some()
-                                {
+                                self.boot_complete = true;
+                                if !self.init_config_injected && self.snapshot_save_path.is_some() {
                                     debug!("Snapshot-ready BRK signal received from guest");
                                     self.snapshot_pending = 1;
                                 }
@@ -937,6 +946,22 @@ impl VmInstance {
                                 // Export done: read tar from /dev/vdb, gzip, save as .layer.
                                 vcpu.write_register(HvReg::Pc, pc + 4)?;
                                 self.handle_export_done();
+                            } else if imm == initramfs::INIT_CONFIG_IMM as u64 {
+                                // Init config request: the init binary asks
+                                // for its runtime configuration (disk mode,
+                                // virtiofs mounts, command argv, etc.).
+                                // Build the config blob and push it into the
+                                // UART RX buffer for the guest to read.
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
+                                self.handle_init_config(&vcpu)?;
+                            } else if imm == initramfs::INIT_READY_IMM as u64 {
+                                // Init ready: the init binary has finished
+                                // processing the config blob and is about to
+                                // fork+exec the user command.  Start
+                                // forwarding UART TX to stdout now.
+                                vcpu.write_register(HvReg::Pc, pc + 4)?;
+                                self.forward_output = true;
+                                debug!("Init ready — forwarding UART output to stdout");
                             } else if imm == 0xF000 {
                                 // ARM semihosting
                                 let op = vcpu.read_register(HvReg::X0)?;
@@ -993,6 +1018,23 @@ impl VmInstance {
                 }
             }
 
+            // ── Poll virtio-blk queues for missed requests ──────────
+            // The guest CPU writes to the avail ring then writes to
+            // QueueNotify (MMIO).  In rare cases the avail-ring store
+            // is not yet visible when the VMM reads it at QueueNotify
+            // time.  Polling here catches any such deferred writes on
+            // every subsequent vCPU exit.
+            if let Some(ref mut blk) = self.virtio_blk {
+                if blk.poll_pending(&mut self.memory, RAM_BASE) {
+                    Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
+                }
+            }
+            if let Some(ref mut dev) = self.data_blk {
+                if dev.poll_pending(&mut self.memory, RAM_BASE) {
+                    Vm::set_gic_spi(DATA_BLK_SPI, true);
+                }
+            }
+
             // ── Guest-cooperative snapshot trigger ─────────────────
             // The init script runs sandal-signal which executes
             // BRK #0x5D1 from userspace right before `read`.  The
@@ -1000,9 +1042,9 @@ impl VmInstance {
             // — in the same iteration, before the next vcpu.run() —
             // so the guest state is exactly: EL0, IRQs enabled, no
             // kernel locks, PC right after the BRK instruction.
-            if self.snapshot_pending > 0 && self.boot_complete && !self.command_injected {
+            if self.snapshot_pending > 0 && self.boot_complete && !self.init_config_injected {
                 self.snapshot_pending = 0;
-                self.save_snapshot_and_inject(&vcpu, &trc)?;
+                self.save_snapshot(&vcpu, &trc)?;
             }
 
             // Poll stdin for input and buffer it for the guest UART.
@@ -1155,30 +1197,8 @@ impl VmInstance {
             return; // Don't forward to stdout
         }
 
-        // Detect boot completion — the init script prints this marker
-        // right before reading the command from the UART.
-        // Skip on restored VMs: boot is already complete and the command
-        // has been injected.  Without this guard, user command output that
-        // happens to contain BOOT_MARKER would re-trigger inject_command
-        // (harmless but wasteful) and log misleading messages.
-        if !self.is_restored && trimmed.contains(initramfs::BOOT_MARKER) {
-            self.boot_complete = true;
-            // boot_complete_iter is set by the caller (run_command) after calling process_uart_line
-            debug!("{trimmed}");
-
-            if self.snapshot_save_path.is_some() {
-                // The init script runs sandal-signal which executes
-                // BRK #0x5D1.  The VMM traps the BRK from EL0 and
-                // saves the snapshot in the same iteration.
-                debug!("BOOT_MARKER detected, waiting for BRK snapshot signal");
-            } else {
-                // No snapshot saving; inject the command immediately.
-                self.inject_command();
-            }
-            return;
-        }
-
-        // Before boot is complete: only show in debug mode
+        // Before boot is complete: only show in debug mode.
+        // Boot completion is signaled by BRK #SNAPSHOT_SIGNAL or BRK #INIT_CONFIG.
         if !self.boot_complete {
             debug!("{trimmed}");
         }
@@ -1187,39 +1207,49 @@ impl VmInstance {
         // by the UART write handler, so nothing more to print here.
     }
 
-    /// Inject the pending command into the UART RX buffer so the guest
-    /// init script's `read` call receives it.
-    fn inject_command(&mut self) {
-        if self.command_injected {
-            return;
+    /// Handle BRK #INIT_CONFIG: build the config blob and push it into the
+    /// UART RX buffer.  Sets x0 = blob size so the guest knows how much to read.
+    fn handle_init_config(&mut self, vcpu: &Vcpu) -> Result<()> {
+        if self.init_config_injected {
+            return Ok(());
         }
-        if let Some(mount_setup) = self.pending_mount_setup.take() {
-            // Line 1: mount setup commands (may be empty)
-            debug!("Injecting mount setup via UART: {mount_setup}");
-            for byte in mount_setup.as_bytes() {
-                self.uart_rx_buf.push_back(*byte);
-            }
-            self.uart_rx_buf.push_back(b'\n');
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let blob = initramfs::build_init_config(
+            self.init_disk_mode.as_deref(),
+            &self.init_shares,
+            &self.init_command,
+            self.init_network,
+            now,
+        );
+        debug!(
+            "Pushing init config blob ({} bytes): disk={:?}, shares={}, argv={}, net={}",
+            blob.len(),
+            self.init_disk_mode,
+            self.init_shares.len(),
+            self.init_command.len(),
+            self.init_network,
+        );
+        let blob_len = blob.len() as u64;
+        for byte in &blob {
+            self.uart_rx_buf.push_back(*byte);
         }
-        if let Some(cmd_line) = self.pending_command.take() {
-            // Line 2: the actual command
-            debug!("Injecting command via UART: {cmd_line}");
-            for byte in cmd_line.as_bytes() {
-                self.uart_rx_buf.push_back(*byte);
-            }
-            self.uart_rx_buf.push_back(b'\n');
-            self.command_injected = true;
-        }
+        vcpu.write_register(HvReg::X0, blob_len)?;
+        self.init_config_injected = true;
+        self.boot_complete = true;
+        self.command_injected = true; // Enable stdin polling
+        Ok(())
     }
 
-    /// Save snapshot to disk and inject the pending command into the UART.
+    /// Save snapshot to disk.
     /// Called when the guest signals snapshot-ready via BRK #0x5D1.
-    fn save_snapshot_and_inject(&mut self, vcpu: &Vcpu, trc: &Instant) -> Result<()> {
+    fn save_snapshot(&mut self, vcpu: &Vcpu, trc: &Instant) -> Result<()> {
         let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
         debug!("Saving snapshot (PC=0x{pc:x})");
 
         let Some(ref save_path) = self.snapshot_save_path.clone() else {
-            self.inject_command();
             return Ok(());
         };
 
@@ -1227,7 +1257,6 @@ impl VmInstance {
         let device_state = self.capture_device_state();
         if device_state.gic_state.is_none() {
             warn!("Skipping snapshot save: GIC state not available (macOS 15.0+ required)");
-            self.inject_command();
             return Ok(());
         }
 
@@ -1269,11 +1298,12 @@ impl VmInstance {
             Err(e) => warn!("Failed to save snapshot: {e}"),
         }
         debug!(
-            "[bench] snapshot+disk: {:.1}ms, inject_command at: {:.0}ms",
+            "[bench] snapshot+disk: {:.1}ms, save at: {:.0}ms",
             t_total.elapsed().as_secs_f64() * 1000.0,
             trc.elapsed().as_secs_f64() * 1000.0,
         );
-        self.inject_command();
+        // No inject_command here — the init binary will request config
+        // via BRK #INIT_CONFIG after resuming from snapshot.
         Ok(())
     }
 
@@ -1505,12 +1535,14 @@ impl VmInstance {
                     if ch.is_ascii() || ch == b'\n' || ch == b'\r' {
                         self.uart_line_buf.push(ch as char);
 
-                        // After boot: write each character directly to stdout
-                        // so interactive echo and prompts appear immediately.
-                        // Kernel console messages are already suppressed via
-                        // the "quiet" boot parameter.  We only need to filter
-                        // the exit marker here.
-                        if self.boot_complete && !self.uart_suppress_line {
+                        // After init ready: write each character directly to
+                        // stdout so interactive echo and prompts appear
+                        // immediately.  Kernel console messages and the
+                        // config blob echo are suppressed because
+                        // forward_output is only set by BRK #INIT_READY,
+                        // which fires after the init binary has finished
+                        // reading and processing the config.
+                        if self.forward_output && !self.uart_suppress_line {
                             let buf_len = self.uart_line_buf.len();
                             let buf_bytes = self.uart_line_buf.as_bytes();
                             // Check if the current buffer is a prefix of any
@@ -1769,8 +1801,9 @@ impl VmInstance {
                 if is_write {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = blk.mmio_write(offset, value) {
-                        // QueueNotify — process the request and complete it
-                        if blk.process_queue(&mut self.memory, RAM_BASE) {
+                        // QueueNotify — process the request and complete it.
+                        blk.process_queue(&mut self.memory, RAM_BASE);
+                        if blk.interrupt_status != 0 {
                             Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
                         }
                     }
@@ -1792,7 +1825,9 @@ impl VmInstance {
                 if is_write {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = dev.mmio_write(offset, value) {
-                        if dev.process_queue(&mut self.memory, RAM_BASE) {
+                        // QueueNotify — process the request and complete it.
+                        dev.process_queue(&mut self.memory, RAM_BASE);
+                        if dev.interrupt_status != 0 {
                             Vm::set_gic_spi(DATA_BLK_SPI, true);
                         }
                     }
@@ -2158,7 +2193,7 @@ pub fn run(args: Args) -> Result<()> {
 
     {
         // Inject runtime files (/init, device nodes, CA certs, etc.)
-        ext2::inject_runtime_files(&mut disk_image, &args.command, network_enabled, use_8250)
+        ext2::inject_runtime_files(&mut disk_image, network_enabled, use_8250)
             .context("Failed to inject runtime files into ext2 image")?;
 
         if prefer_virtio_blk {
@@ -2191,37 +2226,30 @@ pub fn run(args: Args) -> Result<()> {
     // Always create a second virtio-blk device so the kernel probes /dev/vdb
     // during cold boot.  This ensures the same snapshot works regardless of
     // whether --disk-size or --layer is specified on subsequent warm restores.
-    // Cold boot always uses a 1MB stub — layers and disk-size are applied
-    // post-snapshot on warm restore.
+    // On warm restore the data_blk is replaced with fresh layer/disk content
+    // and a config change SPI is fired to notify the kernel of the new capacity.
     {
-        let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
-        let disk_image = ext2::create_empty_ext2(data_blk_bytes)?;
+        let disk_image = build_data_disk(&args.layers, args.disk_size)?;
         vm.data_blk = Some(VirtioBlkDevice::new(disk_image));
-        if let Some(mb) = args.disk_size {
-            info!("Created {}MB overlay disk (/dev/vdb)", mb);
-        }
     }
 
     // Load kernel (this also builds the device tree, which needs initrd info)
     vm.load_kernel(&kernel_data)?;
 
-    // Determine disk mode for the init script.
-    // When both --layer and --disk-size are given, layers are merged into
-    // the ext2 disk on the host side, so the guest sees mode = "disk".
-    let disk_mode = if args.disk_size.is_some() {
+    // Determine disk mode for the init binary.
+    // With the compiled init, layer-only mode is converted to ext2 on the host
+    // side, so the guest always sees either "disk" (ext2) or nothing (tmpfs).
+    let disk_mode = if args.disk_size.is_some() || !args.layers.is_empty() {
         Some("disk")
-    } else if !args.layers.is_empty() {
-        Some("layer")
     } else {
         None
     };
 
-    // Set mount setup + command to be injected via UART after BOOT_MARKER.
-    // The init script reads two lines: mount setup, then the command.
-    let mount_setup = initramfs::build_mount_setup_line(&shares, disk_mode);
-    vm.pending_mount_setup = Some(mount_setup);
-    let cmd_line = initramfs::build_command_line(&args.command);
-    vm.pending_command = Some(cmd_line.clone());
+    // Store init config for the BRK #INIT_CONFIG hypercall handler.
+    vm.init_disk_mode = disk_mode.map(|s| s.to_string());
+    vm.init_shares = shares.clone();
+    vm.init_command = args.command.clone();
+    vm.init_network = network_enabled;
 
     // Compute fingerprint for snapshot caching.
     // Uses content-based hashing (first/last 4KB) — same as the fast
@@ -2239,7 +2267,7 @@ pub fn run(args: Args) -> Result<()> {
 
     if !args.no_cache {
         // Enable snapshot save when the snapshot doesn't already exist.
-        // Virtiofs is supported: the mount is deferred to after BOOT_MARKER,
+        // Virtiofs is supported: the mount is deferred to after BRK #INIT_CONFIG,
         // so no FUSE session is active at snapshot time.  On restore, fresh
         // VirtioFsDevice instances are created from --share args.
         if let Ok(snap_path) = snapshot::snapshot_path(fingerprint) {
@@ -2247,6 +2275,9 @@ pub fn run(args: Args) -> Result<()> {
                 vm.snapshot_save_path = Some(snap_path);
             }
         }
+        // Cold boot means no valid snapshot was found — clean up stale
+        // snapshots from previous cache versions so they don't pile up.
+        snapshot::gc_stale_snapshots(fingerprint);
     }
 
     // Run the VM
@@ -2501,24 +2532,16 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         t1.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Determine disk mode for the init script.
-    //
-    // When both --layer and --disk-size are specified, we merge layers into
-    // the ext2 disk on the host side, so the guest sees a plain ext2 disk
-    // (mode = "disk") with the layer contents pre-populated.
+    // Determine disk mode for the init binary.
+    // With the compiled init, layer-only mode is converted to ext2 on the host
+    // side, so the guest always sees either "disk" (ext2) or nothing (tmpfs).
     let has_layers = !args.layers.is_empty();
     let has_disk_size = args.disk_size.is_some();
-    let disk_mode = if has_disk_size {
+    let disk_mode = if has_disk_size || has_layers {
         Some("disk")
-    } else if has_layers {
-        Some("layer")
     } else {
         None
     };
-
-    // Build mount setup + command line to inject via UART
-    let mount_setup = initramfs::build_mount_setup_line(&shares, disk_mode);
-    let cmd_line = initramfs::build_command_line(&args.command);
 
     // Build the VmInstance struct with restored state
     let mut vm = VmInstance {
@@ -2532,14 +2555,17 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         boot_complete: true, // Already booted
         boot_complete_iter: 0,
         command_injected: false,
-        pending_mount_setup: Some(mount_setup),
-        pending_command: Some(cmd_line),
+        init_disk_mode: disk_mode.map(|s| s.to_string()),
+        init_shares: shares.clone(),
+        init_command: args.command.clone(),
+        init_network: network_enabled,
+        init_config_injected: false,
+        forward_output: false, // Set by BRK #INIT_READY after config processing
         snapshot_save_path: None,
         snapshot_fingerprint: fingerprint,
         snapshot_pending: 0,
         restored_cpu_state: Some(snapshot_cpu_state),
         gic_state_to_restore: snapshot_device_state.gic_state,
-        is_restored: true,
         uart_line_buf: String::new(),
         uart_suppress_line: false,
         uart_rx_buf: VecDeque::new(),
@@ -2557,68 +2583,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
     // Restore second virtio-blk device (overlay disk).  The disk data is
     // ephemeral (fresh ext2 on every run), but the MMIO state must match
     // what the kernel's driver saw during cold boot.
-    //
-    // Four modes:
-    //   --disk-size N + --layer: merge layers into N MB ext2 disk (or larger)
-    //   --disk-size N:           create an N MB ext2 disk
-    //   --layer:                 load raw .layer (tar.gz) bytes into vdb
-    //   (neither):               1 MB stub, init script uses tmpfs overlay
     {
-        let disk_image = if has_layers && has_disk_size {
-            // Both: parse layers, choose disk size = max(disk_size, layer needs + headroom),
-            // create ext2, inject layer content.
-            let mut all_entries = Vec::new();
-            for layer_path in &args.layers {
-                let gz_data = std::fs::read(layer_path).with_context(|| {
-                    format!("Failed to read layer file: {}", layer_path.display())
-                })?;
-                info!(
-                    "Loading layer: {} ({} bytes)",
-                    layer_path.display(),
-                    gz_data.len()
-                );
-                let entries = tar::read_tar_gz(&gz_data)
-                    .with_context(|| format!("Failed to parse layer: {}", layer_path.display()))?;
-                all_entries.extend(entries);
-            }
-            let layer_data_size = tar::total_data_size(&all_entries);
-            // Headroom: layer data * 2 (for ext2 metadata + free space), minimum 16 MB
-            let layer_need_bytes = ((layer_data_size * 2) + 16 * 1024 * 1024).max(16 * 1024 * 1024);
-            let disk_size_bytes = args.disk_size.unwrap() * 1024 * 1024;
-            let final_size = disk_size_bytes.max(layer_need_bytes);
-            info!(
-                "Creating {}MB disk with {} layer entries (layer data: {} bytes)",
-                final_size / (1024 * 1024),
-                all_entries.len(),
-                layer_data_size,
-            );
-            let mut image = ext2::create_empty_ext2(final_size)?;
-            ext2::inject_tar_entries(&mut image, &all_entries)?;
-            image
-        } else if has_layers {
-            // Layer-only: load raw layer tar.gz bytes as the block device content.
-            // The guest init script detects the gzip magic and extracts it.
-            let mut layer_data = Vec::new();
-            for layer_path in &args.layers {
-                let data = std::fs::read(layer_path).with_context(|| {
-                    format!("Failed to read layer file: {}", layer_path.display())
-                })?;
-                info!(
-                    "Loading layer: {} ({} bytes)",
-                    layer_path.display(),
-                    data.len()
-                );
-                layer_data = data; // Last layer wins (TODO: support stacking)
-            }
-            // Pad to 512-byte boundary (block device alignment)
-            let padded_len = (layer_data.len() + 511) & !511;
-            layer_data.resize(padded_len, 0);
-            layer_data
-        } else {
-            let data_blk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
-            ext2::create_empty_ext2(data_blk_bytes)?
-        };
-
+        let disk_image = build_data_disk(&args.layers, args.disk_size)?;
         let mut device = VirtioBlkDevice::new(disk_image);
 
         // Restore MMIO state from snapshot so the kernel driver stays consistent
@@ -2670,12 +2636,8 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         }
     }
 
-    // Inject the command into the UART RX buffer.  The snapshot was
-    // taken in userspace (EL0) at the BRK instruction — no kernel
-    // locks are held and IRQs are enabled.  On resume the guest's
-    // sandal-signal process exits, the shell continues to `read`,
-    // and the UART driver finds the injected data via normal MMIO reads.
-    vm.inject_command();
+    // No inject_command here — the init binary will request config
+    // via BRK #INIT_CONFIG after resuming from snapshot.
 
     debug!(
         "Snapshot restored in {:.2}ms",
@@ -2687,4 +2649,52 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
 
     debug!("VM exited with code: {exit_code}");
     std::process::exit(exit_code);
+}
+
+/// Build the data disk (overlay /dev/vdb) from layers and/or --disk-size.
+///
+/// Four modes:
+///   --disk-size N + --layer: merge layers into N MB ext2 disk (or larger)
+///   --disk-size N:           create an N MB ext2 disk
+///   --layer:                 create an ext2 disk sized to fit layer content
+///   (neither):               1 MB stub
+fn build_data_disk(layers: &[PathBuf], disk_size: Option<usize>) -> Result<Vec<u8>> {
+    let has_layers = !layers.is_empty();
+    let has_disk_size = disk_size.is_some();
+
+    if has_layers {
+        let mut all_entries = Vec::new();
+        for layer_path in layers {
+            let gz_data = std::fs::read(layer_path)
+                .with_context(|| format!("Failed to read layer file: {}", layer_path.display()))?;
+            info!(
+                "Loading layer: {} ({} bytes)",
+                layer_path.display(),
+                gz_data.len()
+            );
+            let entries = tar::read_tar_gz(&gz_data)
+                .with_context(|| format!("Failed to parse layer: {}", layer_path.display()))?;
+            all_entries.extend(entries);
+        }
+        let layer_data_size = tar::total_data_size(&all_entries);
+        let layer_need_bytes = ((layer_data_size * 2) + 16 * 1024 * 1024).max(16 * 1024 * 1024);
+        let final_size = if has_disk_size {
+            let disk_size_bytes = disk_size.unwrap() * 1024 * 1024;
+            disk_size_bytes.max(layer_need_bytes)
+        } else {
+            layer_need_bytes
+        };
+        info!(
+            "Creating {}MB disk with {} layer entries (layer data: {} bytes)",
+            final_size / (1024 * 1024),
+            all_entries.len(),
+            layer_data_size,
+        );
+        let mut image = ext2::create_empty_ext2(final_size)?;
+        ext2::inject_tar_entries(&mut image, &all_entries)?;
+        Ok(image)
+    } else {
+        let data_blk_bytes = disk_size.unwrap_or(1) * 1024 * 1024;
+        ext2::create_empty_ext2(data_blk_bytes)
+    }
 }

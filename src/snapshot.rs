@@ -540,6 +540,10 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
 ///
 /// Both `kernel_fingerprint` and `rootfs_fingerprint` should be produced
 /// by [`hash_file_content`].
+/// Bump this version whenever the snapshot format or the init binary changes
+/// to automatically invalidate stale caches.
+const SNAPSHOT_CACHE_VERSION: u32 = 10;
+
 pub fn compute_fingerprint(
     kernel_fingerprint: u64,
     rootfs_fingerprint: u64,
@@ -548,6 +552,7 @@ pub fn compute_fingerprint(
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
 
+    SNAPSHOT_CACHE_VERSION.hash(&mut hasher);
     kernel_fingerprint.hash(&mut hasher);
     rootfs_fingerprint.hash(&mut hasher);
 
@@ -577,6 +582,29 @@ pub fn snapshot_path(fingerprint: u64) -> Result<PathBuf> {
 pub fn disk_image_path(fingerprint: u64) -> Result<PathBuf> {
     let dir = snapshot_cache_dir()?;
     Ok(dir.join(format!("snap-{fingerprint:016x}.disk")))
+}
+
+/// Remove all snapshot files in the cache directory whose fingerprint
+/// does not match `keep_fingerprint`.  This cleans up stale snapshots
+/// left behind when the cache version or inputs change.
+pub fn gc_stale_snapshots(keep_fingerprint: u64) {
+    let dir = match snapshot_cache_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let keep_suffix = format!("{keep_fingerprint:016x}");
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("snap-") && !name.contains(&keep_suffix) {
+            debug!("Removing stale snapshot: {}", entry.path().display());
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 // ── Binary reader / writer helpers ────────────────────────────────────

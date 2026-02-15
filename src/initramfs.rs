@@ -5,110 +5,21 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
-use std::time::SystemTime;
 
 use crate::elf::arm64::*;
+use crate::elf::linux::*;
 use crate::elf::ElfBuilder;
 
-/// Marker printed by the init script before shutdown.
+/// Marker printed by the init binary before shutdown.
 /// The VM run loop looks for this to extract the exit code.
 pub const EXIT_MARKER: &str = "SANDAL_EXIT:";
 
-/// Marker printed by the init script once boot is complete and just
-/// before running the user command.  The VM loop detects this to switch
-/// from suppressed (pre-boot) output to direct character output.
-pub const BOOT_MARKER: &str = "SANDAL_BOOT_COMPLETE";
-
 /// Mount point and device path constants.
 pub const MNT_LOWER: &str = "/mnt/lower"; // bind-mount of the original root
-pub const MNT_OVL: &str = "/mnt/overlay"; // final overlay mount (becomes new root)
+pub const MNT_OVERLAY: &str = "/mnt/overlay"; // final overlay mount (becomes new root)
 pub const MNT_TMP: &str = "/mnt/tmpupper"; // tmpfs-backed upper (layer + default)
 pub const MNT_DISK: &str = "/mnt/diskupper"; // ext2-backed upper (disk mode)
 pub const DATA_DEV: &str = "/dev/vdb"; // secondary virtio-blk device
-
-/// Public version of init script generator for use by ext2 builder.
-pub fn generate_init_script_ext(command: &[String], network: bool) -> String {
-    generate_init_script(command, network)
-}
-
-/// Generate the /init shell script that runs inside the VM.
-/// It mounts essential filesystems, reads the command from the host
-/// via UART, prints an exit marker, and powers off.
-///
-/// The command is NOT baked into the script. Instead, after boot setup
-/// completes and BOOT_MARKER is printed, the script reads a single line
-/// from stdin (the UART). The host injects the shell-escaped command
-/// into the UART RX buffer after detecting BOOT_MARKER.
-/// This decoupling enables VM snapshots: the same booted state can
-/// run different commands by injecting different UART input on restore.
-fn generate_init_script(_command: &[String], network: bool) -> String {
-    let net_setup = if network { include_str!("net.sh") } else { "" };
-
-    // Get current time as Unix timestamp for guest clock sync
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // The init script template uses {now}, {net_setup}, {BOOT_MARKER},
-    // and {EXIT_MARKER} as placeholders filled in by format!().
-    format!(
-        include_str!("init.sh"),
-        now = now,
-        net_setup = net_setup,
-        BOOT_MARKER = BOOT_MARKER,
-        EXIT_MARKER = EXIT_MARKER,
-        MNT_LOWER = MNT_LOWER,
-        MNT_OVL = MNT_OVL,
-        MNT_TMP = MNT_TMP,
-        MNT_DISK = MNT_DISK,
-        DATA_DEV = DATA_DEV,
-    )
-}
-
-/// Build the mount setup line injected via UART before the command.
-/// Returns a single line of shell commands (or empty string for no shares).
-///
-/// If `disk_mode` is provided (e.g. "disk" or "layer"), it sets
-/// `SANDAL_DISK_MODE` so the init script knows how to handle /dev/vdb.
-pub fn build_mount_setup_line(shares: &[(String, String)], disk_mode: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    if let Some(mode) = disk_mode {
-        parts.push(format!("export SANDAL_DISK_MODE={mode}"));
-    }
-
-    for (tag, guest_path) in shares {
-        parts.push(format!(
-            "mkdir -p {guest_path} && mount -t virtiofs {tag} {guest_path} 2>/dev/null"
-        ));
-    }
-
-    parts.join("; ")
-}
-
-/// Build the shell-escaped command line that the host sends to the guest
-/// via UART after BOOT_MARKER.  Returns a single line (no trailing newline)
-/// that the init script can `eval "set -- $line"` to recover the original
-/// argv.
-pub fn build_command_line(command: &[String]) -> String {
-    command
-        .iter()
-        .map(|arg| shell_escape(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Simple shell escaping: wrap in single quotes, escaping any embedded single quotes.
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.')
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
 
 /// Build a cpio archive from a pre-built initrd file (just reads it).
 pub fn load_initrd(path: &Path) -> Result<Vec<u8>> {
@@ -222,7 +133,9 @@ pub fn load_host_ca_certificates() -> Option<Vec<u8>> {
 /// 3. Calls `ioctl(TIOCSCTTY)` for robustness
 /// 4. Redirects stdin/stdout/stderr to the TTY via `dup3`
 /// 5. Execs the given command with remaining arguments
-pub fn generate_ctty_helper() -> Vec<u8> {
+///
+/// Computed at compile time — zero runtime overhead.
+const CTTY_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
     let mut elf = ElfBuilder::new();
 
     // On entry the kernel's ELF loader places the initial stack as:
@@ -233,61 +146,41 @@ pub fn generate_ctty_helper() -> Vec<u8> {
     //   ...
     //   NULL terminator, then envp[]
 
-    // Step 1: setsid() — create a new session
-    elf.emit(movz_x(8, 157)); // __NR_setsid
-    elf.emit(svc0());
+    // Step 1: setsid()
+    setsid!(elf);
 
     // Step 2: openat(AT_FDCWD, argv[1], O_RDWR)
-    elf.emit(movn_x(0, 99)); // AT_FDCWD=-100
-    elf.emit(ldr_x_sp(1, 16)); // argv[1]
-    elf.emit(movz_x(2, 2)); // O_RDWR
-    elf.emit(movz_x(8, 56)); // __NR_openat
-    elf.emit(svc0());
-    elf.emit(mov_x(19, 0)); // save fd → x19
+    openat!(elf, [SP, 16], O_RDWR);
+    mov!(elf, x19, x0); // save fd → x19
 
-    // Step 3: ioctl(fd, TIOCSCTTY, 0) — set controlling terminal
-    elf.emit(mov_x(0, 19));
-    elf.emit(movz_w(1, 0x540E)); // TIOCSCTTY
-    elf.emit(movz_x(2, 0));
-    elf.emit(movz_x(8, 29)); // __NR_ioctl
-    elf.emit(svc0());
+    // Step 3: ioctl(fd, TIOCSCTTY, 0)
+    ioctl!(elf, x19, TIOCSCTTY, 0);
 
     // Step 4-6: dup3(fd, 0..2, 0) — redirect stdin/stdout/stderr
-    for newfd in 0u32..=2 {
-        elf.emit(mov_x(0, 19));
-        elf.emit(movz_x(1, newfd));
-        elf.emit(movz_x(2, 0));
-        elf.emit(movz_x(8, 24)); // __NR_dup3
-        elf.emit(svc0());
+    let mut newfd: u32 = 0;
+    while newfd <= 2 {
+        dup3!(elf, x19, newfd);
+        newfd += 1;
     }
 
     // Step 7: close(fd) if fd > 2
-    elf.emit(cmp_x_imm(19, 3));
+    cmp!(elf, x19, 3);
     elf.emit(b_lt(4)); // skip close if fd < 3
-    elf.emit(mov_x(0, 19));
-    elf.emit(movz_x(8, 57)); // __NR_close
-    elf.emit(svc0());
+    close!(elf, x19);
 
     // Step 8: execve(argv[2], &argv[2], envp)
-    //   envp = sp + (argc+2)*8
-    elf.emit(ldr_x_sp(0, 24)); // argv[2]
-    elf.emit(add_x_imm(4, 31, 0)); // x4 = SP
-    elf.emit(add_x_imm(1, 4, 24)); // &argv[2]
-    elf.emit(ldr_x_sp(3, 0)); // argc
-    elf.emit(add_x_imm(3, 3, 2)); // argc+2
-    elf.emit(lsl_x(3, 3, 3)); // *8
-    elf.emit(add_x_reg(2, 4, 3)); // envp
-    elf.emit(movz_x(8, 221)); // __NR_execve
-    elf.emit(svc0());
+    execve!(elf, skip 2);
 
     // Step 9: exit(127) on execve failure
-    elf.emit(movz_x(0, 127));
-    elf.emit(movz_x(8, 93)); // __NR_exit
-    elf.emit(svc0());
+    exit!(elf, 127);
 
-    assert_eq!(elf.offset(), 45 * 4); // 45 instructions, 180 bytes
+    assert!(elf.offset() == 45 * 4); // 45 instructions, 180 bytes
 
     elf.build()
+};
+
+pub fn ctty_helper() -> &'static [u8] {
+    &CTTY_HELPER.0[..CTTY_HELPER.1]
 }
 
 /// Snapshot-ready signal immediate value for BRK instruction.
@@ -303,10 +196,74 @@ pub const EXPORT_RESIZE_IMM: u32 = 0x5D2; // "SanDal 2"
 /// The VMM reads it, gzip-compresses, and saves as a .layer file.
 pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
 
+/// Init config signal: guest requests VM configuration (disk mode,
+/// virtiofs mounts, command argv, network flag, timestamp).
+/// The VMM pushes a binary config blob into the UART RX buffer
+/// and sets x0 = blob size before resuming.
+pub const INIT_CONFIG_IMM: u32 = 0x5D4; // "SanDal 4"
+
+/// Init ready signal: guest has finished processing the config blob
+/// (overlay setup, network, etc.) and is about to fork+exec the user
+/// command.  The VMM uses this to start forwarding UART TX to stdout,
+/// so the config blob echo (kernel TTY echo of the binary blob) is
+/// never shown to the user.
+pub const INIT_READY_IMM: u32 = 0x5D5; // "SanDal 5"
+
 /// UART marker prefix for communicating the export save path from guest to VMM.
 /// The guest echoes `SANDAL_EXPORT_PATH:<path>` to /dev/console before the
 /// BRK #EXPORT_DONE signal, and the VMM intercepts this line.
 pub const EXPORT_PATH_MARKER: &str = "SANDAL_EXPORT_PATH:";
+
+/// Build the binary config blob that the VMM sends to the guest init
+/// binary via UART after `BRK #INIT_CONFIG`.
+///
+/// Layout (little-endian):
+/// ```text
+/// 0x00  disk_mode: u8     (0=none, 1=disk)
+/// 0x01  num_virtiofs: u8
+/// 0x02  num_argv: u8
+/// 0x03  network: u8       (0=off, 1=on)
+/// 0x04  reserved: u32
+/// 0x08  clock_secs: u64
+/// 0x10  data[]:           virtiofs (tag\0 path\0)... then argv (arg\0)...
+/// ```
+pub fn build_init_config(
+    disk_mode: Option<&str>,
+    shares: &[(String, String)],
+    command: &[String],
+    network: bool,
+    clock_secs: u64,
+) -> Vec<u8> {
+    let mut blob = Vec::new();
+
+    // Header (16 bytes)
+    let dm: u8 = match disk_mode {
+        Some("disk") => 1,
+        _ => 0,
+    };
+    blob.push(dm);
+    blob.push(shares.len() as u8);
+    blob.push(command.len() as u8);
+    blob.push(if network { 1 } else { 0 });
+    blob.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    blob.extend_from_slice(&clock_secs.to_le_bytes());
+
+    // Virtiofs entries: tag\0 path\0
+    for (tag, path) in shares {
+        blob.extend_from_slice(tag.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(path.as_bytes());
+        blob.push(0);
+    }
+
+    // Argv entries: arg\0
+    for arg in command {
+        blob.extend_from_slice(arg.as_bytes());
+        blob.push(0);
+    }
+
+    blob
+}
 
 /// Generate a minimal static ARM64 ELF binary that signals
 /// snapshot-readiness to the VMM via a BRK instruction.
@@ -320,18 +277,19 @@ pub const EXPORT_PATH_MARKER: &str = "SANDAL_EXPORT_PATH:";
 /// The BRK causes an immediate VM exit (EC=0x3C) while the guest
 /// is in EL0 with IRQs enabled and no kernel locks held — a clean,
 /// deterministic snapshot point.
-pub fn generate_signal_helper() -> Vec<u8> {
+///
+/// Computed at compile time — zero runtime overhead.
+const SIGNAL_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
     let mut elf = ElfBuilder::new();
 
-    // BRK #SNAPSHOT_SIGNAL_IMM — triggers VM exit from EL0
-    elf.emit(brk(SNAPSHOT_SIGNAL_IMM));
-
-    // exit(0) — reached after snapshot+restore
-    elf.emit(movz_x(0, 0));
-    elf.emit(movz_x(8, 93)); // __NR_exit
-    elf.emit(svc0());
+    brk!(elf, SNAPSHOT_SIGNAL_IMM);
+    exit!(elf, 0);
 
     elf.build()
+};
+
+pub fn signal_helper() -> &'static [u8] {
+    &SIGNAL_HELPER.0[..SIGNAL_HELPER.1]
 }
 
 /// Generate a minimal static ARM64 ELF binary that triggers
@@ -339,28 +297,36 @@ pub fn generate_signal_helper() -> Vec<u8> {
 ///
 /// After the BRK returns, the kernel will process the virtio config
 /// change and resize the block device asynchronously.
-pub fn generate_export_resize_helper() -> Vec<u8> {
+///
+/// Computed at compile time — zero runtime overhead.
+const EXPORT_RESIZE_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
     let mut elf = ElfBuilder::new();
 
-    elf.emit(brk(EXPORT_RESIZE_IMM));
-    elf.emit(movz_x(0, 0));
-    elf.emit(movz_x(8, 93)); // __NR_exit
-    elf.emit(svc0());
+    brk!(elf, EXPORT_RESIZE_IMM);
+    exit!(elf, 0);
 
     elf.build()
+};
+
+pub fn export_resize_helper() -> &'static [u8] {
+    &EXPORT_RESIZE_HELPER.0[..EXPORT_RESIZE_HELPER.1]
 }
 
 /// Generate a minimal static ARM64 ELF binary that triggers
 /// BRK #EXPORT_DONE_IMM — tells the VMM the tar data is ready on /dev/vdb.
-pub fn generate_export_done_helper() -> Vec<u8> {
+///
+/// Computed at compile time — zero runtime overhead.
+const EXPORT_DONE_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
     let mut elf = ElfBuilder::new();
 
-    elf.emit(brk(EXPORT_DONE_IMM));
-    elf.emit(movz_x(0, 0));
-    elf.emit(movz_x(8, 93)); // __NR_exit
-    elf.emit(svc0());
+    brk!(elf, EXPORT_DONE_IMM);
+    exit!(elf, 0);
 
     elf.build()
+};
+
+pub fn export_done_helper() -> &'static [u8] {
+    &EXPORT_DONE_HELPER.0[..EXPORT_DONE_HELPER.1]
 }
 
 /// Generate the `sandal-export` shell script for the guest.

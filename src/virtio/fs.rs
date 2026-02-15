@@ -273,10 +273,18 @@ struct InodeState {
     nlookup: u64,
 }
 
+/// A cached directory entry for READDIR.
+struct CachedDirEntry {
+    name: String,
+    path: PathBuf,
+    meta: Metadata,
+}
+
 /// An open file or directory handle.
 enum HandleInner {
     File(std::fs::File),
-    Dir(PathBuf),
+    /// Directory handle with eagerly-cached entries (read once at OPENDIR).
+    Dir(Vec<CachedDirEntry>),
 }
 
 struct HandleState {
@@ -1066,15 +1074,57 @@ impl VirtioFsDevice {
             None => return make_error(unique, ENOENT),
         };
 
-        // Verify it's a directory
-        match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => {}
+        // Verify it's a directory and cache its metadata for "."
+        let dir_meta = match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => m,
             Ok(_) => return make_error(unique, ENOTDIR),
             Err(e) => return make_error(unique, io_error_to_errno(&e)),
+        };
+
+        // Eagerly read and cache all directory entries at OPENDIR time so that
+        // subsequent READDIR/READDIRPLUS calls index directly into the cached
+        // list instead of re-reading from disk (avoids O(n^2) behavior).
+        let mut entries = Vec::new();
+
+        // "." entry
+        entries.push(CachedDirEntry {
+            name: ".".to_string(),
+            path: path.clone(),
+            meta: dir_meta,
+        });
+
+        // ".." entry
+        let parent = path.parent().unwrap_or(&path);
+        let parent_path = if parent.starts_with(&self.root_path) {
+            parent.to_path_buf()
+        } else {
+            self.root_path.clone()
+        };
+        if let Ok(meta) = fs::symlink_metadata(&parent_path) {
+            entries.push(CachedDirEntry {
+                name: "..".to_string(),
+                path: parent_path,
+                meta,
+            });
+        }
+
+        // Real children
+        if let Ok(rd) = fs::read_dir(&path) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let entry_path = path.join(&name);
+                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
+                    entries.push(CachedDirEntry {
+                        name,
+                        path: entry_path,
+                        meta,
+                    });
+                }
+            }
         }
 
         let fh = self.alloc_handle(HandleState {
-            inner: HandleInner::Dir(path),
+            inner: HandleInner::Dir(entries),
         });
 
         let mut wb = WriteBuf::fuse_out(unique);
@@ -1090,25 +1140,19 @@ impl VirtioFsDevice {
         let dir_offset = buf.read_u64().unwrap_or(0);
         let size = buf.read_u32().unwrap_or(0) as usize;
 
-        let dir_path = match self.handles.get(&fh) {
+        let cached = match self.handles.get(&fh) {
             Some(h) => match &h.inner {
-                HandleInner::Dir(p) => p.clone(),
+                HandleInner::Dir(entries) => entries,
                 HandleInner::File(_) => return make_error(unique, EBADF),
             },
             None => return make_error(unique, EBADF),
         };
 
-        let entries = self.collect_dir_entries(&dir_path);
-
-        // Build packed fuse_dirent data from dir_offset
         let start = dir_offset as usize;
         let mut data = Vec::new();
 
-        for (i, (name, ino, dtype)) in entries.iter().enumerate() {
-            if i < start {
-                continue;
-            }
-            let namelen = name.len();
+        for (i, entry) in cached.iter().enumerate().skip(start) {
+            let namelen = entry.name.len();
             // fuse_dirent: ino(8) + off(8) + namelen(4) + type(4) + name + padding
             let padded_namelen = (namelen + 7) & !7;
             let entry_len = 24 + padded_namelen;
@@ -1116,12 +1160,20 @@ impl VirtioFsDevice {
                 break;
             }
 
+            let ino = entry.meta.ino();
+            let dtype: u32 = if entry.meta.is_dir() {
+                4
+            } else if entry.meta.file_type().is_symlink() {
+                10
+            } else {
+                8
+            };
+
             data.extend_from_slice(&ino.to_le_bytes()); // ino
             data.extend_from_slice(&((i + 1) as u64).to_le_bytes()); // off (next offset)
             data.extend_from_slice(&(namelen as u32).to_le_bytes()); // namelen
-            data.extend_from_slice(&(*dtype as u32).to_le_bytes()); // type
-            data.extend_from_slice(name.as_bytes());
-            // Pad to 8-byte alignment
+            data.extend_from_slice(&dtype.to_le_bytes()); // type
+            data.extend_from_slice(entry.name.as_bytes());
             let pad = padded_namelen - namelen;
             data.extend(std::iter::repeat_n(0u8, pad));
         }
@@ -1137,43 +1189,54 @@ impl VirtioFsDevice {
         let dir_offset = buf.read_u64().unwrap_or(0);
         let size = buf.read_u32().unwrap_or(0) as usize;
 
-        let dir_path = match self.handles.get(&fh) {
-            Some(h) => match &h.inner {
-                HandleInner::Dir(p) => p.clone(),
-                HandleInner::File(_) => return make_error(unique, EBADF),
-            },
-            None => return make_error(unique, EBADF),
+        // Collect (index, path clone, meta ref) from the cached entries so we
+        // can call lookup_or_create_inode (which borrows &mut self) outside of
+        // the immutable borrow on self.handles.
+        let items: Vec<(usize, String, PathBuf, Metadata)> = {
+            let cached = match self.handles.get(&fh) {
+                Some(h) => match &h.inner {
+                    HandleInner::Dir(entries) => entries,
+                    HandleInner::File(_) => return make_error(unique, EBADF),
+                },
+                None => return make_error(unique, EBADF),
+            };
+
+            let start = dir_offset as usize;
+            let mut items = Vec::new();
+            let mut accum = 0usize;
+
+            for (i, entry) in cached.iter().enumerate().skip(start) {
+                let namelen = entry.name.len();
+                let padded_namelen = (namelen + 7) & !7;
+                let entry_len = 128 + 24 + padded_namelen;
+                if accum + entry_len > size {
+                    break;
+                }
+                accum += entry_len;
+                items.push((
+                    i,
+                    entry.name.clone(),
+                    entry.path.clone(),
+                    entry.meta.clone(),
+                ));
+            }
+            items
         };
 
-        let entries = self.collect_dir_entries_with_meta(&dir_path);
-
-        let start = dir_offset as usize;
         let mut data = Vec::new();
 
-        for (i, (name, child_path, meta)) in entries.iter().enumerate() {
-            if i < start {
-                continue;
-            }
-            let namelen = name.len();
-            let padded_namelen = (namelen + 7) & !7;
-            // fuse_direntplus: fuse_entry_out(128) + fuse_dirent(24 + padded_name)
-            let entry_len = 128 + 24 + padded_namelen;
-            if data.len() + entry_len > size {
-                break;
-            }
-
+        for (i, name, child_path, meta) in &items {
             let ino = self.lookup_or_create_inode(child_path);
-            // Increment nlookup for READDIRPLUS entries
             if let Some(state) = self.inodes.get_mut(&ino) {
                 state.nlookup = state.nlookup.saturating_add(1);
             }
 
             let dtype: u32 = if meta.is_dir() {
-                4 // DT_DIR
+                4
             } else if meta.file_type().is_symlink() {
-                10 // DT_LNK
+                10
             } else {
-                8 // DT_REG
+                8
             };
 
             // Write fuse_entry_out (128 bytes)
@@ -1182,8 +1245,10 @@ impl VirtioFsDevice {
             data.extend_from_slice(&entry_wb.data);
 
             // Write fuse_dirent
+            let namelen = name.len();
+            let padded_namelen = (namelen + 7) & !7;
             data.extend_from_slice(&ino.to_le_bytes()); // ino
-            data.extend_from_slice(&((i + 1) as u64).to_le_bytes()); // off
+            data.extend_from_slice(&((*i + 1) as u64).to_le_bytes()); // off
             data.extend_from_slice(&(namelen as u32).to_le_bytes()); // namelen
             data.extend_from_slice(&dtype.to_le_bytes()); // type
             data.extend_from_slice(name.as_bytes());
@@ -1584,82 +1649,6 @@ impl VirtioFsDevice {
         self.next_fh += 1;
         self.handles.insert(fh, state);
         fh
-    }
-
-    /// Collect directory entries as (name, inode, dtype) tuples.
-    fn collect_dir_entries(&self, dir_path: &Path) -> Vec<(String, u64, u8)> {
-        let mut entries = Vec::new();
-
-        // "." entry
-        if let Some(&ino) = self.path_to_inode.get(dir_path) {
-            entries.push((".".to_string(), ino, 4)); // DT_DIR
-        }
-
-        // ".." entry
-        let parent = dir_path.parent().unwrap_or(dir_path);
-        let parent_path = if parent.starts_with(&self.root_path) {
-            parent
-        } else {
-            &self.root_path
-        };
-        if let Some(&ino) = self.path_to_inode.get(parent_path) {
-            entries.push(("..".to_string(), ino, 4)); // DT_DIR
-        }
-
-        if let Ok(rd) = fs::read_dir(dir_path) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let entry_path = dir_path.join(&name);
-                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                    // Use host inode as FUSE inode for readdir (readdir doesn't
-                    // create inode references, so we don't allocate here)
-                    let ino = meta.ino();
-                    let dtype = if meta.is_dir() {
-                        4 // DT_DIR
-                    } else if meta.file_type().is_symlink() {
-                        10 // DT_LNK
-                    } else {
-                        8 // DT_REG
-                    };
-                    entries.push((name, ino, dtype));
-                }
-            }
-        }
-
-        entries
-    }
-
-    /// Collect directory entries with full metadata for READDIRPLUS.
-    fn collect_dir_entries_with_meta(&self, dir_path: &Path) -> Vec<(String, PathBuf, Metadata)> {
-        let mut entries = Vec::new();
-
-        // "." entry
-        if let Ok(meta) = fs::symlink_metadata(dir_path) {
-            entries.push((".".to_string(), dir_path.to_path_buf(), meta));
-        }
-
-        // ".." entry
-        let parent = dir_path.parent().unwrap_or(dir_path);
-        let parent_path = if parent.starts_with(&self.root_path) {
-            parent.to_path_buf()
-        } else {
-            self.root_path.clone()
-        };
-        if let Ok(meta) = fs::symlink_metadata(&parent_path) {
-            entries.push(("..".to_string(), parent_path, meta));
-        }
-
-        if let Ok(rd) = fs::read_dir(dir_path) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let entry_path = dir_path.join(&name);
-                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                    entries.push((name, entry_path, meta));
-                }
-            }
-        }
-
-        entries
     }
 }
 

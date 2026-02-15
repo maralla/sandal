@@ -275,6 +275,27 @@ impl VirtioBlkDevice {
         }
     }
 
+    /// Check if there are unprocessed requests in the avail ring and
+    /// process them.  Returns true if any requests were completed.
+    /// Called from the main loop on every vCPU exit to catch requests
+    /// whose avail-ring writes were not yet visible at QueueNotify time
+    /// (a race between the guest store buffer and the VMM read).
+    pub fn poll_pending(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
+        let q = &self.queues[0];
+        if !q.ready || q.num == 0 {
+            return false;
+        }
+        let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
+            Some(idx) => idx,
+            None => return false,
+        };
+        if avail_idx == self.queues[0].last_avail_idx {
+            return false;
+        }
+        // There are pending requests — process them normally.
+        self.process_queue(memory, ram_base)
+    }
+
     /// Handle a single virtio-blk request (descriptor chain).
     /// Returns total bytes written to device-writable descriptors.
     fn handle_request(
@@ -316,9 +337,9 @@ impl VirtioBlkDevice {
             return 0;
         }
 
-        let req_type = u32::from_le_bytes(memory[hdr_off..hdr_off + 4].try_into().unwrap());
-        let _reserved = u32::from_le_bytes(memory[hdr_off + 4..hdr_off + 8].try_into().unwrap());
-        let sector = u64::from_le_bytes(memory[hdr_off + 8..hdr_off + 16].try_into().unwrap());
+        let req_type = super::volatile_read_u32(memory, hdr_off);
+        let _reserved = super::volatile_read_u32(memory, hdr_off + 4);
+        let sector = super::volatile_read_u64(memory, hdr_off + 8);
 
         // Last descriptor: status byte (device-writable)
         let (status_addr, _, _) = descs[descs.len() - 1];

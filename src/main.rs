@@ -1,8 +1,10 @@
 mod cli;
 mod devicetree;
+#[macro_use]
 mod elf;
 mod ext2;
 mod hypervisor;
+mod init;
 mod initramfs;
 mod net;
 mod rootfs;

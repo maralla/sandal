@@ -1,0 +1,38 @@
+#!/usr/bin/expect -f
+#
+# Test: curl must not hang when using --disk-size with --layer.
+#
+# Usage:
+#   expect tests/test_curl_hang.exp [disk_size_mb]
+#
+# Requires: curl.layer in the project root, a host HTTP server on port 18199.
+# Exit code: 0 = pass, 1 = fail (timeout / hang detected).
+
+set disk_size [lindex $argv 0]
+if {$disk_size eq ""} { set disk_size 128 }
+
+set timeout 8
+set binary "./target/release/sandal"
+
+spawn $binary --no-cache --disk-size $disk_size --layer curl.layer -- sh
+
+# Wait for shell prompt
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout waiting for shell prompt"; exit 1 }
+}
+
+# Type the curl command character by character with 50ms delay (simulates human typing)
+set cmd "curl -sf http://10.0.2.2:18199\r"
+foreach c [split $cmd ""] {
+    send -- $c
+    after 50
+}
+
+# Wait for any response that indicates curl ran (success or error)
+expect {
+    -re "SANDAL_TEST_OK|HTTP|html|<!" { exit 0 }
+    "/ #" { exit 0 }
+    "curl:" { exit 0 }
+    timeout { puts stderr "FAIL: curl hung (disk_size=${disk_size}MB)"; exit 1 }
+}
