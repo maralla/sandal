@@ -14,6 +14,7 @@ ROOTFS_FILES := \
 	bin/busybox \
 	lib/ld-musl-aarch64.so.1 \
 	sbin/apk \
+	usr/bin/ldd \
 	usr/bin/ssl_client \
 	usr/lib/libapk.so.2.14.0 \
 	usr/lib/libcrypto.so.3 \
