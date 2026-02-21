@@ -1513,9 +1513,240 @@ fn dir_lookup(
     Ok(None)
 }
 
+/// Collect all data block numbers for an inode from direct/indirect pointers.
+fn inode_data_block_numbers(
+    image: &[u8],
+    sb: &Ext2Superblock,
+    inode: &Ext2Inode,
+) -> Result<Vec<u32>> {
+    let bs = sb.block_size;
+    let ptrs_per_block = bs / 4;
+    let mut remaining = (inode.size as usize).div_ceil(bs);
+    if remaining == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut block_nums = Vec::with_capacity(remaining);
+
+    // Direct blocks (0..11)
+    for i in 0..12 {
+        if remaining == 0 {
+            break;
+        }
+        let blk = inode.block_ptrs[i];
+        if blk == 0 {
+            anyhow::bail!("inode has missing direct block pointer {}", i);
+        }
+        block_nums.push(blk);
+        remaining -= 1;
+    }
+
+    // Single indirect (block_ptrs[12])
+    if remaining > 0 {
+        if inode.block_ptrs[12] == 0 {
+            anyhow::bail!("inode has missing single-indirect block pointer");
+        }
+        let ind_off = inode.block_ptrs[12] as usize * bs;
+        for i in 0..ptrs_per_block {
+            if remaining == 0 {
+                break;
+            }
+            let blk = read_le32(image, ind_off + i * 4);
+            if blk == 0 {
+                anyhow::bail!("inode has missing single-indirect data pointer {}", i);
+            }
+            block_nums.push(blk);
+            remaining -= 1;
+        }
+    }
+
+    // Double indirect (block_ptrs[13])
+    if remaining > 0 {
+        if inode.block_ptrs[13] == 0 {
+            anyhow::bail!("inode has missing double-indirect block pointer");
+        }
+        let dind_off = inode.block_ptrs[13] as usize * bs;
+        for i in 0..ptrs_per_block {
+            if remaining == 0 {
+                break;
+            }
+            let ind_blk = read_le32(image, dind_off + i * 4);
+            if ind_blk == 0 {
+                anyhow::bail!("inode has missing double-indirect level-1 pointer {}", i);
+            }
+            let ind_off = ind_blk as usize * bs;
+            for j in 0..ptrs_per_block {
+                if remaining == 0 {
+                    break;
+                }
+                let blk = read_le32(image, ind_off + j * 4);
+                if blk == 0 {
+                    anyhow::bail!(
+                        "inode has missing double-indirect data pointer [{}, {}]",
+                        i,
+                        j
+                    );
+                }
+                block_nums.push(blk);
+                remaining -= 1;
+            }
+        }
+    }
+
+    if remaining > 0 {
+        anyhow::bail!("inode data extends into unsupported triple-indirect blocks");
+    }
+
+    Ok(block_nums)
+}
+
+/// Try appending a new directory entry into a single directory block.
+/// Returns true if the entry was inserted.
+fn try_append_dir_entry_to_block(
+    dir_block: &mut [u8],
+    child_ino: u32,
+    child_name: &str,
+    child_ft: u8,
+) -> Result<bool> {
+    let bs = dir_block.len();
+    let new_name_len = child_name.len();
+    let new_entry_size = (8 + new_name_len + 3) & !3;
+
+    // Walk to the last entry in this block
+    let mut off = 0usize;
+    let mut last_off: Option<usize> = None;
+    while off + 8 <= bs {
+        let rec_len = u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
+        if rec_len == 0 {
+            break;
+        }
+        if off + rec_len > bs {
+            anyhow::bail!("Corrupt directory block: entry overruns block boundary");
+        }
+        last_off = Some(off);
+        off += rec_len;
+    }
+
+    // Empty block: place entry at offset 0, consuming the whole block.
+    let Some(last_off) = last_off else {
+        if new_entry_size > bs {
+            anyhow::bail!(
+                "Directory entry '{}' too large for block size {}",
+                child_name,
+                bs
+            );
+        }
+        write_le32(dir_block, 0, child_ino);
+        write_le16(dir_block, 4, bs as u16);
+        dir_block[6] = new_name_len as u8;
+        dir_block[7] = child_ft;
+        dir_block[8..8 + new_name_len].copy_from_slice(child_name.as_bytes());
+        return Ok(true);
+    };
+
+    // Calculate free slack at the end of the last entry.
+    let last_name_len = dir_block[last_off + 6] as usize;
+    let last_actual = (8 + last_name_len + 3) & !3; // 4-byte aligned
+    let last_rec_len =
+        u16::from_le_bytes(dir_block[last_off + 4..last_off + 6].try_into().unwrap()) as usize;
+    if last_rec_len < last_actual {
+        anyhow::bail!("Corrupt directory block: last entry rec_len is too small");
+    }
+    let free_space = last_rec_len - last_actual;
+    if free_space < new_entry_size {
+        return Ok(false);
+    }
+
+    // Shrink last entry and append the new one into the reclaimed space.
+    write_le16(dir_block, last_off + 4, last_actual as u16);
+    let new_off = last_off + last_actual;
+    let new_rec_len = last_rec_len - last_actual;
+    write_le32(dir_block, new_off, child_ino);
+    write_le16(dir_block, new_off + 4, new_rec_len as u16);
+    dir_block[new_off + 6] = new_name_len as u8;
+    dir_block[new_off + 7] = child_ft;
+    dir_block[new_off + 8..new_off + 8 + new_name_len].copy_from_slice(child_name.as_bytes());
+
+    Ok(true)
+}
+
+/// Append a new data block to an inode and update inode metadata.
+fn append_inode_data_block(
+    image: &mut [u8],
+    sb: &Ext2Superblock,
+    bgdt: &Ext2BgdTable,
+    ino: u32,
+    inode: &Ext2Inode,
+    new_block: u32,
+) -> Result<()> {
+    let bs = sb.block_size;
+    let ptrs_per_block = bs / 4;
+    let inode_off = bgdt.inode_offset(sb, ino);
+    let cur_size = read_le32(image, inode_off + 4) as usize;
+    let cur_blocks = cur_size.div_ceil(bs);
+    let mut metadata_blocks_added = 0usize;
+
+    if cur_blocks < 12 {
+        write_le32(image, inode_off + 40 + cur_blocks * 4, new_block);
+    } else if cur_blocks < 12 + ptrs_per_block {
+        let mut ind_blk = inode.block_ptrs[12];
+        if ind_blk == 0 {
+            ind_blk = alloc_block(image, sb, bgdt)?;
+            metadata_blocks_added += 1;
+            write_le32(image, inode_off + 40 + 12 * 4, ind_blk);
+            let ind_off = ind_blk as usize * bs;
+            for b in &mut image[ind_off..ind_off + bs] {
+                *b = 0;
+            }
+        }
+        let ind_idx = cur_blocks - 12;
+        let ind_off = ind_blk as usize * bs;
+        write_le32(image, ind_off + ind_idx * 4, new_block);
+    } else {
+        let dind_idx = cur_blocks - 12 - ptrs_per_block;
+        let l1_idx = dind_idx / ptrs_per_block;
+        let l2_idx = dind_idx % ptrs_per_block;
+        if l1_idx >= ptrs_per_block {
+            anyhow::bail!("inode data block index exceeds double-indirect addressing limit");
+        }
+
+        let mut dind_blk = inode.block_ptrs[13];
+        if dind_blk == 0 {
+            dind_blk = alloc_block(image, sb, bgdt)?;
+            metadata_blocks_added += 1;
+            write_le32(image, inode_off + 40 + 13 * 4, dind_blk);
+            let dind_off = dind_blk as usize * bs;
+            for b in &mut image[dind_off..dind_off + bs] {
+                *b = 0;
+            }
+        }
+        let dind_off = dind_blk as usize * bs;
+
+        let mut l1_blk = read_le32(image, dind_off + l1_idx * 4);
+        if l1_blk == 0 {
+            l1_blk = alloc_block(image, sb, bgdt)?;
+            metadata_blocks_added += 1;
+            write_le32(image, dind_off + l1_idx * 4, l1_blk);
+            let l1_off = l1_blk as usize * bs;
+            for b in &mut image[l1_off..l1_off + bs] {
+                *b = 0;
+            }
+        }
+        let l1_off = l1_blk as usize * bs;
+        write_le32(image, l1_off + l2_idx * 4, new_block);
+    }
+
+    write_le32(image, inode_off + 4, (cur_size + bs) as u32);
+    let old_blocks_512 = read_le32(image, inode_off + 28) as usize;
+    let added_blocks = 1 + metadata_blocks_added; // data + any new indirection blocks
+    let added_512 = added_blocks * (bs / 512);
+    write_le32(image, inode_off + 28, (old_blocks_512 + added_512) as u32);
+
+    Ok(())
+}
+
 /// Add a directory entry to an existing directory.
-/// This appends to the directory's first data block by shrinking the last
-/// entry's rec_len and inserting the new entry in the freed space.
+/// Uses existing blocks first; allocates and links a new block if needed.
 fn add_dir_entry(
     image: &mut [u8],
     sb: &Ext2Superblock,
@@ -1526,59 +1757,50 @@ fn add_dir_entry(
     child_ft: u8,
 ) -> Result<()> {
     let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
-    if !inode.is_dir() || inode.block_ptrs[0] == 0 {
+    if !inode.is_dir() {
+        anyhow::bail!("add_dir_entry: inode {} is not a directory", dir_ino);
+    }
+    if child_name.len() > u8::MAX as usize {
         anyhow::bail!(
-            "add_dir_entry: inode {} is not a directory or has no data block",
-            dir_ino
+            "Directory entry name '{}' exceeds ext2 name length limit",
+            child_name
         );
     }
 
     let bs = sb.block_size;
-    let block_off = inode.block_ptrs[0] as usize * bs;
-    let dir_block = &mut image[block_off..block_off + bs];
-
-    // Walk to the last entry
-    let mut off = 0usize;
-    let mut last_off = 0usize;
-    while off < bs {
-        let rec_len = u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
-        if rec_len == 0 {
-            break;
-        }
-        last_off = off;
-        off += rec_len;
-    }
-
-    // Calculate the actual size of the last entry
-    let last_name_len = dir_block[last_off + 6] as usize;
-    let last_actual = (8 + last_name_len + 3) & !3; // 4-byte aligned
-    let last_rec_len =
-        u16::from_le_bytes(dir_block[last_off + 4..last_off + 6].try_into().unwrap()) as usize;
-    let free_space = last_rec_len - last_actual;
-
-    // Check if there's enough space for the new entry
-    let new_name_len = child_name.len();
-    let new_entry_size = (8 + new_name_len + 3) & !3;
-    if free_space < new_entry_size {
+    let dir_blocks = inode_data_block_numbers(image, sb, &inode)?;
+    if dir_blocks.is_empty() {
         anyhow::bail!(
-            "Not enough space in directory block for entry '{}' ({} needed, {} available)",
-            child_name,
-            new_entry_size,
-            free_space,
+            "add_dir_entry: inode {} has no directory data blocks",
+            dir_ino
         );
     }
 
-    // Shrink last entry's rec_len to its actual size
-    write_le16(dir_block, last_off + 4, last_actual as u16);
+    // First try to append in existing blocks.
+    for blk in dir_blocks {
+        let block_off = blk as usize * bs;
+        let dir_block = &mut image[block_off..block_off + bs];
+        if try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft)? {
+            return Ok(());
+        }
+    }
 
-    // Write new entry at last_off + last_actual
-    let new_off = last_off + last_actual;
-    let new_rec_len = last_rec_len - last_actual; // fills remainder of block
-    write_le32(dir_block, new_off, child_ino);
-    write_le16(dir_block, new_off + 4, new_rec_len as u16);
-    dir_block[new_off + 6] = new_name_len as u8;
-    dir_block[new_off + 7] = child_ft;
-    dir_block[new_off + 8..new_off + 8 + new_name_len].copy_from_slice(child_name.as_bytes());
+    // No room in existing blocks: allocate and append a new directory block.
+    let new_blk = alloc_block(image, sb, bgdt)?;
+    append_inode_data_block(image, sb, bgdt, dir_ino, &inode, new_blk)?;
+
+    let block_off = new_blk as usize * bs;
+    for b in &mut image[block_off..block_off + bs] {
+        *b = 0;
+    }
+    let dir_block = &mut image[block_off..block_off + bs];
+    let inserted = try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft)?;
+    if !inserted {
+        anyhow::bail!(
+            "Not enough space in fresh directory block for entry '{}'",
+            child_name
+        );
+    }
 
     Ok(())
 }
@@ -1970,6 +2192,53 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
     Ok(())
 }
 
+/// Read the current overlay upper tree from an ext2 image and convert it to
+/// tar entries with paths relative to `upper/`.
+pub fn read_upper_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
+    let sb = Ext2Superblock::parse(image)?;
+    let bgdt = Ext2BgdTable::parse(image, &sb)?;
+    let mut out = Vec::new();
+
+    for entry in walk_ext2(image, &sb, &bgdt)? {
+        let Some(rel_path) = entry.path.strip_prefix("upper/") else {
+            continue;
+        };
+        if rel_path.is_empty() {
+            continue;
+        }
+
+        let mode = (entry.mode as u16) & 0o7777;
+        let file_type = (entry.mode as u16) & 0xF000;
+        match file_type {
+            S_IFDIR => out.push(TarEntry {
+                path: rel_path.to_string(),
+                mode,
+                entry_type: TarEntryType::Directory,
+                link_target: String::new(),
+                data: Vec::new(),
+            }),
+            S_IFREG => out.push(TarEntry {
+                path: rel_path.to_string(),
+                mode,
+                entry_type: TarEntryType::File,
+                link_target: String::new(),
+                data: entry.data,
+            }),
+            S_IFLNK => out.push(TarEntry {
+                path: rel_path.to_string(),
+                mode,
+                entry_type: TarEntryType::Symlink,
+                link_target: String::from_utf8_lossy(&entry.data).into_owned(),
+                data: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 /// Remove a directory entry by name from a directory's data block.
 fn remove_dir_entry(
     image: &mut [u8],
@@ -1979,47 +2248,52 @@ fn remove_dir_entry(
     name: &str,
 ) -> Result<()> {
     let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
-    if !inode.is_dir() || inode.block_ptrs[0] == 0 {
+    if !inode.is_dir() {
         return Ok(());
     }
 
     let bs = sb.block_size;
-    let block_off = inode.block_ptrs[0] as usize * bs;
+    let dir_blocks = inode_data_block_numbers(image, sb, &inode)?;
+    for blk in dir_blocks {
+        let block_off = blk as usize * bs;
+        let mut off = 0usize;
+        let mut prev_off: Option<usize> = None;
 
-    let mut off = 0usize;
-    let mut prev_off: Option<usize> = None;
-
-    while off < bs {
-        let rec_len = u16::from_le_bytes(
-            image[block_off + off + 4..block_off + off + 6]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        if rec_len == 0 {
-            break;
-        }
-        let name_len = image[block_off + off + 6] as usize;
-        let ino = read_le32(image, block_off + off);
-        if ino != 0 && name_len == name.len() {
-            let entry_name = &image[block_off + off + 8..block_off + off + 8 + name_len];
-            if entry_name == name.as_bytes() {
-                // Found it. Merge its rec_len into the previous entry.
-                if let Some(prev) = prev_off {
-                    let prev_rec_len = u16::from_le_bytes(
-                        image[block_off + prev + 4..block_off + prev + 6]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
-                    write_le16(image, block_off + prev + 4, (prev_rec_len + rec_len) as u16);
-                } else {
-                    // First entry — just zero the inode to mark as deleted
-                    write_le32(image, block_off + off, 0);
-                }
-                return Ok(());
+        while off + 8 <= bs {
+            let rec_len = u16::from_le_bytes(
+                image[block_off + off + 4..block_off + off + 6]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if rec_len == 0 {
+                break;
             }
+            if off + rec_len > bs {
+                anyhow::bail!("Corrupt directory block while removing '{}'", name);
+            }
+            let name_len = image[block_off + off + 6] as usize;
+            let ino = read_le32(image, block_off + off);
+            if ino != 0 && name_len == name.len() {
+                let entry_name = &image[block_off + off + 8..block_off + off + 8 + name_len];
+                if entry_name == name.as_bytes() {
+                    // Found it. Merge its rec_len into the previous entry within this block.
+                    if let Some(prev) = prev_off {
+                        let prev_rec_len = u16::from_le_bytes(
+                            image[block_off + prev + 4..block_off + prev + 6]
+                                .try_into()
+                                .unwrap(),
+                        ) as usize;
+                        write_le16(image, block_off + prev + 4, (prev_rec_len + rec_len) as u16);
+                    } else {
+                        // First entry in block — mark deleted by zeroing inode.
+                        write_le32(image, block_off + off, 0);
+                    }
+                    return Ok(());
+                }
+            }
+            prev_off = Some(off);
+            off += rec_len;
         }
-        prev_off = Some(off);
-        off += rec_len;
     }
 
     Ok(())
