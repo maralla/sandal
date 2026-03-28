@@ -2194,6 +2194,7 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
 
 /// Read the current overlay upper tree from an ext2 image and convert it to
 /// tar entries with paths relative to `upper/`.
+#[allow(dead_code)] // Public helper for export/upper tooling; not wired in all builds.
 pub fn read_upper_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;

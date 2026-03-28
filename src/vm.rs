@@ -681,6 +681,27 @@ impl VmInstance {
                 }
             }
 
+            if self.boot_complete && self.command_injected {
+                let mut tx_chunk = Vec::new();
+                if let Some(c) = self.virtio_console.as_mut() {
+                    if c.tx_queue_has_pending(&self.memory, RAM_BASE) {
+                        tx_chunk = c.process_tx(&mut self.memory, RAM_BASE);
+                        Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, c.interrupt_status != 0);
+                    }
+                }
+                if !tx_chunk.is_empty() {
+                    self.process_console_tx(&tx_chunk);
+                }
+                self.poll_stdin(stdin_fd, &mut stdin_eof);
+                if self
+                    .virtio_console
+                    .as_ref()
+                    .is_some_and(|c| !c.rx_backlog.is_empty())
+                {
+                    let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+                }
+            }
+
             let exit_reason = match vcpu.run() {
                 Ok(r) => r,
                 Err(e) => {
@@ -832,7 +853,7 @@ impl VmInstance {
                         0x24 | 0x25 => {
                             // Data Abort - MMIO
                             let fault_addr = vcpu.read_fault_address().unwrap_or(0);
-                            self.handle_mmio(&vcpu, pc, iss, fault_addr)?;
+                            self.handle_mmio(&vcpu, pc, iss, fault_addr, stdin_fd, &mut stdin_eof)?;
                             vcpu.write_register(HvReg::Pc, pc + 4)?;
                         }
 
@@ -977,6 +998,13 @@ impl VmInstance {
             //     before the command data when running without a TTY.
             if self.boot_complete && self.command_injected {
                 self.poll_stdin(stdin_fd, &mut stdin_eof);
+                if self
+                    .virtio_console
+                    .as_ref()
+                    .is_some_and(|c| !c.rx_backlog.is_empty())
+                {
+                    let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+                }
             }
 
             // Poll network backend and deliver incoming packets to guest RX queue
@@ -1065,18 +1093,16 @@ impl VmInstance {
         let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n > 0 {
             if let Some(ref mut console) = self.virtio_console {
-                if console.inject_rx(&mut self.memory, RAM_BASE, &buf[..n as usize]) {
-                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
-                }
+                let _ = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &buf[..n as usize]);
+                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
             }
         } else if n == 0 {
-            // EOF — send Ctrl-D to guest
-            if let Some(ref mut console) = self.virtio_console {
-                if console.inject_rx(&mut self.memory, RAM_BASE, &[0x04]) {
-                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
-                }
-            }
+            // EOF — queue Ctrl-D for the guest (may remain in backlog until RX buffers exist).
             *stdin_eof = true;
+            if let Some(ref mut console) = self.virtio_console {
+                let _ = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &[0x04]);
+                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+            }
         }
         // n < 0 → EAGAIN (no data), ignore
     }
@@ -1192,9 +1218,8 @@ impl VmInstance {
         );
         let blob_len = blob.len() as u64;
         if let Some(ref mut console) = self.virtio_console {
-            if console.inject_rx(&mut self.memory, RAM_BASE, &blob) {
-                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
-            }
+            let _ = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &blob);
+            Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
         }
         vcpu.write_register(HvReg::X0, blob_len)?;
         self.init_config_injected = true;
@@ -1466,9 +1491,17 @@ impl VmInstance {
     }
 
     /// Handle MMIO access (Data Abort)
-    fn handle_mmio(&mut self, vcpu: &Vcpu, pc: u64, iss: u64, fault_addr: u64) -> Result<()> {
+    fn handle_mmio(
+        &mut self,
+        vcpu: &Vcpu,
+        pc: u64,
+        iss: u64,
+        fault_addr: u64,
+        stdin_fd: RawFd,
+        stdin_eof: &mut bool,
+    ) -> Result<()> {
         let is_write = (iss & (1 << 6)) != 0;
-        let _sas = (iss >> 22) & 0x3; // Access size: 0=byte, 1=halfword, 2=word, 3=doubleword
+        let access_sas = ((iss >> 22) & 0x3) as u8; // 0=byte, 1=halfword, 2=word, 3=doubleword
         let rt = ((iss >> 16) & 0x1F) as u8;
 
         // UART at 0x09000000 — earlycon-only PL011 stub.
@@ -1516,6 +1549,16 @@ impl VmInstance {
             // Handle the MMIO access and collect any TX bytes, then process
             // them after releasing the virtio_console borrow.
             let mut tx_bytes = Vec::new();
+            if is_write && self.boot_complete && self.command_injected {
+                self.poll_stdin(stdin_fd, stdin_eof);
+                if self
+                    .virtio_console
+                    .as_ref()
+                    .is_some_and(|c| !c.rx_backlog.is_empty())
+                {
+                    let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+                }
+            }
             if let Some(ref mut console) = self.virtio_console {
                 if is_write {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
@@ -1523,19 +1566,14 @@ impl VmInstance {
                         if queue_idx == 1 {
                             // TX queue notification — collect output bytes
                             tx_bytes = console.process_tx(&mut self.memory, RAM_BASE);
-                            if !tx_bytes.is_empty() {
-                                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, true);
-                            }
+                        } else {
+                            let _ = console.drain_rx_backlog(&mut self.memory, RAM_BASE);
                         }
-                        // queue_idx == 0 (RX): guest posted new buffers — no-op
                     }
-                    // After InterruptACK, deassert SPI if no more pending interrupts
-                    if offset == REG_INTERRUPT_ACK && console.interrupt_status == 0 {
-                        Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, false);
-                    }
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
                 } else {
-                    let value = console.mmio_read(offset);
-                    Self::write_guest_register(vcpu, rt, value as u64)?;
+                    let value = console.mmio_read(offset, access_sas);
+                    Self::write_guest_register(vcpu, rt, value)?;
                 }
             } else if !is_write {
                 Self::write_guest_register(vcpu, rt, 0)?;
