@@ -48,6 +48,8 @@ The failures (timeouts like **no `>>>` after `uv run python`**, or no shell afte
 
 ---
 
+**Note that the methods attempted below are all failed to fix the hang issue**
+
 ## Mitigations in the current codebase (summary)
 
 - **`rx_backlog`** + **`push_rx_and_drain` / `drain_rx_backlog`** so failed inject does not drop bytes (host then synth). Every **host** `push_rx_and_drain` pre-drains **`rx_backlog_synth`** via **`drain_rx_backlog_synth_only`** so partial CPR is not completed after the next host chunk.  
