@@ -168,3 +168,19 @@ Next promising directions: (a) find and prevent whatever leaves the swapper/sche
 - `--stress-repeat 4 6` (fast stress, 24 phases / 12 exit cycles): green.
 - `--exit-cycle` (fast): green (5/5 + earlier).
 - Reproducer (char-by-char `import pl` + Tab + 13 s settle + second uv): 5/5 green (was blocking before the fix).
+
+## 200-phase run: residual block (2026-08-04, WIP)
+
+The full `--stress 200` (fast stress) gate does NOT yet pass: it blocks at attempt ~12 with a 100 ms compute backoff, ~20 with 250 ms. The block: after a phase's `^U + exit()`, the **shell never returns to the prompt** (`warn: no ash / # seen after exit+settle`); `uv` (the `uv run` parent of the exited python) is stuck in `st=0x2001` — its `waitpid` for python never completes. It is a **true deadlock**, not a timeout (the guest keeps ticking, `SP804_WR` continues, but the banner never appears).
+
+**Mechanism (best understanding).** A lost wakeup in the guest's exit path: `uv` sleeps in `waitpid`; the scheduler then never runs python (its child) to exit it, because the guest's scheduler was corrupted by the VMM's abnormal timer delivery over ~10-20 exit cycles. The corruption is the guest's IRQ-exit path scheduling the idle task with `PSTATE.I=1` (`preempt_schedule_irq` runs the idle task with I still masked — a *normal* transient state; HVF's WFI-not-waking bug made it look abnormal). Each timer delivery at a bad point (a force_exit interrupting the wait/wakeup path) is a chance to corrupt; longer idle/exit chains accumulate it.
+
+**Things tested and ruled out as the cause:**
+- Increasing RAM 256 MB → 1024 MB (not OOM; still blocks at attempt 20).
+- Enabling virtio-rng (guest still blocks; the hwrng kthread deadlocks on the virtio-rng `reinit_completion` vs `complete` race — the device fills a few buffers then stalls, so no entropy flows; even fixing `RNG_KICK_RACE` to write `GICD_ISPENDR1` didn't help). RNG left disabled.
+- Removing the idle-WFI `PSTATE.I` clear (the VMM workaround that clears I at `cpu_do_idle`'s WFI) — it's a spurious-interrupt/corruption risk (clearing I lets a timer into the `preempt_schedule_irq` context), but removing it was *neutral* on the 200-run (still attempt 20). It is now removed anyway, because the periodic force_exit wakes the WFI and the armed pending timer is taken at a natural I=0 point after the guest ERETs.
+- Increasing the compute backoff 100 → 250 ms reduces the block rate (attempt 12 → 20), confirming preemption-during-compute is a contributor, but no feasible backoff reaches 200 phases (the guest becomes too slow).
+
+**Residual:** a guest-side scheduler/waitqueue lost wakeup after ~10-20 exit cycles. VMM-side recovery (force_exit, TIF_NEED_RESCHED) does not unstick it — the re-check re-sleeps, so the waitqueue state itself is corrupt. Likely needs a preventive fix that keeps the guest's IRQ-exit path from scheduling with I=1 in the first place (e.g., a cleaner timer delivery that HVF wakes naturally), which is the same conclusion the earlier session reached.
+
+**Net state:** the primary gates (`--exit-cycle`, `--stress-repeat 4 2` default pacing, fast stress) are green; the 200-phase marathon still hits a rare deadlock at ~attempt 20.

@@ -483,10 +483,10 @@ impl VmInstance {
             None
         };
 
-        // Exclude virtio-rng from the DT to avoid the kernel 4.14 virtio-rng
-        // driver race (hwrng kthread completion vs ISR).  The rng-seed property
-        // in /chosen plus random.trust_bootloader=on provides initial CRNG
-        // seeding without the driver.
+        // Exclude virtio-rng from the DT: the guest's hwrng kthread deadlocks on
+        // the virtio-rng completion race (complete() lost vs reinit_completion),
+        // so the device fills a couple of buffers then stalls — no entropy, plus
+        // extra wakeups.  The rng-seed in /chosen seeds the CRNG at boot.
         let virtio_rng_dt: Option<(u64, u32)> = None;
 
         // Always include ALL MAX_FS_DEVICES virtiofs entries in the DT so
@@ -817,6 +817,15 @@ impl VmInstance {
                             ));
                             rng.interrupt_status |= 1;
                             Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
+                            // HVF's set_gic_spi does not create pending state;
+                            // without GICD_ISPENDR1 the hwrng ISR never fires
+                            // and the kthread's complete() is lost forever.
+                            if self.boot_complete {
+                                let _ = Vm::set_distributor_reg(
+                                    HvGicDistributorReg::Ispendr1,
+                                    1u64 << 18, // INTID 50 = SPI 18 (rng)
+                                );
+                            }
                         }
                     }
                     lp_watch_wall = Instant::now();
@@ -1036,6 +1045,13 @@ impl VmInstance {
                 let guest_pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
                 let is_idle_pc = (IDLE_REGION_LO..IDLE_REGION_HI).contains(&guest_pc);
                 use std::sync::atomic::Ordering;
+                let prev = self.guest_idle.load(Ordering::Relaxed);
+                if prev != is_idle_pc {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "GUEST_IDLE {}→{} PC=0x{guest_pc:x} er={exit_reason}",
+                        prev, is_idle_pc
+                    ));
+                }
                 self.guest_idle.store(is_idle_pc, Ordering::Relaxed);
             }
 
@@ -1152,26 +1168,16 @@ impl VmInstance {
                         }
                     }
 
-                    // Clear PSTATE.I ONLY when the vCPU is parked at the idle
-                    // loop's WFI (cpu_do_idle).  In that state the guest is
-                    // genuinely idle — the IRQ-exit path entered the idle WFI
-                    // without restoring I (SPSR_EL1.I=0), so the pending timer
-                    // interrupt can never be taken and the guest spins forever.
-                    // Clearing I there is safe (nothing is protected) and lets
-                    // the armed pending interrupt be delivered on the next run.
-                    // We deliberately do NOT clear I in other contexts: the
-                    // guest may be inside a critical section holding a spinlock,
-                    // and unmasking IRQs there lets a pending interrupt preempt
-                    // the lock holder → exit-cycle deadlock.
-                    if self.boot_complete && cc >= 2 {
-                        let pc_idle = vcpu.read_register(HvReg::Pc).unwrap_or(0);
-                        let cpsr_idle = vcpu.read_register(HvReg::Cpsr).unwrap_or(0);
-                        // cpu_do_idle WFI at 0xffff80008035a028, ret at 0x...a02c.
-                        const IDLE_WFI_RET: u64 = 0xffff_8000_8035_a02c;
-                        if pc_idle == IDLE_WFI_RET && (cpsr_idle >> 7) & 1 == 1 {
-                            let _ = vcpu.write_register(HvReg::Cpsr, cpsr_idle & !(1 << 7));
-                        }
-                    }
+                    // NOTE: we deliberately do NOT clear PSTATE.I at the idle
+                    // WFI anymore.  The "idle entered with I=1" is the normal
+                    // preempt_schedule_irq context (the IRQ-exit path schedules
+                    // the idle task with I still masked); clearing I there lets
+                    // the armed pending timer interrupt into that context,
+                    // corrupting the scheduler (the phase-12/20 second-uv
+                    // block: a task left stuck holding a scheduler lock).  The
+                    // periodic force_exit wakes the WFI; the guest then returns
+                    // through the IRQ-exit (ERET → I restored) and takes the
+                    // armed pending timer at a natural I=0 point.
                     // Read PC on CANCELED exits every 25 iterations to diagnose execution.
                     // More frequent during early boot and hang phases.
                     if cc == 1 || cc % 25 == 0 {
@@ -1217,6 +1223,7 @@ impl VmInstance {
                             let cval = vcpu.read_sys_register(HvSysReg::CntvCvalEl0).unwrap_or(0);
                             let ctl = vcpu.read_sys_register(HvSysReg::CntvCtlEl0).unwrap_or(0);
                             let cntvct = vcpu.read_sys_register(HvSysReg::CntvCtEl0).unwrap_or(0);
+                            let cntpct = vcpu.read_sys_register(HvSysReg::CntpctEl0).unwrap_or(0);
                             let cntfrq = vcpu.read_sys_register(HvSysReg::CntfrqEl0).unwrap_or(0);
                             let vtimer_masked = vcpu.get_vtimer_mask().unwrap_or(false);
                             crate::vmm_trace::write_console_io(format_args!(
@@ -1235,7 +1242,7 @@ impl VmInstance {
                                 c.interrupt_status, c.irq_acked, c.rx_backlog.len(), vtimer_masked,
                             ));
                             crate::vmm_trace::write_console_io(format_args!(
-                                "  cntvct=0x{cntvct:x} cntfrq=0x{cntfrq:x} cval_delta={}",
+                                "  cntvct=0x{cntvct:x} cntpct=0x{cntpct:x} cntfrq=0x{cntfrq:x} cval_delta={}",
                                 cval.wrapping_sub(cntvct) as i64,
                             ));
                             let icc_pmr = vcpu.get_icc_reg(HvGicIccReg::PmrEl1).unwrap_or(0);
@@ -2114,7 +2121,7 @@ impl VmInstance {
             // guest code (which can preempt a critical section and deadlock the
             // guest — the phase-2 uv startup block).  stdin data is polled
             // regardless and wakes the vCPU immediately.
-            let timeout_ms = if guest_idle.load(Ordering::Relaxed) { 10 } else { 100 };
+            let timeout_ms = if guest_idle.load(Ordering::Relaxed) { 10 } else { 250 };
             let (_ready, hungup) = poll_stdin_once_timeout(stdin_fd, timeout_ms);
             Vcpu::force_exit(&[vcpu_id]).ok();
             if hungup {
