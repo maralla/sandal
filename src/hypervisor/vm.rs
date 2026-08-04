@@ -163,6 +163,26 @@ impl Vm {
         }
     }
 
+    /// Read a GIC distributor register.
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_distributor_reg(reg: super::ffi::HvGicDistributorReg) -> Option<u64> {
+        use super::ffi::{hv_gic_get_distributor_reg_wrapper, HV_SUCCESS};
+        let mut value: u64 = 0;
+        let ret = unsafe { hv_gic_get_distributor_reg_wrapper(reg as u16, &mut value) };
+        if ret != HV_SUCCESS {
+            return None;
+        }
+        Some(value)
+    }
+
+    /// Write a GIC distributor register.
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_distributor_reg(reg: super::ffi::HvGicDistributorReg, value: u64) -> bool {
+        use super::ffi::{hv_gic_set_distributor_reg_wrapper, HV_SUCCESS};
+        let ret = unsafe { hv_gic_set_distributor_reg_wrapper(reg as u16, value) };
+        ret == HV_SUCCESS
+    }
+
     /// Save GIC state as an opaque byte blob (macOS 15.0+).
     /// Returns None if GIC state saving is not supported.
     #[cfg(target_arch = "aarch64")]

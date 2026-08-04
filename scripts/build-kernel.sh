@@ -72,6 +72,12 @@ ssh "$HOST" "
     cd $REMOTE_DIR/$KSRC
     cp ../kernel.config .config
     make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig 2>&1 | tail -1
+    # Force-enable SP804 in case olddefconfig dropped it due to unmet deps.
+    if ! grep -q '^CONFIG_ARM_TIMER_SP804=y' .config; then
+        echo 'Enabling CONFIG_ARM_TIMER_SP804...'
+        scripts/config --set-val HAVE_ARM_TIMER_SP804 y --set-val ARM_TIMER_SP804 y
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig 2>&1 | tail -1
+    fi
     make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j\$(nproc) Image 2>&1 | tail -3
 "
 

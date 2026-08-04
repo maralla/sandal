@@ -314,6 +314,11 @@ pub struct VirtioFsDevice {
     handles: HashMap<u64, HandleState>,
     next_ino: u64,
     next_fh: u64,
+
+    /// Monotonically increments each time the VMM completes a FUSE request.
+    pub work_gen: u64,
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioFsDevice {
@@ -347,12 +352,14 @@ impl VirtioFsDevice {
             handles: HashMap::new(),
             next_ino: 2, // 1 is reserved for root
             next_fh: 1,
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
     // ---- Virtio MMIO interface ----
 
-    pub fn mmio_read(&self, offset: u64) -> u32 {
+    pub fn mmio_read(&mut self, offset: u64) -> u32 {
         match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
             REG_VERSION => VIRTIO_MMIO_VERSION,
@@ -381,7 +388,10 @@ impl VirtioFsDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status
+            }
             REG_STATUS => self.status,
             // Shared memory region registers: return length = ~0 to indicate
             // no shared memory region available (no DAX window)
@@ -439,7 +449,12 @@ impl VirtioFsDevice {
                 }
             }
             REG_QUEUE_NOTIFY => return Some(value),
-            REG_INTERRUPT_ACK => self.interrupt_status &= !value,
+            REG_INTERRUPT_ACK => {
+                self.interrupt_status &= !value;
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= 1;
+                }
+            }
             REG_SHM_SEL => { /* Accept SHM region selection; we have no SHM regions */ }
             REG_STATUS => {
                 self.status = value;
@@ -492,6 +507,8 @@ impl VirtioFsDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         self.inodes.clear();
         self.path_to_inode.clear();
         self.handles.clear();
@@ -574,6 +591,7 @@ impl VirtioFsDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.work_gen += 1;
             true
         } else {
             false

@@ -69,12 +69,27 @@ pub struct VirtioConsoleDevice {
     /// Host stdin (and init blob) not yet copied into the guest receiveq — survives `read()` when
     /// the guest has not posted RX buffers yet.
     pub rx_backlog: Vec<u8>,
+
+    /// Set when the guest writes INTERRUPT_ACK; cleared when the VMM completes new work.
+    /// Helps detect orphan interrupts: if irq is set but guest already acked and no new
+    /// work was done, the interrupt is spurious and can be safely cleared.
+    pub irq_acked: bool,
+
+    /// Monotonically increments each time the VMM delivers RX data or processes TX.
+    /// Used to detect work that arrives between the guest's ISR read of INTERRUPT_STATUS
+    /// and its INTERRUPT_ACK write, preventing lost interrupts.
+    pub work_gen: u64,
+
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    /// If `work_gen > work_gen_at_read` at ACK time, new work arrived after the guest
+    /// last sampled the status register, so the interrupt must not be cleared.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioConsoleDevice {
     /// Max transmitq avail heads per `process_tx` call so Tab-sized bursts do not monopolize the
     /// VMM thread (stdin + main loop make progress between `vcpu.run()` entries).
-    const TX_HEADS_PER_SLICE: u16 = 16_384;
+    const TX_HEADS_PER_SLICE: u16 = 256;
 
     pub fn new(cols: u16, rows: u16) -> Self {
         VirtioConsoleDevice {
@@ -88,6 +103,9 @@ impl VirtioConsoleDevice {
             cols,
             rows,
             rx_backlog: Vec::new(),
+            irq_acked: false,
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
@@ -102,7 +120,7 @@ impl VirtioConsoleDevice {
     ///
     /// `sas` is the ARM64 Data Abort ISS access size (`0` byte … `3` doubleword). Required for
     /// `DEVICE_CONFIG` loads: Linux may use `readl` on `cols`/`rows` or byte/halfword probes.
-    pub fn mmio_read(&self, offset: u64, sas: u8) -> u64 {
+    pub fn mmio_read(&mut self, offset: u64, sas: u8) -> u64 {
         let cfg = self.virtio_console_config_bytes();
         if (REG_CONFIG_BASE..REG_CONFIG_BASE + 16).contains(&offset) {
             return read_console_config_le(&cfg, (offset - REG_CONFIG_BASE) as usize, sas);
@@ -134,7 +152,10 @@ impl VirtioConsoleDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status as u64,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status as u64
+            }
             REG_STATUS => self.status as u64,
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
             REG_SHM_BASE_LOW | REG_SHM_BASE_HIGH => 0,
@@ -180,6 +201,13 @@ impl VirtioConsoleDevice {
             }
             REG_INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                self.irq_acked = true;
+                // If new work arrived after the guest last read INTERRUPT_STATUS,
+                // the ACK must not clear the interrupt for that work.
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= 1;
+                    self.irq_acked = false;
+                }
             }
             REG_STATUS => {
                 self.status = value;
@@ -233,6 +261,9 @@ impl VirtioConsoleDevice {
         self.interrupt_status = 0;
         self.driver_features = 0;
         self.rx_backlog.clear();
+        self.irq_acked = false;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         for q in &mut self.queues {
             *q = VirtqState::new(QUEUE_SIZE);
         }
@@ -259,6 +290,10 @@ impl VirtioConsoleDevice {
             pending.drain(..n);
             self.rx_backlog = pending;
             if n == 0 {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "RX_BACKLOG_STALL pending_len={}",
+                    self.rx_backlog.len()
+                ));
                 break;
             }
             progressed = true;
@@ -363,6 +398,22 @@ impl VirtioConsoleDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.irq_acked = false;
+            self.work_gen += 1;
+            crate::vmm_trace::write_console_io(format_args!(
+                "TX_SET_IRQ used_count={used_count} out_bytes={} irq_status={}",
+                output.len(),
+                self.interrupt_status,
+            ));
+        }
+
+        if crate::vmm_trace::console_io_enabled() && used_count > 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "TX_BATCH heads={} out_bytes={} preview=\"{}\"",
+                used_count,
+                output.len(),
+                crate::vmm_trace::bytes_preview(&output, 32)
+            ));
         }
 
         output
@@ -378,24 +429,46 @@ impl VirtioConsoleDevice {
 
         let q = self.queues[RX_QUEUE].clone();
         if !q.ready || q.num == 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "INJECT_RX_SKIP in_len={} reason=queue_not_ready ready={} num={}",
+                data.len(),
+                q.ready,
+                q.num
+            ));
             return 0;
         }
 
         let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
             Some(idx) => idx,
-            None => return 0,
+            None => {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "INJECT_RX_SKIP in_len={} reason=bad_avail_ring",
+                    data.len()
+                ));
+                return 0;
+            }
         };
 
         let mut last_avail = self.queues[RX_QUEUE].last_avail_idx;
         if last_avail == avail_idx {
+            crate::vmm_trace::write_console_io(format_args!(
+                "INJECT_RX_SKIP in_len={} reason=no_avail_buffers avail_idx={last_avail}",
+                data.len()
+            ));
             return 0;
         }
 
         let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
         let mut used_count = 0u16;
         let mut data_offset = 0usize;
+        let last_avail_start = last_avail;
+        // Cap heads per call so the used ring and `last_avail_idx` stay consistent under load.
+        let max_rx_heads: u16 = (q.num as u16).clamp(1, 64);
 
         while data_offset < data.len() && last_avail != avail_idx {
+            if used_count >= max_rx_heads {
+                break;
+            }
             let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
             {
                 Some(d) => d,
@@ -461,7 +534,30 @@ impl VirtioConsoleDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.irq_acked = false;
+            self.work_gen += 1;
         }
+
+        let last_avail_end = self.queues[RX_QUEUE].last_avail_idx;
+        let irq = self.interrupt_status != 0;
+        if used_count > 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "RX_SET_IRQ in_len={} heads={used_count} irq_status={}",
+                data.len(),
+                self.interrupt_status,
+            ));
+        }
+        crate::vmm_trace::write_console_io(format_args!(
+            "INJECT_RX in_len={} consumed={} heads={} avail={} last_avail {}->{} irq={}",
+            data.len(),
+            data_offset,
+            used_count,
+            avail_idx,
+            last_avail_start,
+            last_avail_end,
+            irq
+        ));
+
         data_offset
     }
 }
@@ -472,7 +568,7 @@ mod tests {
 
     #[test]
     fn mmio_config_word_matches_le_cols_rows() {
-        let c = VirtioConsoleDevice::new(80, 25);
+        let mut c = VirtioConsoleDevice::new(80, 25);
         let v = c.mmio_read(REG_CONFIG_BASE, 2);
         let want = u32::from_le_bytes([80u8, 0, 25, 0]) as u64;
         assert_eq!(v, want);
@@ -480,13 +576,13 @@ mod tests {
 
     #[test]
     fn mmio_config_byte_second_byte_of_cols() {
-        let c = VirtioConsoleDevice::new(0x3412, 0);
+        let mut c = VirtioConsoleDevice::new(0x3412, 0);
         assert_eq!(c.mmio_read(REG_CONFIG_BASE + 1, 0), 0x34);
     }
 
     #[test]
     fn mmio_config_halfword_rows() {
-        let c = VirtioConsoleDevice::new(80, 25);
+        let mut c = VirtioConsoleDevice::new(80, 25);
         assert_eq!(c.mmio_read(REG_CONFIG_BASE + 2, 1), 25);
     }
 }

@@ -45,6 +45,7 @@ impl DeviceTree {
         virtio_console: Option<(u64, u32)>,
         verbose: bool,
         overlay_bootarg: Option<&str>,
+        rng_seed: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         let mut dt = Self::new();
 
@@ -62,7 +63,9 @@ impl DeviceTree {
         {
             // earlycon=pl011 for early boot / panic messages on the MMIO UART.
             // console=hvc0 makes the virtio-console the primary interactive console.
-            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0";
+            // random.trust_bootloader=on: seed CRNG at boot so getrandom() never blocks.
+            // random.trust_cpu=on: trust CPU RNG (RNDR on ARMv8.5+) as additional entropy.
+            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0 random.trust_bootloader=on random.trust_cpu=on nohz=off highres=off";
             let rootfs = if virtio_blk.is_some() {
                 " root=/dev/vda rw init=/init"
             } else if initrd.is_some() {
@@ -81,6 +84,13 @@ impl DeviceTree {
         }
         // stdout-path points to the UART node for earlycon
         dt.prop_string("stdout-path", "/pl011@9000000");
+        // Seed the kernel CRNG at early boot so userspace never blocks on
+        // /dev/urandom — the virtio-rng hwrng kthread on Linux 4.14 has a
+        // completion race (reinit_completion vs complete from ISR) that can
+        // permanently stall the hwrng feed under NO_HZ.
+        if let Some(seed) = rng_seed {
+            dt.prop_bytes("rng-seed", seed);
+        }
         if let Some((initrd_start, initrd_end)) = initrd {
             dt.prop_u64("linux,initrd-start", initrd_start);
             dt.prop_u64("linux,initrd-end", initrd_end);
@@ -142,22 +152,39 @@ impl DeviceTree {
         dt.end_node();
 
         // Timer node (ARM generic timer)
+        // No interrupts are advertised — all arch timer PPIs (virtual timer PPI 11,
+        // physical timers PPI 13/14, hyp timer PPI 10) are broken on Apple Silicon
+        // HVF.  Without interrupts the kernel only registers the arch timer as a
+        // clocksource (CNTVCT_EL0 works) and falls back to SP804 Timer 1 for the
+        // clockevent.
         dt.begin_node("timer");
         dt.prop_stringlist("compatible", &["arm,armv8-timer", "arm,armv7-timer"]);
         dt.prop_empty("always-on");
-        // interrupts: secure phys, non-secure phys, virt, hyp phys
-        // Each interrupt specifier: <type irq flags>
-        // GIC_FDT_IRQ_TYPE_PPI = 1
-        // INTID_TO_PPI(irq) = irq - 16
-        // Flags: GIC_FDT_IRQ_FLAGS_LEVEL_HI = 4
-        // Timer IRQs: S_EL1=29→PPI13, NS_EL1=30→PPI14, VIRT=27→PPI11, NS_EL2=26→PPI10
-        let mut interrupts = Vec::new();
-        for irq in &[13u32, 14, 11, 10] {
-            interrupts.extend_from_slice(&1u32.to_be_bytes()); // GIC_FDT_IRQ_TYPE_PPI
-            interrupts.extend_from_slice(&irq.to_be_bytes()); // PPI number
-            interrupts.extend_from_slice(&4u32.to_be_bytes()); // GIC_FDT_IRQ_FLAGS_LEVEL_HI
+        dt.end_node();
+
+        // SP804 Dual-Timer MMIO node — clocksource + clockevent replacement
+        // for the broken ARM generic timer on Apple Silicon HVF.
+        dt.begin_node("sp804@9010000");
+        dt.prop_stringlist("compatible", &["arm,sp804", "arm,primecell"]);
+        let mut sp804_reg = Vec::new();
+        sp804_reg.extend_from_slice(&0x09010000u64.to_be_bytes());
+        sp804_reg.extend_from_slice(&0x1000u64.to_be_bytes());
+        dt.prop_bytes("reg", &sp804_reg);
+        // interrupts: Timer 1 (SPI 29), Timer 2 (SPI 30), both level-high
+        let mut sp804_irqs = Vec::new();
+        for irq in &[29u32, 30] {
+            sp804_irqs.extend_from_slice(&0u32.to_be_bytes()); // SPI
+            sp804_irqs.extend_from_slice(&irq.to_be_bytes());
+            sp804_irqs.extend_from_slice(&4u32.to_be_bytes()); // level-high
         }
-        dt.prop_bytes("interrupts", &interrupts);
+        dt.prop_bytes("interrupts", &sp804_irqs);
+        dt.prop_stringlist("clock-names", &["timclk"]);
+        let sp804_clock_phandle: [u32; 1] = [0x8002];
+        let mut sp804_clk_bytes = Vec::new();
+        for c in &sp804_clock_phandle {
+            sp804_clk_bytes.extend_from_slice(&c.to_be_bytes());
+        }
+        dt.prop_bytes("clocks", &sp804_clk_bytes);
         dt.end_node();
 
         // UART node — PL011 earlycon-only stub (for early boot & panic messages)
@@ -299,6 +326,15 @@ impl DeviceTree {
         dt.prop_u32("clock-frequency", 24000000); // 24 MHz
         dt.prop_string("clock-output-names", "clk24mhz");
         dt.prop_u32("phandle", 0x8000);
+        dt.end_node();
+
+        // Timer clock for SP804 (1 MHz)
+        dt.begin_node("timclk");
+        dt.prop_string("compatible", "fixed-clock");
+        dt.prop_u32("#clock-cells", 0);
+        dt.prop_u32("clock-frequency", 1000000); // 1 MHz
+        dt.prop_string("clock-output-names", "timclk");
+        dt.prop_u32("phandle", 0x8002);
         dt.end_node();
 
         dt.end_node(); // root

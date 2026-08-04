@@ -165,6 +165,15 @@ int hv_gic_set_icc_reg_wrapper(uint32_t vcpu, uint16_t reg, uint64_t value) {
     return hv_gic_set_icc_reg((hv_vcpu_t)vcpu, (hv_gic_icc_reg_t)reg, value);
 }
 
+// GIC distributor register access (macOS 15.0+)
+int hv_gic_get_distributor_reg_wrapper(uint16_t reg, uint64_t *value) {
+    return hv_gic_get_distributor_reg((hv_gic_distributor_reg_t)reg, value);
+}
+
+int hv_gic_set_distributor_reg_wrapper(uint16_t reg, uint64_t value) {
+    return hv_gic_set_distributor_reg((hv_gic_distributor_reg_t)reg, value);
+}
+
 // GIC state save/restore (macOS 15.0+)
 int hv_gic_state_save_wrapper(void *data, size_t *size) {
     hv_gic_state_t state = hv_gic_state_create();

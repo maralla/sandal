@@ -1,0 +1,47 @@
+#!/usr/bin/expect -f
+set timeout 30
+set binary "./target/release/sandal"
+spawn -noecho $binary --no-cache -- sh
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout waiting for shell"; exit 1 }
+}
+
+# Check dmesg for timer-related messages
+send -- "dmesg | grep -iE 'timer|sp804|clocksource|clockevent|arch_timer|sched_clock'\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after dmesg"; exit 1 }
+}
+
+send -- "cat /proc/interrupts\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after /proc/interrupts"; exit 1 }
+}
+
+send -- "cat /sys/devices/system/clocksource/clocksource0/current_clocksource\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after clocksource"; exit 1 }
+}
+
+send -- "cat /sys/devices/system/clockevents/clockevent0/current_device\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after clockevent"; exit 1 }
+}
+
+send -- "cat /sys/devices/system/clockevents/broadcast\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after broadcast"; exit 1 }
+}
+
+send -- "ls -la /sys/devices/system/clockevents/\r"
+expect {
+    "/ #" {}
+    timeout { puts stderr "FAIL: timeout after ls clockevents"; exit 1 }
+}
+
+exit 0

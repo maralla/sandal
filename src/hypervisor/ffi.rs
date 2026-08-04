@@ -189,6 +189,12 @@ extern "C" {
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_set_icc_reg_wrapper(vcpu: HvVcpu, reg: u16, value: u64) -> HvReturn;
 
+    // GIC distributor register access (macOS 15.0+)
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_get_distributor_reg_wrapper(reg: u16, value: *mut u64) -> HvReturn;
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_gic_set_distributor_reg_wrapper(reg: u16, value: u64) -> HvReturn;
+
     // GIC state save/restore (macOS 15.0+)
     #[cfg(target_arch = "aarch64")]
     pub fn hv_gic_state_save_wrapper(data: *mut u8, size: *mut usize) -> HvReturn;
@@ -239,8 +245,17 @@ pub enum HvSysReg {
 
     // Counter-timer
     CntkctlEl1 = 0xc708,  // Counter-timer Kernel Control Register
+    CntfrqEl0 = 0xdf00,   // Counter-timer Frequency Register
+    CntpctEl0 = 0xdf01,   // Counter-timer Physical Count Register
+    CntvCtEl0 = 0xdf02,   // Counter-timer Virtual Count Register
+    CntpCtlEl0 = 0xdf11,  // Counter-timer Physical Timer Control
+    CntpCvalEl0 = 0xdf12, // Counter-timer Physical Timer CompareValue
     CntvCtlEl0 = 0xdf19,  // Counter-timer Virtual Timer Control
     CntvCvalEl0 = 0xdf1a, // Counter-timer Virtual Timer CompareValue
+
+    // GIC ICC registers accessed as system registers (ICC_SRE_EL1.SRE=1).
+    // These overlap with HvGicIccReg encoding but are used via
+    // hv_vcpu_write_sys_reg as a fallback when hv_gic_set_icc_reg fails.
 }
 
 /// GIC ICC (CPU Interface) system registers.
@@ -258,4 +273,28 @@ pub enum HvGicIccReg {
     SreEl1 = 0xc665,     // System Register Enable
     Igrpen0El1 = 0xc666, // Interrupt Group 0 Enable
     Igrpen1El1 = 0xc667, // Interrupt Group 1 Enable
+    Iar1El1 = 0xc660,    // Interrupt Acknowledge Register 1 (not supported by HVF)
+    Eoir1El1 = 0xc661,   // End Of Interrupt Register 1 (not supported by HVF)
+    DirEl1 = 0xc659,     // Deactivate Interrupt Register (not supported by HVF)
+}
+
+/// GIC distributor (GICD) registers accessible via hv_gic_{get,set}_distributor_reg.
+/// The VMM cannot read/write the distributor via MMIO (HVF owns it natively), but
+/// these dedicated APIs expose the distributor register file so the VMM can, e.g.,
+/// re-enable an SPI line the guest disabled via `disable_irq` (GICD_ISENABLER).
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+#[cfg(target_arch = "aarch64")]
+pub enum HvGicDistributorReg {
+    /// GICD_ISENABLER1 — enable SPIs 32..63 (console INTID 60 = bit 28,
+    /// timer INTID 61 = bit 29).
+    Isenabler1 = 0x0104,
+    /// GICD_ISPENDR1 — set-pending SPIs 32..63.  Writing 1 to a bit pends that
+    /// interrupt, which is a workaround for HVF's `hv_gic_set_spi` failing to
+    /// create pending state.
+    Ispendr1 = 0x0204,
+    /// GICD_ICPENDR1 — clear-pending SPIs 32..63.
+    Icpendr1 = 0x0284,
+    /// GICD_ICENABLER1 — clear-enable SPIs 32..63.
+    Iceabler1 = 0x0184,
 }

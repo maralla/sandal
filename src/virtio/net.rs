@@ -45,6 +45,11 @@ pub struct VirtioNetDevice {
 
     // Scratch buffer for packet I/O
     pkt_buf: Vec<u8>,
+
+    /// Monotonically increments each time the VMM delivers RX or completes TX.
+    pub work_gen: u64,
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioNetDevice {
@@ -64,11 +69,13 @@ impl VirtioNetDevice {
             backend,
             filter,
             pkt_buf: vec![0u8; 2048],
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
     /// Handle an MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64) -> u32 {
+    pub fn mmio_read(&mut self, offset: u64) -> u32 {
         match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
             REG_VERSION => VIRTIO_MMIO_VERSION,
@@ -96,7 +103,10 @@ impl VirtioNetDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status
+            }
             REG_STATUS => self.status,
             // Shared memory region: length = ~0 means no SHM available
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
@@ -158,6 +168,9 @@ impl VirtioNetDevice {
             }
             REG_INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= 1;
+                }
             }
             REG_STATUS => {
                 self.status = value;
@@ -210,6 +223,8 @@ impl VirtioNetDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         for q in &mut self.queues {
             *q = VirtqState::new(QUEUE_SIZE);
         }
@@ -304,6 +319,7 @@ impl VirtioNetDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.work_gen += 1;
             true
         } else {
             false
@@ -392,6 +408,7 @@ impl VirtioNetDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.work_gen += 1;
             true
         } else {
             false

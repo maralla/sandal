@@ -1,0 +1,8 @@
+#!/usr/bin/expect -f
+set timeout 8
+spawn -noecho ./target/release/sandal --no-cache -- sh
+expect {
+    "/ #" { puts "GOT_SHELL"; exit 0 }
+    timeout { puts "TIMEOUT"; exit 1 }
+    eof { puts "EOF"; exit 1 }
+}

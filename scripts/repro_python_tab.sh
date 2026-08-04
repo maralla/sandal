@@ -54,7 +54,7 @@ FAIL_FAST=0
 GLOBAL_REPRO_ARGS=()
 
 strip_global_flags() {
-	local out=()
+	unset _REPRO_OUT; _REPRO_OUT=()
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--trace-console-io) TRACE_CONSOLE_IO=1 ;;
@@ -69,15 +69,22 @@ strip_global_flags() {
 			}
 			;;
 		--fail-fast) FAIL_FAST=1 ;;
-		*) out+=("$1") ;;
+		*) _REPRO_OUT+=("$1") ;;
 		esac
 		shift
 	done
-	GLOBAL_REPRO_ARGS=("${out[@]}")
+		# Use explicit index loop instead of [@] expansion for bash 3.2 compat
+		GLOBAL_REPRO_ARGS=()
+		for (( _ri = 0; _ri < ${#_REPRO_OUT[@]}; _ri++ )); do
+			GLOBAL_REPRO_ARGS+=("${_REPRO_OUT[$_ri]}")
+		done
 }
 
 strip_global_flags "$@"
-set -- "${GLOBAL_REPRO_ARGS[@]}"
+set --
+for (( _ri = 0; _ri < ${#GLOBAL_REPRO_ARGS[@]}; _ri++ )); do
+	set -- "$@" "${GLOBAL_REPRO_ARGS[$_ri]}"
+done
 
 if [[ "$FAIL_FAST" == 1 ]]; then
 	export REPRO_FAIL_FAST=1
@@ -183,24 +190,13 @@ proc type_human_line { text } {
 	}
 }
 
-proc send_line_exit_python_repl {} {
-	global env
-	send -- "\x15"
-	set t0 [expr {int($env(EX_TYPE_MIN))}]
-	set t1 [expr {int($env(EX_TYPE_MAX))}]
-	after [rand_ms $t0 $t1]
-	send -- "exit()\r"
-}
-
 proc send_force_exit_python_repl {} {
 	global env
 	send -- "\x15"
 	set t0 [expr {int($env(EX_TYPE_MIN))}]
 	set t1 [expr {int($env(EX_TYPE_MAX))}]
 	after [rand_ms $t0 $t1]
-	send -- "import os\r"
-	after [rand_ms $t0 $t1]
-	send -- "os._exit(0)\r"
+	send -- "exit()\r"
 }
 
 proc send_uv_run_python {} {
@@ -304,21 +300,9 @@ for {set i 1} {$i <= $attempts} {incr i} {
 		if {$env(EX_REPRO_PROFILE) == "exit_cycle"} {
 			puts stderr "attempt $i / $attempts: exit/os._exit, uv run python (no Ctrl-C)"
 		} else {
-			puts stderr "attempt $i / $attempts: Ctrl-C, exit/os._exit, uv run python"
+			puts stderr "attempt $i / $attempts: os._exit(0), uv run python"
 		}
-		if {$env(EX_REPRO_PROFILE) != "exit_cycle"} {
-			set c0 [expr {int($env(EX_PRE_CTRLC_MIN))}]
-			set c1 [expr {int($env(EX_PRE_CTRLC_MAX))}]
-			after [rand_ms $c0 $c1]
-			send -- "\x03"
-			set timeout [expr {max(12, int($env(REPRO_EXIT_FIRST_WAIT)))}]
-			expect {
-				-re {>>>} { }
-				timeout { puts stderr "timeout: no >>> after Ctrl-C (attempt $i)"; exit 1 }
-				eof { puts stderr "eof after Ctrl-C"; exit 1 }
-			}
-		}
-		send_line_exit_python_repl
+		send_force_exit_python_repl
 		set em [expr {int($env(EX_EXIT_REPL_SETTLE_MS))}]
 		if {$em > 0} {
 			set settle $em

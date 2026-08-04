@@ -1,0 +1,12 @@
+#!/usr/bin/expect -f
+set timeout 15
+set binary "./target/release/sandal"
+# Capture all output
+log_user 1
+spawn -noecho $binary --no-cache -- sh
+expect {
+    "/ #" { puts "GOT SHELL PROMPT" }
+    timeout { puts stderr "FAIL: timeout waiting for shell"; }
+    eof { puts stderr "FAIL: sandal exited"; }
+}
+exit 0

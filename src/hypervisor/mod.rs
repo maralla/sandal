@@ -1,4 +1,4 @@
-mod ffi;
+pub(crate) mod ffi;
 pub mod vcpu;
 pub mod vm;
 
@@ -8,6 +8,8 @@ pub use ffi::{HvReg, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE};
 pub use vcpu::Vcpu;
 pub use vm::Vm;
 
+#[cfg(target_arch = "aarch64")]
+pub use ffi::HvGicDistributorReg;
 #[cfg(target_arch = "aarch64")]
 pub use ffi::HvGicIccReg;
 #[cfg(target_arch = "aarch64")]

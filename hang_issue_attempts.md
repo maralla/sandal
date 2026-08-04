@@ -105,3 +105,66 @@ The failures (timeouts like **no `>>>` after `uv run python`**, or no shell afte
 | R2-25 | **`poll_stdin`**: **`console_synth_rx_pending.clear()`** when **`stdin_chunk_contains_uv_run`**; **`SYNTH_FLUSH_BEFORE_HARNESS_STDIN`** skipped when chunk contains **`uv run`** (trace showed flush + **`uv`** same poll while **`uv_stdin` false** edge). Device **`rx_backlog_synth`** still pre-drained on host **`push_rx_and_drain`** |
 | R2-26 | **`VirtioConsoleDevice::discard_rx_backlog_synth`** before **`push_rx_and_drain`** (**Host**) when stdin chunk contains **`uv run`** — do not inject stuck CPR from **`rx_backlog_synth`** ahead of the **`uv`** line |
 | R2-27 | **`repro_python_tab.sh`**: even-phase REPL exit uses **`send_line_exit_python_repl`** (one **`exit()\r`** write after **`^U`**, like **`send_uv_run_python`**) — per-keystroke **`exit()`** interleaved harness **`stty`/`echo`/`uv`** with **`>>>`** readline echo so **`uv`** reached Python; **`wait_ash_prompt` (`/ #`)** was dropped (prompt not reliably visible in expect buffer) |
+
+---
+
+## Exit-cycle GIC starvation hang (WIP, 2026-08)
+
+Reproduces at attempt 4–12 (varies) under both `REPRO_FAST_STRESS` and default pacing.
+
+**Symptom.** After Python `exit()`, the guest enters the idle loop (`do_idle` → `cpu_do_idle`): it reads the cycle counter (`mrs x5, CNTPCTSS_EL0` at `0xffff80008035a00c`) and executes **WFI** (`0xffff80008035a028` = `0xd503207f`), suspending at `PC=0xffff80008035a02c`. Every subsequent exit is `CANCELED` (100 ms poller); no MMIO/sysreg exception ever fires; `consecutive_canceled` climbs past 900. SP804 Timer1 shows `ris=1 mis=1` and SPI 29 is asserted every iteration, but the guest never takes it. Injected console input never wakes it either.
+
+**Confirmed blockers (CONSOLE_IO traces + Hypervisor error codes):**
+1. During the hang every GIC/ICC op fails with **`HV_BAD_ARGUMENT` (0xfae94003)** while the vCPU is suspended mid-WFI: `hv_gic_get_icc_reg(IAR)` reads, `hv_gic_set_icc_reg(DIR/EOIR)` writes, `hv_vcpu_write_sys_reg(CNTVCT)` writes, and `hv_gic_state_restore` all fail. So the GIC cannot be inspected or reset once the hang starts (save still returns a blob; restore errors).
+2. `hv_vcpu_set_pending_interrupt(0,true)` returns Ok but does **not** wake a WFI-suspended vCPU (no exception exit after injection).
+3. Writing `HV_REG_CPSR` to clear PSTATE.I returns Ok and the VMM-side read shows I=0, but the next CANCELED read shows `0x410000c5` (I=1, F=1) again — the guest is inside an exception context (I+F hardware-masked) and re-masks / HVF doesn't persist the write across the run.
+4. Arch timer broken on Apple Silicon HVF: CNTVCT/CNTPCT/CNTFRQ read 0 from VMM, vtimer never fires (`exit_reason=2` count 0), CNTV_CTL writes are banked. Counter reads do not trap (0 `CNT_TRAP_RD`), so no synthetic counter.
+5. Guest time base is fine (SP804 Timer2 clocksource advances); the hang is purely interrupt delivery.
+
+**Attempted recoveries (all failed):** CPSR.I clear; SPI level pulse; ICC DIR; `set_pending_interrupt`; GIC state save/restore (restore errors mid-hang; firing early corrupts a working GIC); force-enabling CNTP/CNTV (banked); removing arch-timer dtb node (breaks boot).
+
+**Working theory.** Guest is stuck in a WFI inside an exception/idle context with PSTATE.I=1 (F=1 ⇒ hardware-masked). No interrupt can wake it (I=1), no event exists (single vCPU), and HVF blocks VMM-side GIC/state manipulation while the vCPU is suspended. Exact trigger after ~6 exit cycles still open. Suspects: spurious-interrupt-driven `disable_irq`, a stuck-Active SPI blocking delivery, or an HVF GIC state issue after many WFI-cancel cycles. Fix must be preventive (keep timer/console SPI delivery alive before the hang), since in-hang recovery is impossible.
+
+**Correction (later):** The `HV_BAD_ARGUMENT` errors for IAR/EOIR/DIR were NOT evidence of a broken GIC. The Apple `hv_gic_icc_reg` enum (hv_gic_types.h) does **not** expose IAR1_EL1/EOIR1_EL1/DIR_EL1 — those register encodings (0xc660/0xc661/0xc659) are simply invalid, so HVF returns `HV_BAD_ARGUMENT`. The supported registers (PMR, BPR0/1, AP0R0/1, RPR, CTLR, SRE, IGRPEN0/1) read back correct values during the hang (pmr=0xf0, igrpen1=1, ctlr=0x40400). So the GIC CPU-interface config is healthy and SPI delivery via `hv_gic_set_spi` may be working; the real blocker is the guest not taking the interrupt.
+
+Refined picture: the guest is stuck inside an **exception (IRQ) context with PSTATE.I=1, F=1 and SPSR_EL1.I=0** — i.e. an IRQ handler (or IRQ-exit schedule path) entered the idle loop and its WFI cannot wake because I is still masked (hardware masks I/F on exception entry; the handler never returned/ERET'd). Forcing a raw ERET by pointing PC at an ERET instruction in the kernel image crashes the guest (the saved ELR_EL1 is not a valid continuation), so that recovery is off the table. No VMM-side recovery has been able to make this guest take an interrupt once it reaches this state.
+
+**Final state (2026-08):** The hang remains unfixed. Key facts established this session:
+- The GIC CPU-interface is healthy during the hang: PMR=0xf0, IGRPEN1=1, CTLR=0x40400, and **AP1R0=AP0R0=0** (no interrupt stuck Active).
+- The SP804 timer SPI is asserted (`set_gic_spi` every iteration, device `ris=1`), but the guest never takes it even with PSTATE.I cleared to 0 (confirmed via ERET setup: SPSR_EL1/ELR_EL1/PC writes all return Ok and the subsequent CPSR read shows I=0, yet still no exception exit / MMIO from any ISR). This strongly implies the **timer and console SPIs are disabled in the GIC distributor** (kernel `disable_irq`), which `hv_gic_set_spi` cannot override (level assert on a disabled SPI never becomes pending) and which the VMM cannot re-enable (no distributor access; `hv_gic_state_restore` succeeds but does not restore the distributor enable bits).
+- **Panic clue:** forcing `TIF_NEED_RESCHED` on the swapper task makes the guest panic with "Attempted to kill the idle task!" — the idle task's state is being corrupted during the exit cycle, consistent with the shell/python teardown leaving the scheduler in a bad state. This suggests the root trigger is in the exit-cycle task/scheduler handling, not purely the GIC.
+- The one working lever is `hv_vcpu_write_sys_reg` for SPSR_EL1/ELR_EL1 (they succeed during the hang), so a correct exception-return could in principle unblock the guest — but with the SPIs disabled there is nothing to wake it even then.
+
+Next promising directions: (a) find and prevent whatever leaves the swapper/scheduler corrupt during Python exit (the panic is a strong lead), (b) determine why the kernel disabled the timer/console IRQs and prevent that, (c) find a way to re-enable GIC distributor SPIs from the VMM.
+
+**Breakthrough + current state (2026-08-02):**
+- **Root cause of the interrupt loss found:** HVF's `hv_gic_set_spi` does NOT create pending state — GICD_ISPENDR1 stays 0 even for asserted+enabled SPIs (a known HVF GIC quirk). Verified via the new `hv_gic_set_distributor_reg`/`hv_gic_get_distributor_reg` APIs (GICD_ISENABLER1=0x3ffb0000, timer/console enabled; GICD_ISPENDR1=0 even when asserted).
+- **Workaround (in code):** write GICD_ISPENDR1 directly to set the timer (INTID 61=bit29) and console (INTID 60=bit28) pending bits, gated so we only pend an SPI whose device actually has work (pending an idle console SPI makes the ISR read 0 → spurious → the kernel disables the line). Also pend the RNG SPI on RNG work. This moved the hang from attempt ~6 to attempt ~12, and the guest now takes console interrupts regularly (~19 Hz).
+- **Remaining blocker:** the guest is still ~50x slow (timer ISR at ~5 Hz vs 250 Hz). It spends most time in an **idle WFI entered with PSTATE.I=1** (the kernel's IRQ-exit path schedules the idle task with I still masked; its WFI never wakes on the pended SPI, and HVF has no API to send the event/WFI-wake or to persist a CPSR.I=0 write). Every VMM-side attempt to clear I (CPSR write doesn't survive the run; forced ERET either corrupts the guest when fired during normal idle or is one-shot and doesn't prevent re-entry into the I=1 idle) has failed. The result is the guest reaches attempt ~12 but each phase takes ~7s, so the 200-phase gate (timeout 60) cannot pass.
+- **Real improvement to keep:** the ISPENDR pending-bit workaround (timer + console + rng) is a genuine fix for the "asserted SPI never pends" HVF bug and should stay.
+
+---
+
+## Phase-2 uv block fixed (2026-08-04)
+
+**Symptom.** Under default pacing (`--stress-repeat 4 2`, no `REPRO_FAST_STRESS`), phase 2 (first exit cycle after the Tab/readline phase) reliably failed with `timeout: no >>> after uv run python (attempt 2)`. The second `uv run python -u` was injected (`backlog=0`, echoed), the shell forked uv (task appears, `st=0x2001`), but uv never printed the Python banner and the guest fell into the idle WFI loop with a full console RX ring (`avail=148 used=20 last_avail=20`) — a process blocked reading stdin. Trace of the block: uv's user code takes a data abort (`ESR=0x92000047`, translation fault) during startup and never resolves it.
+
+**Key empirical findings that isolated the cause:**
+- Faster wake cadence made it WORSE: 10 ms poll → exit-cycle green 5/5, but 1 ms poll → exit-cycle fails (more force-exits = more preemption).
+- The block is a race: 13 s settle + char-by-char `import pl` + Tab reproduces it reliably; single-shot `uv run python` + short settle passes 6/6.
+- No kernel oops/panic (KLOG scan of guest RAM finds only rodata format strings). Not caused by vtimer-offset hack, the STUCK_KICK SPI pulse, a stuck-Active interrupt (`AP1R0=0`), disk I/O (no pending blk), or the terminal-query synthesis (that code is not in this tree).
+
+**Root cause.** The VMM force-exited the vCPU on a fixed cadence (stdin poller every 10 ms + `LOW_PROGRESS_KICK` every 5 ms), **regardless of whether the guest was in WFI (safe to wake) or actively computing**. A low iteration delta is ambiguous: it means "the loop is blocked in one `hv_vcpu_run`", which is true both for a long WFI (idle — force_exit is needed) and for a long compute slice (uv startup — force_exit preempts it). Force-exiting active guest code slices a critical section / page-fault handler and, after the heavy Tab/readline interrupt traffic has left the guest's scheduler fragile, the second uv's startup page fault never resolves → uv blocks forever reading stdin.
+
+**Fix (in code).** Make the wake cadence adaptive to whether the vCPU is parked in the idle WFI:
+1. New `guest_idle` `Arc<AtomicBool>`, set by the main loop after every exit from the guest PC: idle when `PC ∈ [0xffff80008035a000, 0xffff80008035a200)` (`cpu_do_idle` WFI region).
+2. `stdin_poller` uses a 10 ms force-exit cadence when `guest_idle`, 100 ms when the guest is computing — so active code is only sliced once every 100 ms instead of every 10 ms. stdin data still wakes immediately regardless.
+3. `LOW_PROGRESS_KICK` only force-exits when `guest_idle` (or `consecutive_canceled > 2000` as a stuck fallback).
+4. Removed the STUCK_KICK SPI pulse (low→high on every `cc>=3`) — it was built on the disproven stuck-Active theory and is a spurious-interrupt source; gated `GICD_ISPENDR1` pends handle delivery.
+
+**Result.** Verified under the current tree (branch `continuation`, source = the same `src` as the original checkout):
+- `--stress-repeat 4 2` (default pacing): 8/8 green.
+- `--stress-repeat 6 2` (default, 12 phases / 6 exit cycles): green.
+- `--stress-repeat 4 6` (fast stress, 24 phases / 12 exit cycles): green.
+- `--exit-cycle` (fast): green (5/5 + earlier).
+- Reproducer (char-by-char `import pl` + Tab + 13 s settle + second uv): 5/5 green (was blocking before the fix).

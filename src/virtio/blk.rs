@@ -42,6 +42,11 @@ pub struct VirtioBlkDevice {
     // Block device backing store
     pub disk_image: Vec<u8>,
     pub capacity_sectors: u64,
+
+    /// Monotonically increments each time the VMM completes a request.
+    pub work_gen: u64,
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioBlkDevice {
@@ -59,6 +64,8 @@ impl VirtioBlkDevice {
             config_generation: 0,
             disk_image,
             capacity_sectors,
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
@@ -69,7 +76,7 @@ impl VirtioBlkDevice {
     }
 
     /// Handle an MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64) -> u32 {
+    pub fn mmio_read(&mut self, offset: u64) -> u32 {
         match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
             REG_VERSION => VIRTIO_MMIO_VERSION,
@@ -100,7 +107,10 @@ impl VirtioBlkDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status
+            }
             REG_STATUS => self.status,
             // Shared memory region: length = ~0 means no SHM available
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
@@ -163,6 +173,9 @@ impl VirtioBlkDevice {
             }
             REG_INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= 1;
+                }
             }
             REG_STATUS => {
                 self.status = value;
@@ -215,6 +228,8 @@ impl VirtioBlkDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         for q in &mut self.queues {
             *q = VirtqState::new(QUEUE_SIZE);
         }
@@ -225,15 +240,27 @@ impl VirtioBlkDevice {
     pub fn process_queue(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
         let q = self.queues[0].clone();
         if !q.ready || q.num == 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "BLK_PROCESS_QUEUE not ready={} num={}", q.ready, q.num
+            ));
             return false;
         }
 
         let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
             Some(idx) => idx,
-            None => return false,
+            None => {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "BLK_PROCESS_QUEUE bad avail ring"
+                ));
+                return false;
+            }
         };
 
         let mut last_avail = self.queues[0].last_avail_idx;
+        crate::vmm_trace::write_console_io(format_args!(
+            "BLK_PROCESS_QUEUE avail={avail_idx} last_avail={last_avail} irq={}",
+            self.interrupt_status
+        ));
         let mut used_count = 0u16;
         let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
 
@@ -269,6 +296,11 @@ impl VirtioBlkDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.work_gen += 1;
+            crate::vmm_trace::write_console_io(format_args!(
+                "BLK_DONE heads={used_count} last_avail={last_avail} irq={}",
+                self.interrupt_status
+            ));
             true
         } else {
             false
@@ -292,6 +324,10 @@ impl VirtioBlkDevice {
         if avail_idx == self.queues[0].last_avail_idx {
             return false;
         }
+        crate::vmm_trace::write_console_io(format_args!(
+            "BLK_POLL_PENDING avail={avail_idx} last_avail={}",
+            self.queues[0].last_avail_idx
+        ));
         // There are pending requests — process them normally.
         self.process_queue(memory, ram_base)
     }
@@ -340,6 +376,11 @@ impl VirtioBlkDevice {
         let req_type = super::volatile_read_u32(memory, hdr_off);
         let _reserved = super::volatile_read_u32(memory, hdr_off + 4);
         let sector = super::volatile_read_u64(memory, hdr_off + 8);
+
+        crate::vmm_trace::write_console_io(format_args!(
+            "BLK_REQ type={req_type} sector={sector} ndescs={}",
+            descs.len()
+        ));
 
         // Last descriptor: status byte (device-writable)
         let (status_addr, _, _) = descs[descs.len() - 1];

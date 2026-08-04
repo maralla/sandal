@@ -4,6 +4,7 @@
 /// This is essential for guests that need cryptographic random numbers (e.g. TLS),
 /// especially on kernels without hardware RNG support (like kernel 4.14 on ARM64 VMs).
 use super::*;
+use std::fs::File;
 use std::io::Read;
 
 // Virtio-rng device ID
@@ -22,6 +23,14 @@ pub struct VirtioRngDevice {
     pub queues: [VirtqState; NUM_QUEUES],
     pub status: u32,
     pub interrupt_status: u32,
+    /// Cached `/dev/urandom` — opening on every `process_queue` call was dominating CPU during
+    /// bursts of virtio-rng work (e.g. Python/uv startup).
+    urandom: Option<File>,
+
+    /// Monotonically increments each time the VMM fills entropy buffers.
+    pub work_gen: u64,
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioRngDevice {
@@ -34,11 +43,14 @@ impl VirtioRngDevice {
             queues: [VirtqState::new(QUEUE_SIZE)],
             status: 0,
             interrupt_status: 0,
+            urandom: None,
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
     /// Handle an MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64) -> u32 {
+    pub fn mmio_read(&mut self, offset: u64) -> u32 {
         match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
             REG_VERSION => VIRTIO_MMIO_VERSION,
@@ -66,7 +78,10 @@ impl VirtioRngDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status
+            }
             REG_STATUS => self.status,
             // Shared memory region: length = ~0 means no SHM available
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
@@ -113,6 +128,9 @@ impl VirtioRngDevice {
             }
             REG_INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= 1;
+                }
             }
             REG_STATUS => {
                 self.status = value;
@@ -165,6 +183,8 @@ impl VirtioRngDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         for q in &mut self.queues {
             *q = VirtqState::new(QUEUE_SIZE);
         }
@@ -187,10 +207,12 @@ impl VirtioRngDevice {
         let mut used_count = 0u16;
         let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
 
-        // Open /dev/urandom once for this batch
-        let mut rng = match std::fs::File::open("/dev/urandom") {
-            Ok(f) => f,
-            Err(_) => return false,
+        if self.urandom.is_none() {
+            self.urandom = File::open("/dev/urandom").ok();
+        }
+        let rng_file = match &mut self.urandom {
+            Some(f) => f,
+            None => return false,
         };
 
         while last_avail != avail_idx {
@@ -200,7 +222,7 @@ impl VirtioRngDevice {
                 None => break,
             };
 
-            let total_written = self.fill_random(memory, ram_base, &q, desc_head, &mut rng);
+            let total_written = Self::fill_random(memory, ram_base, &q, desc_head, rng_file);
 
             write_used_ring(
                 memory,
@@ -225,8 +247,23 @@ impl VirtioRngDevice {
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= 1;
+            self.work_gen += 1;
+            if crate::vmm_trace::console_io_enabled() {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "RNG_FILL heads={used_count} avail={avail_idx} last_avail={} irq={}",
+                    self.queues[0].last_avail_idx,
+                    self.interrupt_status
+                ));
+            }
             true
         } else {
+            if avail_idx == self.queues[0].last_avail_idx && self.interrupt_status != 0 {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "RNG_NOTIFY_NOOP avail_idx={avail_idx} last_avail={} irq_status={}",
+                    self.queues[0].last_avail_idx,
+                    self.interrupt_status
+                ));
+            }
             false
         }
     }
@@ -234,15 +271,15 @@ impl VirtioRngDevice {
     /// Fill a descriptor chain with random data from the host.
     /// Returns total bytes written.
     fn fill_random(
-        &self,
         memory: &mut [u8],
         ram_base: u64,
         q: &VirtqState,
         head: u16,
-        rng: &mut std::fs::File,
+        rng: &mut File,
     ) -> u32 {
         let mut total_written = 0u32;
         let mut idx = head;
+        let mut buf_count = 0u32;
 
         while let Some((addr, len, flags, next)) =
             read_descriptor(memory, ram_base, q.desc_addr, idx)
@@ -261,12 +298,19 @@ impl VirtioRngDevice {
                 // Fill buffer with random data from host
                 let _ = rng.read_exact(&mut memory[offset..offset + len]);
                 total_written += len as u32;
+                buf_count += 1;
             }
 
             if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
             idx = next;
+        }
+
+        if total_written > 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "RNG_FILL_BUF bytes={total_written} bufs={buf_count}"
+            ));
         }
 
         total_written

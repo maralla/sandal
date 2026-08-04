@@ -1,3 +1,4 @@
+mod chip;
 mod cli;
 mod devicetree;
 #[macro_use]
@@ -13,6 +14,7 @@ mod tar;
 mod unet;
 mod virtio;
 mod vm;
+mod vmm_trace;
 
 use anyhow::Result;
 use clap::Parser;

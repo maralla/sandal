@@ -1,7 +1,8 @@
 use crate::cli::Args;
 use crate::devicetree::DeviceTree;
 use crate::hypervisor::{
-    self, HvGicIccReg, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE,
+    self, HvGicDistributorReg, HvGicIccReg, HvReg, HvSysReg, Vcpu, Vm, HV_MEMORY_EXEC,
+    HV_MEMORY_READ, HV_MEMORY_WRITE,
 };
 use crate::net::NetworkFilter;
 use crate::snapshot::{
@@ -14,7 +15,8 @@ use crate::virtio::console::VirtioConsoleDevice;
 use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
-use crate::virtio::REG_INTERRUPT_ACK;
+use crate::virtio::{read_avail_idx, REG_INTERRUPT_ACK, REG_INTERRUPT_STATUS};
+use crate::chip::timer::Sp804;
 use crate::{ext2, initramfs, rootfs};
 use anyhow::{Context, Result};
 use flate2::write::GzEncoder;
@@ -27,7 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{env, fs, mem, process, thread, time};
 
 // ARM64 guest physical memory layout.
@@ -91,6 +93,11 @@ mod mem_layout {
     pub const VIRTIO_CONSOLE_BASE: u64 = 0x0A001A00;
     pub const VIRTIO_CONSOLE_SIZE: u64 = 0x200;
     pub const VIRTIO_CONSOLE_SPI: u32 = 28;
+
+    // SP804 Dual-Timer MMIO region — clocksource + clockevent replacement
+    // for the broken ARM generic timer on Apple Silicon HVF.
+    pub const SP804_BASE: u64 = 0x09010000;
+    pub const SP804_SPI_1: u32 = 29; // Timer 1 (clockevent)
 }
 
 use mem_layout::*;
@@ -119,6 +126,7 @@ pub struct VmInstance {
     gic_state_to_restore: Option<Vec<u8>>, // GIC state blob to restore after vCPU creation
     uart_line_buf: String, // Buffer for current line being received from virtio-console TX
     uart_suppress_line: bool, // True if rest of line is suppressed (kernel/marker)
+    console_out_buf: Vec<u8>, // Batched console output pending flush to stdout
     network_enabled: bool,
     virtio_net: Option<VirtioNetDevice>,
     virtio_blk: Option<VirtioBlkDevice>,
@@ -128,9 +136,40 @@ pub struct VmInstance {
     virtio_rng: Option<VirtioRngDevice>,
     virtio_console: Option<VirtioConsoleDevice>, // Interactive terminal I/O (hvc0)
     virtio_console_config_changed: bool,         // Trigger config change SPI after GIC restore
+    sp804: Sp804,                                // MMIO timer for clocksource + clockevent
     virtiofs: Vec<VirtioFsDevice>,
     use_virtio_blk: bool,
+    /// MMIO base of the device whose INTERRUPT_ACK was just written on this exit.
+    /// Set by handle_mmio, consumed by post-vcpu polling to avoid immediately
+    /// re-asserting an interrupt the guest just acked.
+    irq_ack_device: u64,
+    /// Consecutive CANCELED (exit_reason=0) exits with no MMIO activity.
+    /// Used to detect guest hangs (kernel idle with no runnable tasks).
+    consecutive_canceled: u32,
+    /// Wall-clock instant when the VM boot started, used to provide a
+    /// synthetic timebase for CNTVCT_EL0 reads.
+    boot_instant: Instant,
+    /// Last observed ICC_PMR_EL1 value for diagnostic tracing.
+    last_pmr: u64,
+    /// Counter for sampling untracked sysreg trap logs.
+    sysreg_trap_count: u64,
+    /// Counter for sampling synthetic counter-register read logs.
+    counter_trap_count: u64,
+    /// GPA of an ERET instruction (0xd69f03e0) in the kernel image,
+    /// used by STUCK_KICK to force PSTATE restoration from SPSR_EL1.
+    eret_insn_gpa: Option<u64>,
+    /// Wall-clock of the last vtimer-offset advance (to make CNTVCT move).
+    last_vt_advance: std::time::Instant,
+    /// Whether the vCPU is parked in the idle loop's WFI (safe to force-exit for
+    /// timer wake) vs. actively computing (avoid slicing it with force_exit).
+    /// Shared with the stdin poller thread so it can adapt its wake cadence.
+    guest_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Idle-region lower/upper bounds for the guest's `cpu_do_idle` (kernel build
+/// 6.12.13, loaded at the KIMAGE_VADDR mapping).  The WFI ret is at 0x...a02c.
+const IDLE_REGION_LO: u64 = 0xffff_8000_8035_a000;
+const IDLE_REGION_HI: u64 = 0xffff_8000_8035_a200;
 
 // ============= Terminal raw mode =============
 
@@ -180,14 +219,22 @@ fn set_blocking(fd: RawFd) {
 /// Poll stdin for data or hangup.
 /// Returns (ready, hungup) — `ready` is true if POLLIN is set,
 /// `hungup` is true if POLLHUP is set (pipe write-end closed).
-fn poll_stdin_once(fd: RawFd) -> (bool, bool) {
+///
+/// The poll timeout is short (2 ms) because this function doubles as the
+/// periodic vCPU wake source.  On Apple Silicon HVF a vCPU that executes
+/// WFI is parked inside `hv_vcpu_run` and is NOT woken by a pending GIC
+/// SPI (`hv_gic_set_spi`/GICD_ISPENDR) nor by `hv_vcpu_set_pending_interrupt`
+/// (the pending bit is only consumed at run entry).  The ONLY way to wake
+/// it is `hv_vcpus_exit` from another thread, so the poller force-exits on
+/// this cadence.  With a 100 ms timeout the guest clockevent ticked at
+/// ~10 Hz (50x slow); 2 ms keeps it near the SP804 250 Hz clockevent rate.
+fn poll_stdin_once_timeout(fd: RawFd, timeout_ms: i32) -> (bool, bool) {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    // Block up to 1 second then re-check (allows thread to notice shutdown)
-    let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if n < 0 {
         return (false, true); // error → treat as hangup
     }
@@ -247,6 +294,7 @@ impl VmInstance {
             gic_state_to_restore: None,
             uart_line_buf: String::new(),
             uart_suppress_line: false,
+            console_out_buf: Vec::with_capacity(4096),
             network_enabled: false,
             virtio_net: None,
             virtio_blk: None,
@@ -256,8 +304,18 @@ impl VmInstance {
             virtio_rng: None,
             virtio_console: None,
             virtio_console_config_changed: false,
+            sp804: Sp804::new(),
             virtiofs: Vec::new(),
             use_virtio_blk: false,
+            irq_ack_device: 0,
+            consecutive_canceled: 0,
+            boot_instant: Instant::now(),
+            last_pmr: 0xff,
+            sysreg_trap_count: 0,
+            counter_trap_count: 0,
+            eret_insn_gpa: None,
+            last_vt_advance: Instant::now(),
+            guest_idle: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -360,6 +418,23 @@ impl VmInstance {
         debug!("   Kernel at GPA: 0x{kernel_entry_gpa:x} (text_offset=0x{text_offset:x})");
         debug!("   DTB at GPA: 0x{dtb_gpa:x}");
 
+        // Scan the kernel image for an ERET instruction (0xd69f03e0).
+        // STUCK_KICK uses it to restore PSTATE from SPSR_EL1 when the
+        // guest is hung with CPSR.I=1 (IRQs masked).  ERET atomically
+        // loads PSTATE from SPSR_EL1 and jumps to ELR_EL1, which we
+        // set to the current PC before redirecting.
+        const ERET: u32 = 0xd69f03e0;
+        let kernel_slice = &self.memory[kernel_offset..kernel_offset + kernel_data.len()];
+        let eret_offset = kernel_slice
+            .chunks_exact(4)
+            .position(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == ERET);
+        self.eret_insn_gpa = eret_offset.map(|i| RAM_BASE + kernel_offset as u64 + (i * 4) as u64);
+        if self.eret_insn_gpa.is_some() {
+            debug!("ERET instruction found at GPA 0x{:x}", self.eret_insn_gpa.unwrap());
+        } else {
+            debug!("WARNING: no ERET instruction found in kernel image — STUCK_KICK ERET redirect disabled");
+        }
+
         Ok(())
     }
 
@@ -408,11 +483,11 @@ impl VmInstance {
             None
         };
 
-        let virtio_rng_dt = if self.virtio_rng.is_some() {
-            Some((VIRTIO_RNG_BASE, VIRTIO_RNG_SPI))
-        } else {
-            None
-        };
+        // Exclude virtio-rng from the DT to avoid the kernel 4.14 virtio-rng
+        // driver race (hwrng kthread completion vs ISR).  The rng-seed property
+        // in /chosen plus random.trust_bootloader=on provides initial CRNG
+        // seeding without the driver.
+        let virtio_rng_dt: Option<(u64, u32)> = None;
 
         // Always include ALL MAX_FS_DEVICES virtiofs entries in the DT so
         // the kernel probes every slot during cold boot.  This lets the same
@@ -434,6 +509,14 @@ impl VmInstance {
         // Virtio-console device for interactive terminal I/O
         let virtio_console_dt = Some((VIRTIO_CONSOLE_BASE, VIRTIO_CONSOLE_SPI));
 
+        // Seed the kernel CRNG at early boot so /dev/urandom never blocks.
+        let rng_seed = {
+            let mut buf = vec![0u8; 256];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+                .ok()
+                .map(|_| buf)
+        };
         let dtb = DeviceTree::build(
             self.memory_size as u64,
             UART_BASE,
@@ -450,6 +533,7 @@ impl VmInstance {
             virtio_console_dt,
             log::log_enabled!(log::Level::Debug),
             None, // no overlay bootarg — init script detects via /dev/vdb size
+            rng_seed.as_deref(),
         )?;
 
         let dtb_offset = DTB_OFFSET as usize;
@@ -534,6 +618,12 @@ impl VmInstance {
             // Trap debug exceptions
             vcpu.set_trap_debug_exceptions(true)?;
 
+            // NOTE: Do NOT call set_vtimer_offset(0) here.  HVF manages the
+            // vtimer offset internally; overriding it to 0 breaks the virtual
+            // counter comparison, preventing the vtimer from ever firing
+            // (exit_reason=2 count stays 0).
+
+
             debug!("--- Entering VCPU run loop ---");
         }
 
@@ -583,8 +673,9 @@ impl VmInstance {
         // poll()-based poller is the only reliable approach.
         let stdin_poller_thread = {
             let vcpu_id = vcpu.id() as u64;
+            let guest_idle = self.guest_idle.clone();
             Some(thread::spawn(move || {
-                Self::stdin_poller(vcpu_id, stdin_fd);
+                Self::stdin_poller(vcpu_id, stdin_fd, guest_idle);
             }))
         };
 
@@ -606,6 +697,9 @@ impl VmInstance {
             "[bench] run_command ready (tty+threads): {:.2}ms",
             trc.elapsed().as_secs_f64() * 1000.0
         );
+
+        let mut lp_watch_wall = Instant::now();
+        let mut lp_watch_iter: u64 = 0;
 
         loop {
             iteration += 1;
@@ -682,26 +776,201 @@ impl VmInstance {
             }
 
             if self.boot_complete && self.command_injected {
-                let mut tx_chunk = Vec::new();
-                if let Some(c) = self.virtio_console.as_mut() {
-                    if c.tx_queue_has_pending(&self.memory, RAM_BASE) {
-                        tx_chunk = c.process_tx(&mut self.memory, RAM_BASE);
-                        Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, c.interrupt_status != 0);
+                // During RNG-driven work the guest kernel may defer the vtimer
+                // far into the future (NO_HZ).  Use a short kick interval so
+                // the VMM can force timer ticks and let the hwrng kthread run.
+                // Keep it short (5ms) at all times: HVF does not wake a
+                // WFI-suspended vCPU on a pending SPI, so the ONLY way the
+                // guest's clockevent fires is when the VMM force-exits it and
+                // the main loop re-pends the SP804 timer.  A 100ms kick makes
+                // the guest tick at 10 Hz (very slow); 5ms keeps it near-normal.
+                let kick_interval_ms: u64 = 5;
+                if lp_watch_wall.elapsed() >= Duration::from_millis(kick_interval_ms) {
+                    let delta = iteration.saturating_sub(lp_watch_iter);
+                    let guest_idle = {
+                        use std::sync::atomic::Ordering;
+                        self.guest_idle.load(Ordering::Relaxed)
+                    };
+                    // Only force-exit when the guest is parked in the idle WFI
+                    // (or genuinely stalled).  A low iteration delta while the
+                    // guest is actively computing just means hv_vcpu_run blocked
+                    // on one long run; force-exiting there slices active guest
+                    // code and can preempt a critical section (uv startup block).
+                    if delta < 250 && (guest_idle || self.consecutive_canceled > 2000) {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "LOW_PROGRESS_KICK delta={delta} iter={iteration}"
+                        ));
+                        let _ = self.poll_stdin(stdin_fd, &mut stdin_eof);
+                        let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+                    }
+                    // If the RNG IRQ was ACKed by the guest ISR but the
+                    // hwrng kthread lost the completion signal (race between
+                    // reinit_completion and complete), re-assert the SPI and
+                    // set interrupt_status so the ISR sees a used-ring update
+                    // and calls complete() to unblock the kthread.
+                    if let Some(ref mut rng) = self.virtio_rng {
+                        if rng.interrupt_status == 0 && rng.queues[0].ready {
+                            let avail =
+                                crate::virtio::read_avail_idx(&self.memory, RAM_BASE, rng.queues[0].avail_addr).unwrap_or(0);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "RNG_KICK_RACE avail_idx={avail}"
+                            ));
+                            rng.interrupt_status |= 1;
+                            Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
+                        }
+                    }
+                    lp_watch_wall = Instant::now();
+                    lp_watch_iter = iteration;
+                }
+
+                // Interleave console TX with stdin so large transmitq bursts do not starve RX.
+                const MAX_CONSOLE_TX_SLICES: u32 = 64;
+                let mut tx_slices = 0u32;
+                while tx_slices < MAX_CONSOLE_TX_SLICES {
+                    let mut tx_chunk = Vec::new();
+                    if let Some(c) = self.virtio_console.as_mut() {
+                        if c.tx_queue_has_pending(&self.memory, RAM_BASE) {
+                            tx_chunk = c.process_tx(&mut self.memory, RAM_BASE);
+                            Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, c.interrupt_status != 0);
+                        }
+                    }
+                    if tx_chunk.is_empty() {
+                        break;
+                    }
+                    tx_slices += 1;
+                    self.process_console_tx(&tx_chunk);
+                    if self.poll_stdin(stdin_fd, &mut stdin_eof) {
+                        let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
                     }
                 }
-                if !tx_chunk.is_empty() {
-                    self.process_console_tx(&tx_chunk);
-                }
-                self.poll_stdin(stdin_fd, &mut stdin_eof);
-                if self
-                    .virtio_console
-                    .as_ref()
-                    .is_some_and(|c| !c.rx_backlog.is_empty())
-                {
+                if self.poll_stdin(stdin_fd, &mut stdin_eof) {
                     let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
                 }
             }
 
+            // Poll RNG proactively before vcpu.run() so buffers posted
+            // by the guest without a subsequent QueueNotify (e.g. between
+            // virtqueue_add_inbuf and virtqueue_kick) are filled promptly.
+            // Use a full memory barrier to ensure guest stores are visible.
+            if let Some(ref mut rng) = self.virtio_rng {
+                if rng.queues[0].ready {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    if rng.process_queue(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
+                        // HVF's set_gic_spi doesn't pend the interrupt; pend the
+                        // RNG SPI too so uv/python entropy (getrandom) completes.
+                        if self.boot_complete {
+                            let _ = Vm::set_distributor_reg(
+                                HvGicDistributorReg::Ispendr1,
+                                1u64 << 18, // INTID 50 = SPI 18 (rng)
+                            );
+                        }
+                    } else {
+                        Vm::set_gic_spi(VIRTIO_RNG_SPI, rng.interrupt_status != 0);
+                    }
+                }
+            }
+
+            // SP804 timer: check if clockevent (Timer 1) expired and assert SPI.
+            // HVF's hv_gic_set_spi does not create pending state (GICD_ISPENDR
+            // stays 0), so also set the pending bit directly via the distributor
+            // register.  Without this the guest's clockevent never fires and the
+            // idle loop waits forever.
+            //
+            // Pend SPI 29 on the RISING EDGE only: while the timer is expired
+            // `check_timer1_irq()` returns true on every main-loop iteration
+            // (irq_pending1 stays set until the guest ACKs it).  Re-writing
+            // GICD_ISPENDR1 each iteration floods the guest with timer
+            // interrupts at the poll cadence (e.g. 500 Hz with a 2 ms kick)
+            // instead of the SP804's natural 250 Hz, which can preempt a
+            // critical section holding a spinlock and deadlock the exit path.
+            if self.sp804.check_timer1_irq() && !self.sp804.timer1_spi_pended() {
+                self.sp804.mark_timer1_spi_pended();
+                Vm::set_gic_spi(SP804_SPI_1, true);
+                if self.boot_complete {
+                    let _ = Vm::set_distributor_reg(
+                        HvGicDistributorReg::Ispendr1,
+                        1u64 << 29, // INTID 61 = SPI 29 (timer)
+                    );
+                }
+            }
+
+            // The arch timer counters read as 0 on Apple Silicon HVF, so if the
+            // guest's clocksource is CNTVCT (advertised by the dtb), ktime is
+            // frozen and any kernel delay spins.  Advance the guest's virtual
+            // counter by setting a growing negative vtimer offset: CNTVCT =
+            // CNTPCT - CNTVOFF, so CNTVOFF = -elapsed makes CNTVCT advance even
+            // with CNTPCT frozen.
+            if self.boot_complete && self.last_vt_advance.elapsed().as_millis() >= 2 {
+                self.last_vt_advance = Instant::now();
+                let elapsed_ns = self.boot_instant.elapsed().as_nanos() as u64;
+                let ticks = elapsed_ns * 24_000_000 / 1_000_000_000; // 24MHz
+                let _ = vcpu.set_vtimer_offset(u64::MAX - ticks + 1); // -ticks
+            }
+
+            // Poll data_blk before vcpu.run() to catch requests whose avail-ring
+            // writes were not visible at QueueNotify time.  Use a full memory
+            // barrier to ensure guest stores are visible (same pattern as RNG).
+            if self.boot_complete && self.command_injected {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                if let Some(ref mut dev) = self.data_blk {
+                    if dev.poll_pending(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(DATA_BLK_SPI, true);
+                    }
+                }
+                if let Some(ref mut blk) = self.virtio_blk {
+                    if blk.poll_pending(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
+                    }
+                }
+                // Poll virtiofs before vcpu.run() for the same reason.
+                for dev_idx in 0..self.virtiofs.len() {
+                    let spi = VIRTIOFS_SPI_START + dev_idx as u32;
+                    let dev = &mut self.virtiofs[dev_idx];
+                    if dev.queues[0].ready || dev.queues[1].ready {
+                        let had_work0 = dev.process_queue(0, &mut self.memory, RAM_BASE);
+                        let had_work1 = dev.process_queue(1, &mut self.memory, RAM_BASE);
+                        if had_work0 || had_work1 {
+                            Vm::set_gic_spi(spi, true);
+                        }
+                    }
+                }
+            }
+
+            // Raise the virtual IRQ line before hv_vcpu_run whenever a device
+            // has a pending interrupt.  On Apple HVF a vCPU parked in WFI is
+            // NOT woken by GIC distributor pending state (ISPENDR) alone; the
+            // pending state must be armed via hv_vcpu_set_pending_interrupt
+            // BEFORE every hv_vcpu_run (it auto-clears after the run returns).
+            // Gate it on real device work so the guest's IAR read returns a
+            // valid INTID rather than 1023 (spurious).
+            let pending_irq = self.sp804.timer1_irq_asserted()
+                || self
+                    .virtio_console
+                    .as_ref()
+                    .map_or(false, |c| c.interrupt_status != 0)
+                || self
+                    .virtio_rng
+                    .as_ref()
+                    .map_or(false, |r| r.interrupt_status != 0);
+            if pending_irq && self.boot_complete {
+                match vcpu.set_pending_interrupt(0, true) {
+                    Ok(()) => {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "PENDING_IRQ_OK timer={} console={}",
+                            self.sp804.timer1_irq_asserted(),
+                            self.virtio_console.as_ref().map_or(0, |c| c.interrupt_status),
+                        ));
+                    }
+                    Err(e) => {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "PENDING_IRQ_ERR {e}"
+                        ));
+                    }
+                }
+            }
+
+            let vcpu_entry = Instant::now();
             let exit_reason = match vcpu.run() {
                 Ok(r) => r,
                 Err(e) => {
@@ -710,16 +979,713 @@ impl VmInstance {
                     return Err(e);
                 }
             };
+            let vcpu_dur = vcpu_entry.elapsed();
 
-            // Unmask the vtimer after any non-VTIMER exit.
-            if exit_reason != 2 {
-                vcpu.set_vtimer_mask(false)?;
+            // ===== Broken vtimer on Apple Silicon HVF =====
+            // CNTVCT_EL0, CNTPCT_EL0, CNTFRQ_EL0 all read as 0 from VMM.
+            // The hardware comparator never fires on its own.
+            // CNTV_CVAL_EL0 is banked — VMM writes go to EL2 copy and don't
+            // affect the guest's EL1 view.  We rely on SP804 Timer 2 as the
+            // clockevent source instead.
+            vcpu.set_vtimer_mask(false)?;
+
+            // Reset per-exit IRQ ACK tracker; handle_mmio will set it if the
+            // guest writes INTERRUPT_ACK, so post-vcpu polling can skip that device.
+            self.irq_ack_device = 0;
+
+            // Only reset consecutive_canceled on productive exits (MMIO, vtimer,
+            // HVC, sysreg traps, etc.), not on WFI which just means the kernel is
+            // idle/spinning, and not on SP804 timer MMIO which only means the
+            // timer ISR is running without making I/O forward progress.
+            // This allows cc to build up and trigger stuck detection.
+            if exit_reason == 2 {
+                // VTIMER_ACTIVATED — productive exit
+                self.consecutive_canceled = 0;
+            } else if exit_reason == 1 {
+                let syndrome = vcpu.read_exception_syndrome().unwrap_or(0);
+                let ec = (syndrome >> 26) & 0x3F;
+                if ec != 0x01 {
+                    let is_sp804 = (ec == 0x24 || ec == 0x25)
+                        && vcpu
+                            .read_fault_address()
+                            .map(|fa| (SP804_BASE..SP804_BASE + 0x1000).contains(&fa))
+                            .unwrap_or(false);
+                    if !is_sp804 {
+                        self.consecutive_canceled = 0;
+                    }
+                }
+            }
+
+            // Track PMR transitions to identify when kernel enters IRQ-off state.
+            let cur_pmr = vcpu.get_icc_reg(HvGicIccReg::PmrEl1).unwrap_or(0);
+            if cur_pmr != self.last_pmr {
+                let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                let elr = vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0);
+                crate::vmm_trace::write_console_io(format_args!(
+                    "PMR_TRANSITION 0x{old:x}→0x{new:x} iter={iteration} exit_reason={exit_reason} PC=0x{pc:x} ELR=0x{elr:x}",
+                    old = self.last_pmr, new = cur_pmr
+                ));
+                self.last_pmr = cur_pmr;
+            }
+
+            // Update whether the vCPU is parked in the idle WFI so the stdin
+            // poller can back off force-exits while the guest is actively
+            // computing (prevents preempting a critical section — the cause of
+            // the phase-2 uv startup block after heavy Tab/readline traffic).
+            {
+                let guest_pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                let is_idle_pc = (IDLE_REGION_LO..IDLE_REGION_HI).contains(&guest_pc);
+                use std::sync::atomic::Ordering;
+                self.guest_idle.store(is_idle_pc, Ordering::Relaxed);
             }
 
             match exit_reason {
                 0 => {
                     // HV_EXIT_REASON_CANCELED — hv_vcpus_exit() was called
-                    // (e.g. by the stdin/network poller to wake a WFI-parked vCPU)
+                    // (e.g. by the stdin/network poller to wake a WFI-parked vCPU).
+                    self.consecutive_canceled += 1;
+                    let cc = self.consecutive_canceled;
+
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "CANCELED iter={iteration} dur_us={} cc={cc}",
+                        vcpu_dur.as_micros()
+                    ));
+
+                    // When the kernel is stuck in a WFI loop without
+                    // productive progress, lower the GIC PMR (which the kernel
+                    // may have raised to block interrupts in a critical section)
+                    // and assert the IRQ line so the GIC delivers the highest-
+                    // priority pending interrupt (SP804 timer on SPI 29).  This
+                    // lets the kernel's timer ISR update jiffies, run the
+                    // scheduler, and unstick any I/O wait.
+                    if cc >= 3 && self.boot_complete {
+                        // Process console queues during STUCK_KICK — the
+                        // kernel may be waiting for TX completions.
+                        let mut tx_bytes = Vec::new();
+                        if let Some(ref mut console) = self.virtio_console {
+                            tx_bytes = console.process_tx(&mut self.memory, RAM_BASE);
+                            let _ = console.drain_rx_backlog(&mut self.memory, RAM_BASE);
+                            Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+                        }
+                        if !tx_bytes.is_empty() {
+                            self.process_console_tx(&tx_bytes);
+                        }
+                        // Re-check and assert SP804 timer IRQ if expired.
+                        if self.sp804.check_timer1_irq() {
+                            Vm::set_gic_spi(SP804_SPI_1, true);
+                        }
+
+                        // Poll all block devices so any completed I/O
+                        // asserts its SPI and wakes waiters.
+                        if let Some(ref mut dev) = self.data_blk {
+                            if dev.poll_pending(&mut self.memory, RAM_BASE) {
+                                Vm::set_gic_spi(DATA_BLK_SPI, true);
+                            }
+                        }
+                        if let Some(ref mut blk) = self.virtio_blk {
+                            if blk.poll_pending(&mut self.memory, RAM_BASE) {
+                                Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
+                            }
+                        }
+                        if let Some(ref mut rng) = self.virtio_rng {
+                            if rng.queues[0].ready {
+                                if rng.process_queue(&mut self.memory, RAM_BASE) {
+                                    Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
+                                }
+                            }
+                        }
+
+                        // The guest is stuck in the idle loop's WFI (or a
+                        // driver WFI) and no interrupt is being delivered.
+                        // During the hang, HVF rejects all ICC register access
+                        // (HV_BAD_ARGUMENT), so the GIC CPU interface cannot be
+                        // read or written.  What still works: set_gic_spi
+                        // (VM-level level assert), set_pending_interrupt, and
+                        // GPR/CPSR/PC writes.
+                        //
+                        // NOTE: we deliberately do NOT pulse every managed SPI
+                        // low→high here.  The "stuck Active SPI" theory this was
+                        // built on was disproven (AP0R0/AP1R0 read 0 during the
+                        // hang), and the pulse is a spurious-interrupt source:
+                        // lowering a level line under a guest that is mid-EOIR
+                        // can inject an interrupt whose IAR read returns 1023,
+                        // and enough spurious interrupts make the kernel disable
+                        // the line.  Pending delivery is handled by the gated
+                        // GICD_ISPENDR1 writes below.
+
+                        // Do NOT clear PSTATE.I here.  The guest may be inside a
+                        // critical section that holds a spinlock with IRQs masked;
+                        // unmasking I lets a pending timer/console interrupt be
+                        // taken inside that critical section, and the IRQ handler
+                        // then spins forever on the same lock (the exit-cycle
+                        // deadlock).  The fast periodic force_exit already wakes a
+                        // WFI'd vCPU; when the guest later unmasks I on its own it
+                        // takes the pending interrupt naturally.
+                        // Re-enable the timer/console SPIs in the GIC distributor
+                        // if the kernel disabled them (disable_irq after a
+                        // Work around HVF's `hv_gic_set_spi` not creating pending
+                        // state by writing GICD_ISPENDR1 directly.  IMPORTANT:
+                        // only pend an SPI whose device actually has work —
+                        // pending a console SPI with interrupt_status==0 makes
+                        // the guest's ISR read 0 and return IRQ_NONE (spurious),
+                        // and enough spurious interrupts make the kernel disable
+                        // the console line entirely.
+                        if cc >= 3 {
+                            let mut want: u64 = 0;
+                            if self.sp804.check_timer1_irq()
+                                && !self.sp804.timer1_spi_pended()
+                            {
+                                self.sp804.mark_timer1_spi_pended();
+                                want |= 1u64 << 29; // INTID 61 = timer
+                            }
+                            if let Some(ref console) = self.virtio_console {
+                                if console.interrupt_status != 0 {
+                                    want |= 1u64 << 28; // INTID 60 = console
+                                }
+                            }
+                            if want != 0 {
+                                let _ = Vm::set_distributor_reg(
+                                    HvGicDistributorReg::Ispendr1,
+                                    want,
+                                );
+                            }
+                        }
+                    }
+
+                    // Clear PSTATE.I ONLY when the vCPU is parked at the idle
+                    // loop's WFI (cpu_do_idle).  In that state the guest is
+                    // genuinely idle — the IRQ-exit path entered the idle WFI
+                    // without restoring I (SPSR_EL1.I=0), so the pending timer
+                    // interrupt can never be taken and the guest spins forever.
+                    // Clearing I there is safe (nothing is protected) and lets
+                    // the armed pending interrupt be delivered on the next run.
+                    // We deliberately do NOT clear I in other contexts: the
+                    // guest may be inside a critical section holding a spinlock,
+                    // and unmasking IRQs there lets a pending interrupt preempt
+                    // the lock holder → exit-cycle deadlock.
+                    if self.boot_complete && cc >= 2 {
+                        let pc_idle = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                        let cpsr_idle = vcpu.read_register(HvReg::Cpsr).unwrap_or(0);
+                        // cpu_do_idle WFI at 0xffff80008035a028, ret at 0x...a02c.
+                        const IDLE_WFI_RET: u64 = 0xffff_8000_8035_a02c;
+                        if pc_idle == IDLE_WFI_RET && (cpsr_idle >> 7) & 1 == 1 {
+                            let _ = vcpu.write_register(HvReg::Cpsr, cpsr_idle & !(1 << 7));
+                        }
+                    }
+                    // Read PC on CANCELED exits every 25 iterations to diagnose execution.
+                    // More frequent during early boot and hang phases.
+                    if cc == 1 || cc % 25 == 0 {
+                        let pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                        let sp_el0 = vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0);
+                        let sp_el1 = vcpu.read_sys_register(HvSysReg::SpEl1).unwrap_or(0);
+                        let spsr = vcpu.read_sys_register(HvSysReg::SpsrEl1).unwrap_or(0);
+                        let el = spsr & 0xF;
+                        let irq_masked = (spsr >> 7) & 1;
+                        // Read CPSR (actual PSTATE) to compare against SPSR_EL1.
+                        let cpsr = vcpu.read_register(HvReg::Cpsr).unwrap_or(0);
+                        let cpsr_irq_masked = (cpsr >> 7) & 1;
+                        // Read 4 instructions at PC to identify function
+                        let ttbr1 = vcpu.read_sys_register(HvSysReg::Ttbr1El1).unwrap_or(0);
+                        let tcr = vcpu.read_sys_register(HvSysReg::TcrEl1).unwrap_or(0);
+                        let t1sz = tcr & 0x3F;
+                        let mut insn_str = String::new();
+                        if let Some(pc_pa) = self.translate_va_to_pa(pc, ttbr1, t1sz) {
+                            if pc_pa >= RAM_BASE && (pc_pa as usize) + 16 <= RAM_BASE as usize + self.memory.len() {
+                                let off = (pc_pa - RAM_BASE) as usize;
+                                let i0 = u32::from_le_bytes(self.memory[off..off+4].try_into().unwrap());
+                                let i1 = u32::from_le_bytes(self.memory[off+4..off+8].try_into().unwrap());
+                                let i2 = u32::from_le_bytes(self.memory[off+8..off+12].try_into().unwrap());
+                                let i3 = u32::from_le_bytes(self.memory[off+12..off+16].try_into().unwrap());
+                                use std::fmt::Write;
+                                let _ = write!(insn_str, "ins=[0x{i0:08x} 0x{i1:08x} 0x{i2:08x} 0x{i3:08x}]");
+                            }
+                        }
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "CANCELED_PC cc={cc} PC=0x{pc:x} SP_EL0=0x{sp_el0:x} SP_EL1=0x{sp_el1:x} SPSR.EL={el} SPSR.I={irq_masked} CPSR=0x{cpsr:x} CPSR.I={cpsr_irq_masked} {insn_str}",
+                        ));
+                    }
+                    // Dump console queue state every ~1 second of pure CANCELED.
+                    if cc == 3 || cc % 50 == 0 {
+                        if let Some(ref c) = self.virtio_console {
+                            let tx = &c.queues[1];
+                            let rx = &c.queues[0];
+                            let tx_avail = crate::virtio::read_avail_idx(&self.memory, RAM_BASE, tx.avail_addr);
+                            let rx_avail = crate::virtio::read_avail_idx(&self.memory, RAM_BASE, rx.avail_addr);
+                            let tx_used = crate::virtio::read_used_idx(&self.memory, RAM_BASE, tx.used_addr);
+                            let rx_used = crate::virtio::read_used_idx(&self.memory, RAM_BASE, rx.used_addr);
+                            let guest_pc = vcpu.read_register(HvReg::Pc).unwrap_or(0);
+                            let cval = vcpu.read_sys_register(HvSysReg::CntvCvalEl0).unwrap_or(0);
+                            let ctl = vcpu.read_sys_register(HvSysReg::CntvCtlEl0).unwrap_or(0);
+                            let cntvct = vcpu.read_sys_register(HvSysReg::CntvCtEl0).unwrap_or(0);
+                            let cntfrq = vcpu.read_sys_register(HvSysReg::CntfrqEl0).unwrap_or(0);
+                            let vtimer_masked = vcpu.get_vtimer_mask().unwrap_or(false);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "HANG_DIAG cc={cc} iter={iteration} PC=0x{guest_pc:x}",
+                            ));
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  TX: avail={:?} used={:?} last_avail={} ready={} num={}",
+                                tx_avail, tx_used, tx.last_avail_idx, tx.ready, tx.num,
+                            ));
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  RX: avail={:?} used={:?} last_avail={} ready={} num={}",
+                                rx_avail, rx_used, rx.last_avail_idx, rx.ready, rx.num,
+                            ));
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  irq_status={} irq_acked={} backlog={} vtimer_masked={} ctl=0x{ctl:x} cval=0x{cval:x}",
+                                c.interrupt_status, c.irq_acked, c.rx_backlog.len(), vtimer_masked,
+                            ));
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  cntvct=0x{cntvct:x} cntfrq=0x{cntfrq:x} cval_delta={}",
+                                cval.wrapping_sub(cntvct) as i64,
+                            ));
+                            let icc_pmr = vcpu.get_icc_reg(HvGicIccReg::PmrEl1).unwrap_or(0);
+                            let igrpen0 = vcpu.get_icc_reg(HvGicIccReg::Igrpen0El1).unwrap_or(0);
+                            let igrpen1 = vcpu.get_icc_reg(HvGicIccReg::Igrpen1El1).unwrap_or(0);
+                            let icc_ctlr = vcpu.get_icc_reg(HvGicIccReg::CtlrEl1).unwrap_or(0);
+                            // Active priority registers: non-zero AP1R0/AP0R0
+                            // means an interrupt is stuck Active (guest took it
+                            // but never EOIR'd) — this blocks lower-priority
+                            // delivery and would explain total starvation.
+                            let ap1 = vcpu
+                                .get_icc_reg(HvGicIccReg::Ap1r0El1)
+                                .unwrap_or(0xFFFF_FFFF);
+                            let ap0 = vcpu
+                                .get_icc_reg(HvGicIccReg::Ap0r0El1)
+                                .unwrap_or(0xFFFF_FFFF);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  GIC: pmr=0x{icc_pmr:x} igrpen0=0x{igrpen0:x} igrpen1=0x{igrpen1:x} ctlr=0x{icc_ctlr:x} ap1=0x{ap1:x} ap0=0x{ap0:x}",
+                            ));
+                            // Distributor registers: verify the ISPENDR pending-bit
+                            // workaround actually pends the timer (INTID 61=bit29)
+                            // and console (INTID 60=bit28) SPIs.
+                            let dist_isen1 = Vm::get_distributor_reg(HvGicDistributorReg::Isenabler1).unwrap_or(0xFFFF_FFFF_FFFF_FFFF);
+                            let dist_ispendr1 = Vm::get_distributor_reg(HvGicDistributorReg::Ispendr1).unwrap_or(0xFFFF_FFFF_FFFF_FFFF);
+                            let dist_icpendr1 = Vm::get_distributor_reg(HvGicDistributorReg::Icpendr1).unwrap_or(0xFFFF_FFFF_FFFF_FFFF);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  DIST: isen1=0x{dist_isen1:08x} ispendr1=0x{dist_ispendr1:08x} icpendr1=0x{dist_icpendr1:08x} (timer b29 cons b28)",
+                            ));
+                            // SP804 timer state
+                            let t1_ctrl = self.sp804.mmio_read(0x08);
+                            let t1_load = self.sp804.mmio_read(0x00);
+                            let t1_val = self.sp804.mmio_read(0x04);
+                            let t1_ris = self.sp804.mmio_read(0x10);
+                            let t1_mis = self.sp804.mmio_read(0x14);
+                            let t1_enabled = t1_ctrl & 0x80 != 0;
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  SP804 T1: enabled={t1_enabled} ctrl=0x{t1_ctrl:08x} load=0x{t1_load:08x} val=0x{t1_val:08x} ris={t1_ris} mis={t1_mis}",
+                            ));
+                            // Timer 2 (clocksource) state — if the guest's time
+                            // base is frozen, timeout loops spin forever.
+                            let t2_ctrl = self.sp804.mmio_read(0x28);
+                            let t2_load = self.sp804.mmio_read(0x20);
+                            let t2_val = self.sp804.mmio_read(0x24);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  SP804 T2: ctrl=0x{t2_ctrl:08x} load=0x{t2_load:08x} val=0x{t2_val:08x}",
+                            ));
+                            let sp_el0 = vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0);
+                            let sp_el1 = vcpu.read_sys_register(HvSysReg::SpEl1).unwrap_or(0);
+                            let lr = vcpu.read_sys_register(HvSysReg::ElrEl1).unwrap_or(0);
+                            let x0 = vcpu.read_register(HvReg::X0).unwrap_or(0);
+                            let x1 = vcpu.read_register(HvReg::X1).unwrap_or(0);
+                            let x2 = vcpu.read_register(HvReg::X2).unwrap_or(0);
+                            let x3 = vcpu.read_register(HvReg::X3).unwrap_or(0);
+                            let x4 = vcpu.read_register(HvReg::X4).unwrap_or(0);
+                            let tpidr = vcpu.read_sys_register(HvSysReg::TpidrEl1).unwrap_or(0);
+                            let esr = vcpu.read_sys_register(HvSysReg::EsrEl1).unwrap_or(0);
+                            let fault_addr = vcpu.read_fault_address().unwrap_or(0);
+                            let tcr = vcpu.read_sys_register(HvSysReg::TcrEl1).unwrap_or(0);
+                            let spsr = vcpu.read_sys_register(HvSysReg::SpsrEl1).unwrap_or(0);
+                            let irq_masked = (spsr >> 7) & 1;
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  CPU: SP_EL0=0x{sp_el0:x} SP_EL1=0x{sp_el1:x} ELR_EL1=0x{lr:x} X0=0x{x0:x} X1=0x{x1:x} X2=0x{x2:x} X3=0x{x3:x} X4=0x{x4:x} TPIDR=0x{tpidr:x} ESR=0x{esr:x} FAR=0x{fault_addr:x} TCR=0x{tcr:x} T1SZ={} SPSR=0x{spsr:x} IRQ_MASKED={irq_masked}",
+                                tcr & 0x3F,
+                            ));
+                            // Dump the kernel stack to find the stuck call chain.
+                            let ttbr1_stack = vcpu
+                                .read_sys_register(HvSysReg::Ttbr1El1)
+                                .unwrap_or(0);
+                            let t1sz_stack = tcr & 0x3F;
+                            let mut frames: Vec<u64> = Vec::new();
+                            let mut sp = sp_el1;
+                            for _ in 0..24 {
+                                if let Some(sp_pa) =
+                                    self.translate_va_to_pa(sp, ttbr1_stack, t1sz_stack)
+                                {
+                                    if sp_pa < RAM_BASE
+                                        || sp_pa + 8 > RAM_BASE + self.memory_size as u64
+                                    {
+                                        break;
+                                    }
+                                    let o = (sp_pa - RAM_BASE) as usize;
+                                    let w = u64::from_le_bytes(
+                                        self.memory[o..o + 8].try_into().unwrap(),
+                                    );
+                                    if (w & 0xFFFF_0000_0000_0000) == 0xFFFF_0000_0000_0000 {
+                                        frames.push(w);
+                                    }
+                                    sp = sp.wrapping_add(8);
+                                } else {
+                                    break;
+                                }
+                            }
+                            let mut fs = String::new();
+                            for f in frames.iter().take(12) {
+                                use std::fmt::Write;
+                                let _ = write!(fs, "0x{f:x} ");
+                            }
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "  STACK_SP1: {fs}"
+                            ));
+                            // Dump instructions at the stuck PC
+                            let ttbr1 = vcpu.read_sys_register(HvSysReg::Ttbr1El1).unwrap_or(0);
+                            let t1sz = tcr & 0x3F;
+                            if let Some(pc_pa) = self.translate_va_to_pa(guest_pc, ttbr1, t1sz) {
+                                let mem_len = self.memory.len();
+                                if pc_pa >= RAM_BASE && (pc_pa as usize) + 64 <= RAM_BASE as usize + mem_len {
+                                    let off = (pc_pa - RAM_BASE) as usize;
+                                    let i0 = u32::from_le_bytes(self.memory[off..off+4].try_into().unwrap());
+                                    let i1 = u32::from_le_bytes(self.memory[off+4..off+8].try_into().unwrap());
+                                    let i2 = u32::from_le_bytes(self.memory[off+8..off+12].try_into().unwrap());
+                                    let i3 = u32::from_le_bytes(self.memory[off+12..off+16].try_into().unwrap());
+                                    let i4 = u32::from_le_bytes(self.memory[off+16..off+20].try_into().unwrap());
+                                    let i5 = u32::from_le_bytes(self.memory[off+20..off+24].try_into().unwrap());
+                                    let i6 = u32::from_le_bytes(self.memory[off+24..off+28].try_into().unwrap());
+                                    let i7 = u32::from_le_bytes(self.memory[off+28..off+32].try_into().unwrap());
+                                    // Read the function that BL calls (BL target at PC-20)
+                                    let pre_off = off.saturating_sub(0x20);
+                                    let p0 = u32::from_le_bytes(self.memory[pre_off..pre_off+4].try_into().unwrap());
+                                    let p1 = u32::from_le_bytes(self.memory[pre_off+4..pre_off+8].try_into().unwrap());
+                                    let p2 = u32::from_le_bytes(self.memory[pre_off+8..pre_off+12].try_into().unwrap());
+                                    let p3 = u32::from_le_bytes(self.memory[pre_off+12..pre_off+16].try_into().unwrap());
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  STUCK: PC=0x{guest_pc:x} PA=0x{pc_pa:x} INS=[0x{i0:08x} 0x{i1:08x} 0x{i2:08x} 0x{i3:08x} 0x{i4:08x} 0x{i5:08x} 0x{i6:08x} 0x{i7:08x}]",
+                                    ));
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  BL_TGT: PA=0x{:x} INS=[0x{p0:08x} 0x{p1:08x} 0x{p2:08x} 0x{p3:08x}]",
+                                        pc_pa.saturating_sub(0x20),
+                                    ));
+                                }
+                            }
+                            // If stuck in a spinlock wait (ldxrb [x3] + wfi/wfe),
+                            // dump the lock word at X3 so we can identify it.
+                            if let Some(x3_pa) = self.translate_va_to_pa(x3, ttbr1, t1sz) {
+                                if x3_pa >= RAM_BASE && (x3_pa as usize) + 8 <= RAM_BASE as usize + self.memory.len() {
+                                    let off = (x3_pa - RAM_BASE) as usize;
+                                    let lock_val = u64::from_le_bytes(self.memory[off..off+8].try_into().unwrap());
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  LOCK@X3: va=0x{x3:x} pa=0x{x3_pa:x} val=0x{lock_val:x}",
+                                    ));
+                                }
+                            }
+                        }
+                        // Dump virtio-blk queue state to diagnose I/O stalls.
+                        if let Some(ref blk) = self.virtio_blk {
+                            for qi in 0..blk.queues.len() {
+                                let q = &blk.queues[qi];
+                                if q.ready {
+                                    let blk_avail = crate::virtio::read_avail_idx(&self.memory, RAM_BASE, q.avail_addr);
+                                    let blk_used = crate::virtio::read_used_idx(&self.memory, RAM_BASE, q.used_addr);
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  BLK q{qi}: avail={blk_avail:?} used={blk_used:?} last_avail={} irq={}",
+                                        q.last_avail_idx, blk.interrupt_status,
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(ref dev) = self.data_blk {
+                            for qi in 0..dev.queues.len() {
+                                let q = &dev.queues[qi];
+                                if q.ready {
+                                    let blk_avail = crate::virtio::read_avail_idx(&self.memory, RAM_BASE, q.avail_addr);
+                                    let blk_used = crate::virtio::read_used_idx(&self.memory, RAM_BASE, q.used_addr);
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  DATABLK q{qi}: avail={blk_avail:?} used={blk_used:?} last_avail={} irq={}",
+                                        q.last_avail_idx, dev.interrupt_status,
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(ref rng) = self.virtio_rng {
+                            let q = &rng.queues[0];
+                            if q.ready {
+                                let rng_avail = crate::virtio::read_avail_idx(&self.memory, RAM_BASE, q.avail_addr);
+                                let rng_used = crate::virtio::read_used_idx(&self.memory, RAM_BASE, q.used_addr);
+                                crate::vmm_trace::write_console_io(format_args!(
+                                    "  RNG: avail={rng_avail:?} used={rng_used:?} last_avail={} irq={}",
+                                    q.last_avail_idx, rng.interrupt_status,
+                                ));
+                            }
+                        }
+                        // Scan guest RAM for kernel panic/oops markers and dump context.
+                        // Gives the guest kernel's own view of why it is stuck.
+                        if cc == 100 {
+                            const NEEDLES: [&[u8]; 10] = [
+                                b"Kernel panic",
+                                b"Oops",
+                                b"BUG:",
+                                b"Unable to handle kernel",
+                                b"Call trace",
+                                b"scheduling while atomic",
+                                b"attempted to kill",
+                                b"soft lockup",
+                                b"rcu_sched self-detected",
+                                b"bad page state",
+                            ];
+                            let mem = &self.memory[..self.memory.len().min(64 << 20)]; // first 64MB: kernel image + log buf
+                            for needle in NEEDLES {
+                                if let Some(pos) = mem.windows(needle.len()).position(|w| w == needle) {
+                                    let start = pos.saturating_sub(64);
+                                    let end = (pos + needle.len() + 384).min(mem.len());
+                                    let text: String = mem[start..end]
+                                        .iter()
+                                        .map(|&b| if b == b'\n' { '|' } else if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                        .collect();
+                                    crate::vmm_trace::write_console_io(format_args!(
+                                        "  KLOG[{}]@0x{:x}: {}", String::from_utf8_lossy(needle),
+                                        RAM_BASE + start as u64, text
+                                    ));
+                                }
+                            }
+                        }
+                        // Dump task list so we can see which tasks are stuck.
+                        let ttbr1 = vcpu.read_sys_register(HvSysReg::Ttbr1El1).unwrap_or(0);
+                        let tcr_val = vcpu.read_sys_register(HvSysReg::TcrEl1).unwrap_or(0);
+                        let t1sz = tcr_val & 0x3F;
+                        let sp_el0 = vcpu.read_sys_register(HvSysReg::SpEl0).unwrap_or(0);
+                        if let Some(idle_pa) = self.translate_va_to_pa(sp_el0, ttbr1, t1sz) {
+                            let idle_off = (idle_pa - RAM_BASE) as usize;
+                            let list_off = idle_off + 0x300;
+                            if list_off + 16 <= self.memory.len() {
+                                let first = u64::from_le_bytes(self.memory[list_off..list_off+8].try_into().unwrap());
+                                let mut cursor = first;
+                                let mut tasks: Vec<(String, u64, u64)> = Vec::new();
+                                for _ in 0..48 {
+                                    let task_va = cursor.saturating_sub(0x300);
+                                    let task_pa = match self.translate_va_to_pa(task_va, ttbr1, t1sz) {
+                                        Some(pa) => pa, None => break,
+                                    };
+                                    if task_pa < RAM_BASE { break; }
+                                    let t_off = (task_pa - RAM_BASE) as usize;
+                                    if t_off + 0x30 > self.memory.len() { break; }
+                                    let fl = u64::from_le_bytes(self.memory[t_off..t_off+8].try_into().unwrap());
+                                    let st = u64::from_le_bytes(self.memory[t_off+0x18..t_off+0x20].try_into().unwrap());
+                                    // comm at 0x5a8 on this kernel
+                                    let c_start = t_off + 0x5a8;
+                                    let c_end = (c_start + 16).min(self.memory.len());
+                                    let comm_bytes = &self.memory[c_start..c_end];
+                                    let comm = String::from_utf8_lossy(comm_bytes).trim_end_matches('\0').to_string();
+                                    let clean = if comm.is_empty() { "?".to_string() } else { comm.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect() };
+                                    tasks.push((clean, fl, st));
+                                    let c_pa = match self.translate_va_to_pa(cursor, ttbr1, t1sz) {
+                                        Some(pa) => pa, None => break,
+                                    };
+                                    if c_pa < RAM_BASE || c_pa + 8 > RAM_BASE + self.memory_size as u64 { break; }
+                                    let c_off = (c_pa - RAM_BASE) as usize;
+                                    let next = u64::from_le_bytes(self.memory[c_off..c_off+8].try_into().unwrap());
+                                    if next == first { break; }
+                                    cursor = next;
+                                }
+                                let mut ts = String::new();
+                                let mut uv_task_pa: Option<u64> = None;
+                                for (i, (name, fl, st)) in tasks.iter().enumerate() {
+                                    use std::fmt::Write;
+                                    let _ = write!(ts, "{i}:{name}(fl=0x{fl:x},st=0x{st:x}) ");
+                                    if name.contains("uv") && uv_task_pa.is_none() {
+                                        // Re-walk to get uv's task_struct PA
+                                        let mut c2 = first;
+                                        for j in 0..=i {
+                                            let tv = c2.saturating_sub(0x300);
+                                            if let Some(tp) = self.translate_va_to_pa(tv, ttbr1, t1sz) {
+                                                uv_task_pa = Some(tp);
+                                            }
+                                            if j < i {
+                                                let cp = self.translate_va_to_pa(c2, ttbr1, t1sz);
+                                                if let Some(cp) = cp {
+                                                    if cp >= RAM_BASE && cp + 8 <= RAM_BASE + self.memory_size as u64 {
+                                                        let co = (cp - RAM_BASE) as usize;
+                                                        c2 = u64::from_le_bytes(self.memory[co..co+8].try_into().unwrap());
+                                                    } else { break; }
+                                                } else { break; }
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::vmm_trace::write_console_io(format_args!(
+                                    "  TASKS({}): {ts}", tasks.len()
+                                ));
+                                // Dump uv kernel state to see call trace.
+                                if let Some(uv_pa) = uv_task_pa {
+                                    let uv_off = (uv_pa - RAM_BASE) as usize;
+                                    // Try stack at multiple offsets (thread_info may be 16 or 24 bytes)
+                                    let mut stack_va = 0u64;
+                                    for &soff in &[0x18u64, 0x20u64] {
+                                        let addr = uv_off + soff as usize;
+                                        if addr + 8 <= self.memory.len() {
+                                            let v = u64::from_le_bytes(self.memory[addr..addr+8].try_into().unwrap());
+                                            // Valid stack VA is in vmalloc range
+                                            if v >= 0xffff000000000000 && v < 0xffff800000000000 {
+                                                stack_va = v;
+                                                crate::vmm_trace::write_console_io(format_args!(
+                                                    "  UV_INFO: stack_va@0x{soff:x}=0x{stack_va:x}",
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if stack_va == 0 {
+                                        // Fallback: read raw bytes at 0x18 and 0x20
+                                        let v18 = if uv_off + 0x20 <= self.memory.len() {
+                                            u64::from_le_bytes(self.memory[uv_off+0x18..uv_off+0x20].try_into().unwrap())
+                                        } else { 0 };
+                                        let v20 = if uv_off + 0x28 <= self.memory.len() {
+                                            u64::from_le_bytes(self.memory[uv_off+0x20..uv_off+0x28].try_into().unwrap())
+                                        } else { 0 };
+                                        crate::vmm_trace::write_console_io(format_args!(
+                                            "  UV_INFO: offset_0x18=0x{v18:x} offset_0x20=0x{v20:x}",
+                                        ));
+                                    }
+
+                                    // Scan task_struct for thread.cpu_context by trying every
+                                    // 8-byte-aligned offset from 0x200 to 0x5a0 and looking for
+                                    // valid sp (vmalloc) + pc (kernel text) at +0x60,+0x68.
+                                    let mut found_ctx: Option<(u64, u64, u64, u64)> = None;
+                                    // Verify a candidate PC really points at code: the 4 bytes
+                                    // there must be a plausible AArch64 opcode (not a kernel
+                                    // pointer / not zeros).  The naive sp+pc scan matches data
+                                    // tables (e.g. function-pointer arrays) whose slots look
+                                    // like a saved sp+pc, producing pc=0xffff800080462448 (data).
+                                    for off in (0x200u64..0x5a0u64).step_by(8) {
+                                        let ctx = uv_off + off as usize;
+                                        if ctx + 0x70 > self.memory.len() { break; }
+                                        let sp = u64::from_le_bytes(self.memory[ctx+0x60..ctx+0x68].try_into().unwrap());
+                                        let pc = u64::from_le_bytes(self.memory[ctx+0x68..ctx+0x70].try_into().unwrap());
+                                        let sp_ok = sp >= 0xffff000000000000 && sp <= 0xffffffffffffefff && sp & 0xf == 0;
+                                        let pc_ok = pc >= 0xffff800000000000 && pc <= 0xffffffffffffefff && (pc & 3) == 0;
+                                        let mut code_ok = false;
+                                        if pc_ok {
+                                            if let Some(ppa) = self.translate_va_to_pa(pc, ttbr1, t1sz) {
+                                                let po = (ppa - RAM_BASE) as usize;
+                                                if po + 4 <= self.memory.len() {
+                                                    let insn = u32::from_le_bytes(self.memory[po..po+4].try_into().unwrap());
+                                                    // Code-like: not a kernel pointer, not zero,
+                                                    // top byte not 0x1f (SVCR/garbage from data).
+                                                    code_ok = insn != 0
+                                                        && insn >> 20 != 0xffff8
+                                                        && insn >> 28 != 0x1f
+                                                        && (insn >> 24) & 0xff != 0x80;
+                                                }
+                                            }
+                                        }
+                                        if sp_ok && pc_ok && code_ok {
+                                            let fp = u64::from_le_bytes(self.memory[ctx+0x58..ctx+0x60].try_into().unwrap());
+                                            found_ctx = Some((off, fp, sp, pc));
+                                            break;
+                                        }
+                                    }
+
+                                    if let Some((ctx_off, fp, sp, pc)) = found_ctx {
+                                        // Convert PC to physical to identify the blocking function
+                                        let pc_pa = self.translate_va_to_pa(pc, ttbr1, t1sz);
+                                        let mut pc_info = String::new();
+                                        if let Some(ppa) = pc_pa {
+                                            let po = (ppa - RAM_BASE) as usize;
+                                            if po + 4 <= self.memory.len() {
+                                                let insn = u32::from_le_bytes(self.memory[po..po+4].try_into().unwrap());
+                                                use std::fmt::Write;
+                                                let _ = write!(pc_info, " pc_pa=0x{ppa:x} insn=0x{insn:08x}");
+                                            }
+                                        }
+                                        crate::vmm_trace::write_console_io(format_args!(
+                                            "  UV_CTX@0x{ctx_off:x}: fp=0x{fp:x} sp=0x{sp:x} pc=0x{pc:x}{pc_info}",
+                                        ));
+                                        // Dump raw stack context around sp
+                                        if let Some(sp_pa) = self.translate_va_to_pa(sp, ttbr1, t1sz) {
+                                            let sp_off = (sp_pa - RAM_BASE) as usize;
+                                            if sp_off + 0x80 <= self.memory.len() {
+                                                let mut raw = String::new();
+                                                for j in 0..8 {
+                                                    let addr = sp_off + j * 8;
+                                                    let v = u64::from_le_bytes(self.memory[addr..addr+8].try_into().unwrap());
+                                                    use std::fmt::Write;
+                                                    let _ = write!(raw, " [{j}]=0x{v:x}");
+                                                }
+                                                crate::vmm_trace::write_console_io(format_args!(
+                                                    "  UV_STACK: sp_pa=0x{sp_pa:x}{raw}",
+                                                ));
+                                            }
+                                        }
+                                        // Try walking frame pointers with verbose error
+                                        if let Some(fp_pa) = self.translate_va_to_pa(fp, ttbr1, t1sz) {
+                                            if fp_pa >= RAM_BASE && fp_pa + 16 <= RAM_BASE + self.memory_size as u64 {
+                                                let fo = (fp_pa - RAM_BASE) as usize;
+                                                let next_fp = u64::from_le_bytes(self.memory[fo..fo+8].try_into().unwrap());
+                                                let lr = u64::from_le_bytes(self.memory[fo+8..fo+16].try_into().unwrap());
+                                                crate::vmm_trace::write_console_io(format_args!(
+                                                    "  UV_FRAME: fp_pa=0x{fp_pa:x} next_fp=0x{next_fp:x} lr=0x{lr:x}",
+                                                ));
+                                                let mut cur_fp = fp;
+                                                let mut trace = String::new();
+                                                for _j in 0..12 {
+                                                    if let Some(fpa) = self.translate_va_to_pa(cur_fp, ttbr1, t1sz) {
+                                                        if fpa >= RAM_BASE && fpa + 16 <= RAM_BASE + self.memory_size as u64 {
+                                                            let fo = (fpa - RAM_BASE) as usize;
+                                                            let nfp = u64::from_le_bytes(self.memory[fo..fo+8].try_into().unwrap());
+                                                            let lrv = u64::from_le_bytes(self.memory[fo+8..fo+16].try_into().unwrap());
+                                                            if nfp == 0 || nfp <= cur_fp { break; }
+                                                            // Convert LR to PA for function identification
+                                                            let mut lr_info = format!("0x{lrv:x}");
+                                                            if let Some(lr_pa) = self.translate_va_to_pa(lrv, ttbr1, t1sz) {
+                                                                lr_info = format!("0x{lrv:x}(pa=0x{lr_pa:x})");
+                                                            }
+                                                            use std::fmt::Write;
+                                                            let _ = write!(trace, "lr={lr_info} ");
+                                                            cur_fp = nfp;
+                                                        } else { break; }
+                                                    } else { break; }
+                                                }
+                                                if !trace.is_empty() {
+                                                    crate::vmm_trace::write_console_io(format_args!(
+                                                        "  UV_TRACE: {trace}"
+                                                    ));
+                                                }
+                                            } else {
+                                                crate::vmm_trace::write_console_io(format_args!(
+                                                    "  UV_FRAME: fp=0x{fp:x} fp_pa out of range"
+                                                ));
+                                            }
+                                        } else {
+                                            crate::vmm_trace::write_console_io(format_args!(
+                                                "  UV_FRAME: fp=0x{fp:x} translation failed"
+                                            ));
+                                        }
+                                    } else {
+                                        crate::vmm_trace::write_console_io(format_args!(
+                                            "  UV_CTX: no cpu_context found in [0x200..0x5a0]"
+                                        ));
+                                    }
+
+                                    // Try pt_regs from stack top
+                                    if stack_va != 0 {
+                                        if let Some(stack_pa) = self.translate_va_to_pa(stack_va, ttbr1, t1sz) {
+                                            let top = stack_pa.wrapping_add(16384u64);
+                                            let prb = top.wrapping_sub(0x110);
+                                            if prb >= RAM_BASE && prb + 0x110 <= RAM_BASE + self.memory_size as u64 {
+                                                let pr = (prb - RAM_BASE) as usize;
+                                                let usr_x8 = u64::from_le_bytes(self.memory[pr+64..pr+72].try_into().unwrap());
+                                                let usr_pc = u64::from_le_bytes(self.memory[pr+256..pr+264].try_into().unwrap());
+                                                let usr_sp = u64::from_le_bytes(self.memory[pr+248..pr+256].try_into().unwrap());
+                                                // Also dump 4 words at stack_pa to see raw content
+                                                let s0 = u64::from_le_bytes(self.memory[(stack_pa-RAM_BASE) as usize..(stack_pa-RAM_BASE) as usize+8].try_into().unwrap());
+                                                crate::vmm_trace::write_console_io(format_args!(
+                                                    "  UV_REGS: x8=0x{usr_x8:x} usr_sp=0x{usr_sp:x} usr_pc=0x{usr_pc:x} stack_pa=0x{stack_pa:x} stack[0]=0x{s0:x}",
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 1 => {
                     // HV_EXIT_REASON_EXCEPTION
@@ -951,8 +1917,17 @@ impl VmInstance {
 
                 2 => {
                     // HV_EXIT_REASON_VTIMER_ACTIVATED
-                    vcpu.set_vtimer_mask(true)?;
-                    vcpu.set_pending_interrupt(0, true)?;
+                    // Advance CVAL far into the future to prevent immediate
+                    // re-fire while the guest processes the injected IRQ.
+                    // The guest's timer handler will reprogram CVAL to the
+                    // correct next-tick value.
+                    self.consecutive_canceled = 0;
+                    let _ = vcpu.write_sys_register(HvSysReg::CntvCvalEl0, u64::MAX);
+                    let _ = vcpu.set_pending_interrupt(0, true);
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "VTIMER iter={iteration} irq_ack_device=0x{ack:x}",
+                        ack = self.irq_ack_device
+                    ));
                 }
 
                 _ => {
@@ -967,15 +1942,55 @@ impl VmInstance {
             // is not yet visible when the VMM reads it at QueueNotify
             // time.  Polling here catches any such deferred writes on
             // every subsequent vCPU exit.
-            if let Some(ref mut blk) = self.virtio_blk {
-                if blk.poll_pending(&mut self.memory, RAM_BASE) {
-                    Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
+            if self.boot_complete
+                && self.command_injected
+                && self.poll_stdin(stdin_fd, &mut stdin_eof)
+            {
+                let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+            }
+            if self.irq_ack_device != VIRTIO_BLK_BASE {
+                if let Some(ref mut blk) = self.virtio_blk {
+                    if blk.poll_pending(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
+                    }
                 }
             }
-            if let Some(ref mut dev) = self.data_blk {
-                if dev.poll_pending(&mut self.memory, RAM_BASE) {
-                    Vm::set_gic_spi(DATA_BLK_SPI, true);
+            if self.irq_ack_device != DATA_BLK_BASE {
+                if let Some(ref mut dev) = self.data_blk {
+                    if dev.poll_pending(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(DATA_BLK_SPI, true);
+                    }
                 }
+            }
+            if self.irq_ack_device != VIRTIO_RNG_BASE {
+                if let Some(ref mut rng) = self.virtio_rng {
+                    if rng.process_queue(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
+                    } else {
+                        // Orphan IRQ may have been cleared by process_queue.
+                        Vm::set_gic_spi(VIRTIO_RNG_SPI, rng.interrupt_status != 0);
+                    }
+                }
+            }
+            // Poll virtio-console queues for missed work (same race as blk:
+            // the guest's avail-ring write may not be visible at QueueNotify
+            // time, or QueueNotify may not have arrived yet).
+            if self.irq_ack_device != VIRTIO_CONSOLE_BASE {
+                let mut tx_bytes = Vec::new();
+                if let Some(ref mut console) = self.virtio_console {
+                    tx_bytes = console.process_tx(&mut self.memory, RAM_BASE);
+                    let _ = console.drain_rx_backlog(&mut self.memory, RAM_BASE);
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+                }
+                if !tx_bytes.is_empty() {
+                    self.process_console_tx(&tx_bytes);
+                }
+            }
+            if self.boot_complete
+                && self.command_injected
+                && self.poll_stdin(stdin_fd, &mut stdin_eof)
+            {
+                let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
             }
 
             // ── Guest-cooperative snapshot trigger ─────────────────
@@ -996,22 +2011,35 @@ impl VmInstance {
             //     driver during init, and
             // (b) stdin EOF (Ctrl-D) doesn't reach the guest's `read`
             //     before the command data when running without a TTY.
-            if self.boot_complete && self.command_injected {
-                self.poll_stdin(stdin_fd, &mut stdin_eof);
-                if self
-                    .virtio_console
-                    .as_ref()
-                    .is_some_and(|c| !c.rx_backlog.is_empty())
-                {
-                    let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
-                }
+            if self.boot_complete
+                && self.command_injected
+                && self.poll_stdin(stdin_fd, &mut stdin_eof)
+            {
+                let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
             }
 
             // Poll network backend and deliver incoming packets to guest RX queue
-            if let Some(ref mut net) = self.virtio_net {
-                net.poll_backend();
-                if net.process_rx(&mut self.memory, RAM_BASE) {
-                    Vm::set_gic_spi(VIRTIO_NET_SPI, true);
+            if self.irq_ack_device != VIRTIO_NET_BASE {
+                if let Some(ref mut net) = self.virtio_net {
+                    net.poll_backend();
+                    if net.process_rx(&mut self.memory, RAM_BASE) {
+                        Vm::set_gic_spi(VIRTIO_NET_SPI, true);
+                    }
+                }
+            }
+
+            // Poll virtiofs devices for missed FUSE requests (same race as blk
+            // where avail-ring writes may not be visible at QueueNotify time).
+            for dev_idx in 0..self.virtiofs.len() {
+                let spi = VIRTIOFS_SPI_START + dev_idx as u32;
+                let dev = &mut self.virtiofs[dev_idx];
+                if dev.queues[0].ready || dev.queues[1].ready {
+                    // Poll hiprio queue (0) and request queue (1)
+                    let had_work0 = dev.process_queue(0, &mut self.memory, RAM_BASE);
+                    let had_work1 = dev.process_queue(1, &mut self.memory, RAM_BASE);
+                    if had_work0 || had_work1 {
+                        Vm::set_gic_spi(spi, true);
+                    }
                 }
             }
 
@@ -1068,49 +2096,122 @@ impl VmInstance {
     }
 
     /// Minimal poller for stdin when networking is disabled.
-    /// Uses poll() to block until stdin has data, then kicks the vcpu.
+    /// Uses poll() to block until stdin has data or the periodic kick fires,
+    /// then kicks the vcpu.  The periodic kick (every 100 ms) prevents the
+    /// guest from running unbounded without a VMM scheduling point, which
+    /// matters when NO_HZ defers the vtimer during CPU-bound stretches.
     /// Exits when stdin reaches EOF/POLLHUP or an error occurs.
-    fn stdin_poller(vcpu_id: u64, stdin_fd: RawFd) {
+    fn stdin_poller(
+        vcpu_id: u64,
+        stdin_fd: RawFd,
+        guest_idle: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
         loop {
-            let (ready, hungup) = poll_stdin_once(stdin_fd);
-            if ready || hungup {
-                Vcpu::force_exit(&[vcpu_id]).ok();
-            }
+            // Adaptive wake cadence: when the guest is parked in the idle WFI,
+            // force-exit every 10 ms so it can take timer ticks; when it is
+            // actively computing, back off to 100 ms so we do NOT slice active
+            // guest code (which can preempt a critical section and deadlock the
+            // guest — the phase-2 uv startup block).  stdin data is polled
+            // regardless and wakes the vCPU immediately.
+            let timeout_ms = if guest_idle.load(Ordering::Relaxed) { 10 } else { 100 };
+            let (_ready, hungup) = poll_stdin_once_timeout(stdin_fd, timeout_ms);
+            Vcpu::force_exit(&[vcpu_id]).ok();
             if hungup {
                 break;
             }
         }
     }
 
-    /// Read available bytes from host stdin and inject into the
-    /// virtio-console RX queue.  When stdin reaches EOF (pipe closed),
-    /// sends Ctrl-D (0x04) so the guest's TTY layer signals end-of-file.
-    fn poll_stdin(&mut self, stdin_fd: RawFd, stdin_eof: &mut bool) {
+    /// Read host stdin until `EAGAIN` (up to 16 KiB per call), inject into virtio-console RX.
+    /// Returns whether the vCPU should be kicked (`force_exit`): data reached the guest, is
+    /// queued in [`VirtioConsoleDevice::rx_backlog`], or EOF was queued.
+    fn poll_stdin(&mut self, stdin_fd: RawFd, stdin_eof: &mut bool) -> bool {
         if *stdin_eof {
-            return;
+            return false;
         }
-        let mut buf = [0u8; 256];
-        let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n > 0 {
-            if let Some(ref mut console) = self.virtio_console {
-                let _ = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &buf[..n as usize]);
-                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+        const MAX_PER_CALL: usize = 16 * 1024;
+        const CHUNK: usize = 4096;
+        let mut buf = [0u8; CHUNK];
+        let mut total_read = 0usize;
+        let mut need_kick = false;
+
+        loop {
+            let n =
+                unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                total_read += n as usize;
+                let chunk = &buf[..n as usize];
+                if let Some(ref mut console) = self.virtio_console {
+                    let progressed = console.push_rx_and_drain(&mut self.memory, RAM_BASE, chunk);
+                    need_kick |= progressed || !console.rx_backlog.is_empty();
+                    let irq = console.interrupt_status != 0;
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, irq);
+                    // HVF's set_gic_spi doesn't pend the interrupt; pend the
+                    // console SPI directly when it has work so the guest's ISR
+                    // actually fires and wakes the blocked shell.
+                    if irq {
+                        let _ = Vm::set_distributor_reg(
+                            HvGicDistributorReg::Ispendr1,
+                            1u64 << 28, // INTID 60 = console
+                        );
+                    }
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "STDIN_READ n={} progressed={} backlog={} irq_pending={} preview=\"{}\"",
+                        n,
+                        progressed,
+                        console.rx_backlog.len(),
+                        irq,
+                        crate::vmm_trace::bytes_preview(chunk, 48)
+                    ));
+                }
+                if total_read >= MAX_PER_CALL {
+                    need_kick = true;
+                    break;
+                }
+                continue;
             }
-        } else if n == 0 {
-            // EOF — queue Ctrl-D for the guest (may remain in backlog until RX buffers exist).
-            *stdin_eof = true;
-            if let Some(ref mut console) = self.virtio_console {
-                let _ = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &[0x04]);
-                Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+            if n == 0 {
+                *stdin_eof = true;
+                if let Some(ref mut console) = self.virtio_console {
+                    let progressed = console.push_rx_and_drain(&mut self.memory, RAM_BASE, &[0x04]);
+                    need_kick |= progressed || !console.rx_backlog.is_empty();
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "STDIN_EOF progressed={} backlog={}",
+                        progressed,
+                        console.rx_backlog.len()
+                    ));
+                    Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
+                }
+                return need_kick;
             }
+            let err = io::Error::last_os_error();
+            let raw = err.raw_os_error().unwrap_or(0);
+            if raw == libc::EINTR {
+                continue;
+            }
+            if raw == libc::EAGAIN || raw == libc::EWOULDBLOCK {
+                break;
+            }
+            crate::vmm_trace::write_console_io(format_args!(
+                "STDIN_READ_ERR errno={raw} err={err}"
+            ));
+            break;
         }
-        // n < 0 → EAGAIN (no data), ignore
+        need_kick
     }
 
     /// Process bytes received from the virtio-console TX queue.
     /// Feeds them through the same line-buffered marker detection and output
     /// filtering that previously ran per-byte in the UART TX handler.
+    /// Output is batched: bytes are accumulated and only flushed to stdout
+    /// on newline or when the buffer reaches FLUSH_THRESHOLD bytes.  This
+    /// avoids per-byte write+flush that could block the VMM thread when the
+    /// receiving pty/pipe buffer fills up (especially during high-volume
+    /// output like python REPL exits).
     fn process_console_tx(&mut self, data: &[u8]) {
+        const FLUSH_THRESHOLD: usize = 256;
+
         for &ch in data {
             if ch.is_ascii() || ch == b'\n' || ch == b'\r' {
                 self.uart_line_buf.push(ch as char);
@@ -1137,13 +2238,10 @@ impl VmInstance {
                     } else if is_prefix_of_marker(buf_bytes) {
                         // Still matching a marker prefix — keep buffering.
                     } else if buf_len > 1 && is_prefix_of_marker(&buf_bytes[..buf_len - 1]) {
-                        let buffered = buf_bytes.to_vec();
-                        io::stdout().write_all(&buffered).ok();
-                        io::stdout().flush().ok();
+                        // Was matching a prefix but no longer — flush the queued bytes.
+                        self.console_out_buf.extend_from_slice(buf_bytes);
                     } else {
-                        let out = [ch];
-                        io::stdout().write_all(&out).ok();
-                        io::stdout().flush().ok();
+                        self.console_out_buf.push(ch);
                     }
                 }
 
@@ -1151,9 +2249,31 @@ impl VmInstance {
                     self.uart_suppress_line = false;
                     let line = mem::take(&mut self.uart_line_buf);
                     self.process_uart_line(&line);
+                    // Flush on newline so the reader sees complete lines promptly.
+                    if !self.console_out_buf.is_empty() {
+                        Self::flush_console_out(&mut self.console_out_buf);
+                    }
+                } else if self.console_out_buf.len() >= FLUSH_THRESHOLD {
+                    Self::flush_console_out(&mut self.console_out_buf);
                 }
             }
         }
+        // Flush any buffered output that didn't end with a newline,
+        // e.g. shell prompt ("/ # ") or DSR ("\x1b[6n").
+        if !self.console_out_buf.is_empty() {
+            Self::flush_console_out(&mut self.console_out_buf);
+        }
+    }
+
+    /// Write buffered console output to stdout.
+    /// Batched writes reduce syscall overhead vs the old per-byte flush.
+    fn flush_console_out(buf: &mut Vec<u8>) {
+        if buf.is_empty() {
+            return;
+        }
+        let _ = io::stdout().write_all(buf);
+        let _ = io::stdout().flush();
+        buf.clear();
     }
 
     /// Process a complete line of console output.
@@ -1185,6 +2305,14 @@ impl VmInstance {
         // Boot completion is signaled by BRK #SNAPSHOT_SIGNAL or BRK #INIT_CONFIG.
         if !self.boot_complete {
             debug!("{trimmed}");
+        }
+
+        if self.boot_complete && self.command_injected {
+            crate::vmm_trace::write_console_io(format_args!(
+                "GUEST_LINE len={} text=\"{}\"",
+                trimmed.len(),
+                crate::vmm_trace::text_preview(trimmed, 200)
+            ));
         }
 
         // After boot: characters were already written directly to stdout
@@ -1476,16 +2604,144 @@ impl VmInstance {
     }
 
     /// Handle system register trap (EC=0x18)
-    fn handle_sysreg_trap(&self, vcpu: &Vcpu, _pc: u64, iss: u64) -> Result<()> {
-        let is_read = (iss & 1) != 0; // Bit 0: direction (1=read/MRS, 0=write/MSR)
+    fn handle_sysreg_trap(&mut self, vcpu: &Vcpu, pc: u64, iss: u64) -> Result<()> {
+        // ARM64 ISS encoding for MSR/MRS (EC=0x18):
+        //   ISS[23:22] = Op0   (2 bits)
+        //   ISS[21:19] = Op1   (3 bits)
+        //   ISS[18:14] = CRn   (5 bits, upper bit is reserved on some encodings)
+        //   ISS[13:10] = CRm   (4 bits)
+        //   ISS[9:5]   = Rt    (5 bits)
+        //   ISS[4:1]   = Op2   (3 bits)
+        //   ISS[0]     = Direction (1=Read/MRS, 0=Write/MSR)
+        let is_read = (iss & 1) != 0;
         let rt = ((iss >> 5) & 0x1F) as u8;
+        let op0 = (iss >> 22) & 3;
+        let op1 = (iss >> 19) & 7;
+        let crn = (iss >> 14) & 0xF;
+        let crm = (iss >> 10) & 0xF;
+        let op2 = (iss >> 1) & 7;
+
+        // ── ICC (GIC CPU Interface) register forwarding ──────────────────
+        // ICC registers are accessed as S3_0_C{crn}_C{crm}_{op2}.
+        // If ICC_SRE_EL1.SRE=0 these trap to EL2 and the VMM must forward
+        // them to the GIC hardware.  Even with SRE=1 some HVF versions may
+        // trap individual ICC registers.
+        let is_icc = op0 == 3 && op1 == 0;
+        if is_icc {
+            // Map (CRn, CRm, op2) → HvGicIccReg
+            let icc_reg: Option<HvGicIccReg> = match (crn, crm, op2) {
+                (4, 6, 0) => Some(HvGicIccReg::PmrEl1),
+                (12, 12, 0) => Some(HvGicIccReg::Iar1El1),
+                (12, 12, 1) => Some(HvGicIccReg::Eoir1El1),
+                (12, 12, 4) => Some(HvGicIccReg::CtlrEl1),
+                (12, 12, 5) => Some(HvGicIccReg::SreEl1),
+                (12, 12, 6) => Some(HvGicIccReg::Igrpen0El1),
+                (12, 12, 7) => Some(HvGicIccReg::Igrpen1El1),
+                (12, 8, 3) => Some(HvGicIccReg::Bpr0El1),
+                (12, 12, 3) => Some(HvGicIccReg::Bpr1El1),
+                // ICC_AP0R0_EL1 / ICC_AP1R0_EL1 — active priority registers
+                (12, 8, 4) => Some(HvGicIccReg::Ap0r0El1),
+                (12, 9, 0) => Some(HvGicIccReg::Ap1r0El1),
+                _ => None,
+            };
+            if let Some(reg) = icc_reg {
+                if is_read {
+                    let value = vcpu.get_icc_reg(reg).unwrap_or(0);
+                    Self::write_guest_register(vcpu, rt, value)?;
+                    if reg as u16 == HvGicIccReg::Iar1El1 as u16 {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "ICC_TRAP_RD: IAR=0x{value:x} PC=0x{pc:x} rt={rt}"
+                        ));
+                    }
+                } else {
+                    let value = Self::read_guest_register(vcpu, rt)?;
+                    vcpu.set_icc_reg(reg, value)?;
+                    if reg as u16 == HvGicIccReg::Eoir1El1 as u16 {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "ICC_TRAP_WR: EOIR=0x{value:x} PC=0x{pc:x} rt={rt}"
+                        ));
+                    } else if reg as u16 == HvGicIccReg::PmrEl1 as u16 {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "ICC_TRAP_WR: PMR=0x{value:x} PC=0x{pc:x} rt={rt}"
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+        }
 
         if is_read {
-            // MRS - provide emulated value
-            let value = 0u64;
+            // Counter registers are broken on Apple Silicon HVF: CNTVCT_EL0,
+            // CNTPCT_EL0, CNTFRQ_EL0 read as 0 from the vCPU, so any guest
+            // delay/udelay/timeout that reads a cycle counter sees a frozen
+            // value and busy-spins forever (observed after repeated Python
+            // exit cycles: the guest spins in a counter-read loop).
+            //
+            // Provide a synthetic, monotonically advancing counter for ALL
+            // counter register reads (regular and self-synchronized variants)
+            // so guest timing code makes forward progress.
+            //   CNTFRQ_EL0:   S3_3_C14_C0_0  op2=0
+            //   CNTPCT_EL0:   S3_3_C14_C0_1  op2=1
+            //   CNTVCT_EL0:   S3_3_C14_C0_2  op2=2
+            //   CNTVCTSS_EL0: S3_3_C14_C0_4  op2=4
+            //   CNTPCTSS_EL0: S3_3_C14_C0_5  op2=5
+            let is_counter_cr = op0 == 3 && op1 == 3 && crn == 14 && crm == 0;
+            let is_cntfrq = is_counter_cr && op2 == 0;
+            let is_counter = is_counter_cr && (op2 == 1 || op2 == 2 || op2 == 4 || op2 == 5);
+
+            let value = if is_cntfrq {
+                24_000_000u64
+            } else if is_counter {
+                self.counter_trap_count += 1;
+                if self.counter_trap_count <= 5 || self.counter_trap_count % 100 == 0 {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "CNT_TRAP_RD op2={op2} rt={rt} cnt={} PC=0x{pc:x}",
+                        self.counter_trap_count
+                    ));
+                }
+                let freq_hz: u64 = 24_000_000;
+                let elapsed_ns = self.boot_instant.elapsed().as_nanos() as u64;
+                (elapsed_ns * freq_hz) / 1_000_000_000
+            } else {
+                // Log untracked sysreg reads for diagnostics — only sample to
+                // avoid flooding the trace.
+                self.sysreg_trap_count += 1;
+                if self.sysreg_trap_count <= 20 || self.sysreg_trap_count % 200 == 0 {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "SYSREG_TRAP_RD[{cnt}]: op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} rt={rt} PC=0x{pc:x}",
+                        cnt = self.sysreg_trap_count,
+                    ));
+                }
+                0u64
+            };
             Self::write_guest_register(vcpu, rt, value)?;
+        } else {
+            // MSR write — forward timer register writes to hardware.
+            // CNTV_CTL_EL0: Op0=3, Op1=3, CRn=14, CRm=3, Op2=1
+            // CNTV_CVAL_EL0: Op0=3, Op1=3, CRn=14, CRm=3, Op2=2
+            let is_cntv_ctl = op0 == 3 && op1 == 3 && crn == 14 && crm == 3 && op2 == 1;
+            let is_cntv_cval = op0 == 3 && op1 == 3 && crn == 14 && crm == 3 && op2 == 2;
+
+            if is_cntv_ctl || is_cntv_cval {
+                let value = Self::read_guest_register(vcpu, rt)?;
+                let reg = if is_cntv_ctl { HvSysReg::CntvCtlEl0 } else { HvSysReg::CntvCvalEl0 };
+                vcpu.write_sys_register(reg, value)?;
+                crate::vmm_trace::write_console_io(format_args!(
+                    "SYSREG_WRITE: rt={rt} val=0x{value:x} reg={}",
+                    if is_cntv_ctl { "CTL" } else { "CVAL" }
+                ));
+            } else {
+                // Log untracked sysreg writes for diagnostics.
+                self.sysreg_trap_count += 1;
+                if self.sysreg_trap_count <= 20 || self.sysreg_trap_count % 200 == 0 {
+                    let value = Self::read_guest_register(vcpu, rt)?;
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "SYSREG_TRAP_WR[{cnt}]: op0={op0} op1={op1} CRn={crn} CRm={crm} op2={op2} rt={rt} val=0x{value:x} PC=0x{pc:x}",
+                        cnt = self.sysreg_trap_count,
+                    ));
+                }
+            }
         }
-        // MSR writes are silently ignored (trapped regs are usually debug/ICC regs)
 
         Ok(())
     }
@@ -1549,36 +2805,94 @@ impl VmInstance {
             // Handle the MMIO access and collect any TX bytes, then process
             // them after releasing the virtio_console borrow.
             let mut tx_bytes = Vec::new();
-            if is_write && self.boot_complete && self.command_injected {
-                self.poll_stdin(stdin_fd, stdin_eof);
-                if self
-                    .virtio_console
-                    .as_ref()
-                    .is_some_and(|c| !c.rx_backlog.is_empty())
-                {
-                    let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
-                }
+            if self.boot_complete && self.command_injected && self.poll_stdin(stdin_fd, stdin_eof) {
+                let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
             }
             if let Some(ref mut console) = self.virtio_console {
                 if is_write {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(queue_idx) = console.mmio_write(offset, value) {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "CONSOLE_QUEUE_NOTIFY q={queue_idx}"
+                        ));
                         if queue_idx == 1 {
                             // TX queue notification — collect output bytes
                             tx_bytes = console.process_tx(&mut self.memory, RAM_BASE);
                         } else {
-                            let _ = console.drain_rx_backlog(&mut self.memory, RAM_BASE);
+                            let drained = console.drain_rx_backlog(&mut self.memory, RAM_BASE);
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "CONSOLE_RX_NOTIFY drained={} backlog={}",
+                                drained,
+                                console.rx_backlog.len()
+                            ));
                         }
+                    }
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = VIRTIO_CONSOLE_BASE;
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "CONSOLE_ACK irq_status={} backlog={}",
+                            console.interrupt_status,
+                            console.rx_backlog.len(),
+                        ));
                     }
                     Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, console.interrupt_status != 0);
                 } else {
                     let value = console.mmio_read(offset, access_sas);
+                    // Trace INTERRUPT_STATUS reads to diagnose orphan IRQ loops
+                    if offset == REG_INTERRUPT_STATUS {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "CONSOLE_READ_IRQ value={value} int_status={} backlog={}",
+                            console.interrupt_status,
+                            console.rx_backlog.len(),
+                        ));
+                    }
+                    // Clear orphan interrupt on INTERRUPT_STATUS read: only if the
+                    // guest has already acked (irq_acked), meaning it processed the
+                    // used ring, and there's no new work pending.
+                    if offset == REG_INTERRUPT_STATUS && value != 0 && console.irq_acked {
+                        let tx_q = &console.queues[1]; // TX_QUEUE
+                        let rx_q = &console.queues[0]; // RX_QUEUE
+                        let tx_idle = !tx_q.ready
+                            || tx_q.num == 0
+                            || read_avail_idx(&self.memory, RAM_BASE, tx_q.avail_addr)
+                                .is_some_and(|a| a == tx_q.last_avail_idx);
+                        // RX is idle if there are no pending buffers with
+                        // data to inject or we've already processed all of
+                        // them.  An empty backlog means no pending work on
+                        // the RX side regardless of how many empty buffers
+                        // the guest has posted.
+                        let rx_idle = console.rx_backlog.is_empty()
+                            || !rx_q.ready
+                            || rx_q.num == 0
+                            || read_avail_idx(&self.memory, RAM_BASE, rx_q.avail_addr)
+                                .is_some_and(|a| a == rx_q.last_avail_idx);
+                        if tx_idle && rx_idle {
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "CONSOLE_ORPHAN_IRQ_CLEAR irq={} tx_avail={} rx_avail={}",
+                                console.interrupt_status,
+                                tx_q.last_avail_idx,
+                                rx_q.last_avail_idx,
+                            ));
+                            console.interrupt_status = 0;
+                            console.irq_acked = false;
+                            Vm::set_gic_spi(VIRTIO_CONSOLE_SPI, false);
+                            Self::write_guest_register(vcpu, rt, 0)?;
+                            return Ok(());
+                        }
+                    }
                     Self::write_guest_register(vcpu, rt, value)?;
                 }
             } else if !is_write {
                 Self::write_guest_register(vcpu, rt, 0)?;
             }
             // Process TX output after releasing the borrow on self.virtio_console
+            if !tx_bytes.is_empty()
+                && self.boot_complete
+                && self.command_injected
+                && self.poll_stdin(stdin_fd, stdin_eof)
+            {
+                let _ = Vcpu::force_exit(&[vcpu.id() as u64]);
+            }
             if !tx_bytes.is_empty() {
                 self.process_console_tx(&tx_bytes);
             }
@@ -1599,8 +2913,11 @@ impl VmInstance {
                         }
                     }
                     // After InterruptACK, deassert SPI if no more pending interrupts
-                    if offset == REG_INTERRUPT_ACK && net.interrupt_status == 0 {
-                        Vm::set_gic_spi(VIRTIO_NET_SPI, false);
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = VIRTIO_NET_BASE;
+                        if net.interrupt_status == 0 {
+                            Vm::set_gic_spi(VIRTIO_NET_SPI, false);
+                        }
                     }
                 } else {
                     let value = net.mmio_read(offset);
@@ -1621,13 +2938,20 @@ impl VmInstance {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = blk.mmio_write(offset, value) {
                         // QueueNotify — process the request and complete it.
+                        crate::vmm_trace::write_console_io(format_args!("BLK_QNOTIFY"));
                         blk.process_queue(&mut self.memory, RAM_BASE);
                         if blk.interrupt_status != 0 {
                             Vm::set_gic_spi(VIRTIO_BLK_SPI, true);
                         }
                     }
-                    if offset == REG_INTERRUPT_ACK && blk.interrupt_status == 0 {
-                        Vm::set_gic_spi(VIRTIO_BLK_SPI, false);
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = VIRTIO_BLK_BASE;
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "BLK_ACK irq={}", blk.interrupt_status
+                        ));
+                        if blk.interrupt_status == 0 {
+                            Vm::set_gic_spi(VIRTIO_BLK_SPI, false);
+                        }
                     }
                 } else {
                     let value = blk.mmio_read(offset);
@@ -1645,13 +2969,20 @@ impl VmInstance {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = dev.mmio_write(offset, value) {
                         // QueueNotify — process the request and complete it.
+                        crate::vmm_trace::write_console_io(format_args!("DATABLK_QNOTIFY"));
                         dev.process_queue(&mut self.memory, RAM_BASE);
                         if dev.interrupt_status != 0 {
                             Vm::set_gic_spi(DATA_BLK_SPI, true);
                         }
                     }
-                    if offset == REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
-                        Vm::set_gic_spi(DATA_BLK_SPI, false);
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = DATA_BLK_BASE;
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "DATABLK_ACK irq={}", dev.interrupt_status
+                        ));
+                        if dev.interrupt_status == 0 {
+                            Vm::set_gic_spi(DATA_BLK_SPI, false);
+                        }
                     }
                 } else {
                     let value = dev.mmio_read(offset);
@@ -1669,12 +3000,14 @@ impl VmInstance {
                     let value = Self::read_guest_register(vcpu, rt)? as u32;
                     if let Some(_queue_idx) = rng.mmio_write(offset, value) {
                         // QueueNotify — fill buffers with random data
-                        if rng.process_queue(&mut self.memory, RAM_BASE) {
-                            Vm::set_gic_spi(VIRTIO_RNG_SPI, true);
-                        }
+                        rng.process_queue(&mut self.memory, RAM_BASE);
+                        Vm::set_gic_spi(VIRTIO_RNG_SPI, rng.interrupt_status != 0);
                     }
-                    if offset == REG_INTERRUPT_ACK && rng.interrupt_status == 0 {
-                        Vm::set_gic_spi(VIRTIO_RNG_SPI, false);
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = VIRTIO_RNG_BASE;
+                        if rng.interrupt_status == 0 {
+                            Vm::set_gic_spi(VIRTIO_RNG_SPI, false);
+                        }
                     }
                 } else {
                     let value = rng.mmio_read(offset);
@@ -1702,8 +3035,11 @@ impl VmInstance {
                             Vm::set_gic_spi(spi, true);
                         }
                     }
-                    if offset == REG_INTERRUPT_ACK && dev.interrupt_status == 0 {
-                        Vm::set_gic_spi(spi, false);
+                    if offset == REG_INTERRUPT_ACK {
+                        self.irq_ack_device = dev_base;
+                        if dev.interrupt_status == 0 {
+                            Vm::set_gic_spi(spi, false);
+                        }
                     }
                 } else {
                     let value = dev.mmio_read(offset);
@@ -1711,6 +3047,31 @@ impl VmInstance {
                 }
             } else if !is_write {
                 Self::write_guest_register(vcpu, rt, 0)?;
+            }
+        }
+        // SP804 Dual-Timer MMIO region
+        else if (SP804_BASE..SP804_BASE + 0x1000).contains(&fault_addr) {
+            let offset = fault_addr - SP804_BASE;
+            if is_write {
+                let value = Self::read_guest_register(vcpu, rt)? as u32;
+                crate::vmm_trace::write_console_io(format_args!(
+                    "SP804_WR off=0x{offset:x} val=0x{value:x} pc=0x{:x}",
+                    vcpu.read_register(HvReg::Pc).unwrap_or(0)
+                ));
+                let irq_was_pending = self.sp804.mmio_read(0x10) != 0; // RIS
+                self.sp804.mmio_write(offset, value);
+                let irq_is_pending = self.sp804.mmio_read(0x10) != 0;
+                // De-assert GIC SPI whenever the timer IRQ was cleared by any
+                // write (IntClr, TimerLoad w/ timer enabled, TimerControl enable).
+                // Without this the SPI stays asserted while irq_pending1=0,
+                // causing spurious interrupts that can accumulate and cause
+                // the kernel to disable the interrupt line.
+                if irq_was_pending && !irq_is_pending {
+                    Vm::set_gic_spi(SP804_SPI_1, false);
+                }
+            } else {
+                let value = self.sp804.mmio_read(offset);
+                Self::write_guest_register(vcpu, rt, value as u64)?;
             }
         }
         // GIC distributor region (0x08000000 - 0x0800FFFF)
@@ -2372,6 +3733,21 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
     }
 
     // Build the VmInstance struct with restored state
+    // Scan the snapshot memory for an ERET instruction (needed by STUCK_KICK).
+    // Do this before constructing VmInstance so `memory` is still borrowable.
+    let eret_insn_gpa: Option<u64> = {
+        const ERET: u32 = 0xd69f03e0;
+        let scan_start = 0x200000usize;
+        let scan_end = memory_size.min(64 * 1024 * 1024);
+        memory[scan_start..scan_end]
+            .chunks_exact(4)
+            .position(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == ERET)
+            .map(|i| RAM_BASE + scan_start as u64 + (i * 4) as u64)
+    };
+    if eret_insn_gpa.is_some() {
+        debug!("ERET instruction found at GPA 0x{:x} (snapshot restore)", eret_insn_gpa.unwrap());
+    }
+
     let mut vm = VmInstance {
         vm: vm_handle,
         memory,
@@ -2395,6 +3771,7 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         gic_state_to_restore: snapshot_device_state.gic_state,
         uart_line_buf: String::new(),
         uart_suppress_line: false,
+        console_out_buf: Vec::with_capacity(4096),
         network_enabled,
         virtio_net,
         virtio_rng: Some(virtio_rng),
@@ -2404,8 +3781,18 @@ pub fn run_from_snapshot(args: &Args, snap_path: &Path, fingerprint: u64) -> Res
         export_save_path: None,
         virtio_console: Some(virtio_console),
         virtio_console_config_changed: false,
+        sp804: Sp804::new(),
         use_virtio_blk,
         virtiofs: virtiofs_devices,
+        irq_ack_device: 0,
+        consecutive_canceled: 0,
+        boot_instant: Instant::now(),
+        last_pmr: 0xff,
+        sysreg_trap_count: 0,
+        counter_trap_count: 0,
+        eret_insn_gpa,
+        last_vt_advance: Instant::now(),
+        guest_idle: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Restore second virtio-blk device (overlay disk).  The disk data is
