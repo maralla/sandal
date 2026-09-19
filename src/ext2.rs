@@ -1134,10 +1134,7 @@ impl Ext2BgdTable {
 struct Ext2Inode {
     mode: u16,
     size: u32,
-    links_count: u16,
     block_ptrs: [u32; 15],
-    dev_major: u8,
-    dev_minor: u8,
 }
 
 impl Ext2Inode {
@@ -1157,22 +1154,14 @@ impl Ext2Inode {
         let raw = &image[offset..];
         let mode = read_le16(raw, 0);
         let size = read_le32(raw, 4);
-        let links_count = read_le16(raw, 26);
         let mut block_ptrs = [0u32; 15];
         for (i, ptr) in block_ptrs.iter_mut().enumerate() {
             *ptr = read_le32(raw, 40 + i * 4);
         }
-        // For char devices, dev number is in block_ptrs[0]
-        let dev = block_ptrs[0];
-        let dev_major = ((dev >> 8) & 0xFF) as u8;
-        let dev_minor = (dev & 0xFF) as u8;
         Ok(Ext2Inode {
             mode,
             size,
-            links_count,
             block_ptrs,
-            dev_major,
-            dev_minor,
         })
     }
 
@@ -1314,14 +1303,11 @@ fn read_dir_entries(image: &[u8], sb: &Ext2Superblock, inode: &Ext2Inode) -> Vec
     entries
 }
 
-/// An entry extracted from an ext2 image for conversion to cpio.
+/// An entry extracted from an ext2 image (path, mode and contents).
 pub struct Ext2Entry {
     pub path: String,
     pub mode: u32,
     pub data: Vec<u8>,
-    pub dev_major: u32,
-    pub dev_minor: u32,
-    pub nlink: u32,
 }
 
 /// Walk the entire ext2 filesystem starting from root and collect all entries.
@@ -1341,9 +1327,6 @@ fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<V
                 path: prefix.clone(),
                 mode: inode.mode as u32,
                 data: Vec::new(),
-                dev_major: 0,
-                dev_minor: 0,
-                nlink: inode.links_count as u32,
             });
         }
 
@@ -1370,18 +1353,12 @@ fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<V
                     path: child_path,
                     mode: child_inode.mode as u32,
                     data,
-                    dev_major: 0,
-                    dev_minor: 0,
-                    nlink: child_inode.links_count as u32,
                 });
             } else if child_inode.is_chardev() {
                 entries.push(Ext2Entry {
                     path: child_path,
                     mode: child_inode.mode as u32,
                     data: Vec::new(),
-                    dev_major: child_inode.dev_major as u32,
-                    dev_minor: child_inode.dev_minor as u32,
-                    nlink: child_inode.links_count as u32,
                 });
             }
         }
@@ -2194,7 +2171,6 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
 
 /// Read the current overlay upper tree from an ext2 image and convert it to
 /// tar entries with paths relative to `upper/`.
-#[allow(dead_code)] // Public helper for export/upper tooling; not wired in all builds.
 pub fn read_upper_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
@@ -2301,7 +2277,7 @@ fn remove_dir_entry(
 }
 
 /// Inject all runtime files into a pre-built ext2 image.
-/// This adds /init, device nodes, CA certificates, entropy seeder, ctty helper.
+/// This adds /init, device nodes, CA certificates and the sandal-export helpers.
 pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
@@ -2333,27 +2309,9 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
         }
     }
 
-    // Ctty helper binary
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        "usr/sbin/sandal-ctty",
-        initramfs::ctty_helper(),
-        0o755,
-    )?;
-
-    // Snapshot signal helper binary (BRK-based)
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        "usr/sbin/sandal-signal",
-        initramfs::signal_helper(),
-        0o755,
-    )?;
-
-    // Export helpers: resize + done BRK binaries, and the sandal-export script
+    // Export helpers: resize + done BRK binaries, and the sandal-export script.
+    // Used by the guest `sandal-export [path]` command to turn the overlay
+    // upper directory into a host-side gzip-compressed .layer file.
     inject_file(
         image,
         &sb,
@@ -2385,49 +2343,4 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
     inject_file(image, &sb, &bgdt, "init", init_binary, 0o755)?;
 
     Ok(())
-}
-
-// ── ext2 to cpio conversion ─────────────────────────────────────────
-
-/// Convert an ext2 image (with runtime files already injected) to a cpio
-/// archive suitable for loading as initramfs.
-pub fn ext2_to_cpio(image: &[u8]) -> Result<Vec<u8>> {
-    let sb = Ext2Superblock::parse(image)?;
-    let bgdt = Ext2BgdTable::parse(image, &sb)?;
-
-    let entries = walk_ext2(image, &sb, &bgdt)?;
-
-    let mut archive = Vec::new();
-    let mut ino: u32 = 300000;
-
-    for entry in &entries {
-        let mode = entry.mode;
-        let nlink = entry.nlink;
-        let (devmajor, devminor) = (entry.dev_major, entry.dev_minor);
-
-        initramfs::write_cpio_entry(
-            &mut archive,
-            &entry.path,
-            ino,
-            mode,
-            0,
-            0,
-            nlink,
-            0,
-            &entry.data,
-            devmajor,
-            devminor,
-        )?;
-        ino += 1;
-    }
-
-    // Trailer
-    initramfs::write_cpio_entry(&mut archive, "TRAILER!!!", 0, 0, 0, 0, 1, 0, &[], 0, 0)?;
-
-    // Pad to 512-byte boundary
-    while archive.len() % 512 != 0 {
-        archive.push(0);
-    }
-
-    Ok(archive)
 }

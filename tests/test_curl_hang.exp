@@ -14,7 +14,7 @@ if {$disk_size eq ""} { set disk_size 128 }
 set timeout 8
 set binary "./target/release/sandal"
 
-spawn $binary --no-cache --disk-size $disk_size --layer curl.layer -- sh
+spawn $binary --disk-size $disk_size --layer curl.layer -- sh
 
 # Wait for shell prompt
 expect {

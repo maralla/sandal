@@ -246,13 +246,6 @@ macro_rules! ldr_w {
     };
 }
 
-/// `LDR Xt, [SP, #off]`.
-macro_rules! ldr_sp {
-    ($e:expr, $rt:tt, $off:expr) => {
-        $e.emit(ldr_x_sp(reg!($rt), $off))
-    };
-}
-
 /// `LDRB Wt, [Xn, #off]`.
 macro_rules! ldrb {
     ($e:expr, $rt:tt, $rn:tt, $off:expr) => {
@@ -457,15 +450,8 @@ macro_rules! pivot_root {
 ///
 /// Path variants:
 ///   - `openat!(e, str_offset, flags)` — path from ELF data section (adr)
-///   - `openat!(e, [SP, off], flags)` — path pointer loaded from stack slot
 ///   - `openat!(e, SP, flags)` — path buffer at SP
 macro_rules! openat {
-    ($e:expr, [SP, $off:expr], $flags:expr) => {{
-        movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
-        ldr_sp!($e, x1, $off);
-        movz!($e, x2, $flags);
-        syscall!($e, $crate::elf::linux::nr::OPENAT);
-    }};
     ($e:expr, SP, $flags:expr) => {{
         movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
         add!($e, x1, SP, 0);
@@ -590,17 +576,6 @@ macro_rules! execve {
         mov!($e, x2, $envp);
         syscall!($e, $crate::elf::linux::nr::EXECVE);
     }};
-    ($e:expr, skip $n:expr) => {{
-        let _off: u32 = ($n + 1) * 8;
-        ldr_sp!($e, x0, _off); // path = argv[N]
-        add!($e, x4, SP, 0); // x4 = SP
-        add!($e, x1, x4, _off); // argv_ptr = &argv[N]
-        ldr_sp!($e, x3, 0); // argc
-        add!($e, x3, x3, 2_u32); // argc + 2 (argv[] + NULL)
-        lsl!($e, x3, x3, 3); // * 8
-        add_reg!($e, x2, x4, x3); // envp
-        syscall!($e, $crate::elf::linux::nr::EXECVE);
-    }};
 }
 
 /// `socket(domain, type)` — result fd in x0.
@@ -610,24 +585,6 @@ macro_rules! socket {
         movz!($e, x1, $type);
         movz!($e, x2, 0);
         syscall!($e, $crate::elf::linux::nr::SOCKET);
-    }};
-}
-
-/// `finit_module(fd_reg, params_str)` — load kernel module.
-macro_rules! finit_module {
-    ($e:expr, $fd:tt, $params:expr) => {{
-        mov!($e, x0, $fd);
-        adr!($e, x1, $params);
-        movz!($e, x2, 0);
-        syscall!($e, $crate::elf::linux::nr::FINIT_MODULE);
-    }};
-}
-
-/// `uname(base_reg, offset)` — result at base+offset.
-macro_rules! uname {
-    ($e:expr, $base:tt, $off:expr) => {{
-        add!($e, x0, $base, $off);
-        syscall!($e, $crate::elf::linux::nr::UNAME);
     }};
 }
 

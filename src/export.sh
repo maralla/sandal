@@ -28,6 +28,8 @@ fi
 
 # If {DATA_DEV} is mounted as ext2 (disk mode), the VMM can read it directly.
 if mount | grep -q '{DATA_DEV}.*ext2'; then
+    # Flush dirty pages so the VMM's in-memory image has all upper/ writes.
+    sync
     /usr/sbin/sandal-export-done 2>/dev/null
     echo "Layer exported (disk mode)."
     exit 0

@@ -39,7 +39,7 @@ ROOTFS_TOUCH := \
 ROOTFS_APK_CONF := etc/apk/repositories etc/apk/arch etc/apk/world lib/apk/db/installed
 ROOTFS_APK_KEYS := etc/apk/keys
 
-.PHONY: build debug clippy rootfs-minimal
+.PHONY: build debug test lint rootfs-minimal
 
 build: $(BUILTIN_ROOTFS)
 	@cargo build --release
@@ -48,6 +48,27 @@ build: $(BUILTIN_ROOTFS)
 debug: $(BUILTIN_ROOTFS)
 	@cargo build
 	@codesign --entitlements $(ENTITLEMENTS) -s - target/debug/sandal --force
+
+# Wall-clock cap for the hang gate; from Homebrew coreutils on macOS.
+TIMEOUT := $(shell command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)
+
+# Test suites:
+#   - cargo unit tests (incl. the ustar layer round-trips)
+#   - device/feature test: virtio IDs, block queue geometry, rng (tests/test_devices.py)
+#   - multi-segment block I/O integrity (tests/test_blk.py)
+#   - export/load integration test (tests/test_export.py)
+#   - shared-directory (virtiofs) test (tests/test_share.py)
+#   - user-space network/curl test (tests/test_curl_hang.sh)
+#   - interactive/readline/uv hang gate (tests/test_python_tab.sh)
+# The integration/gate tests need the codesigned release binary, hence `build`.
+test: build
+	cargo test --release
+	uv run python tests/test_devices.py
+	uv run python tests/test_blk.py
+	uv run python tests/test_export.py
+	uv run python tests/test_share.py
+	tests/test_curl_hang.sh 1 128
+	$(TIMEOUT) $(if $(TIMEOUT),60,) env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_python_tab.sh --fail-fast --exit-cycle
 
 lint:
 	cargo fmt --all

@@ -7,13 +7,12 @@ pub mod fs;
 /// Each virtio device appears as a 0x200-byte MMIO region.
 pub mod net;
 pub mod rng;
-
 use std::sync::atomic::{fence, Ordering};
 
 // Virtio MMIO magic value ("virt")
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
 pub const VIRTIO_MMIO_VERSION: u32 = 2;
-// "QEMU" in ASCII — the de-facto standard vendor ID recognized by Linux virtio drivers.
+// Virtio MMIO vendor ID: the de-facto standard value for virtio-mmio devices.
 pub const VIRTIO_MMIO_VENDOR: u32 = 0x554D4551;
 
 // Virtio MMIO register offsets
@@ -49,6 +48,10 @@ pub const REG_CONFIG_BASE: u64 = 0x100;
 
 // Virtio features
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+// Virtio MMIO interrupt status bits (VIRTIO_MMIO_INTERRUPT_STATUS)
+pub const VIRTIO_MMIO_INT_VRING: u32 = 1;
+pub const VIRTIO_MMIO_INT_CONFIG: u32 = 2;
 
 // Virtqueue descriptor flags
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;

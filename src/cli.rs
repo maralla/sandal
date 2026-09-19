@@ -50,21 +50,13 @@ pub struct RunArgs {
     #[arg(short = 'k', long = "kernel")]
     pub kernel: Option<PathBuf>,
 
-    /// Initrd image path
-    #[arg(short = 'i', long = "initrd")]
-    pub initrd: Option<PathBuf>,
-
-    /// Root filesystem ext2 image [default: rootfs.ext2]
-    #[arg(short = 'r', long = "rootfs")]
-    pub rootfs: Option<PathBuf>,
-
     /// Verbose output
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
-    /// Disable snapshot caching (always boot from scratch)
-    #[arg(long = "no-cache")]
-    pub no_cache: bool,
+    /// Root filesystem ext2 image [default: built-in rootfs]
+    #[arg(short = 'r', long = "rootfs")]
+    pub rootfs: Option<PathBuf>,
 
     /// Extra writable disk size in MB (creates /dev/vdb with overlayfs).
     /// Can be combined with --layer: layers are pre-populated into the disk.

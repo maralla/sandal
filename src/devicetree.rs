@@ -36,7 +36,6 @@ impl DeviceTree {
         gic_dist_size: usize,
         gic_redist_base: u64,
         gic_redist_size: usize,
-        initrd: Option<(u64, u64)>,
         virtio_net: Option<(u64, u32)>,
         virtio_blk: Option<(u64, u32)>,
         data_blk: Option<(u64, u32)>,
@@ -45,6 +44,7 @@ impl DeviceTree {
         virtio_console: Option<(u64, u32)>,
         verbose: bool,
         overlay_bootarg: Option<&str>,
+        rng_seed: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         let mut dt = Self::new();
 
@@ -62,11 +62,11 @@ impl DeviceTree {
         {
             // earlycon=pl011 for early boot / panic messages on the MMIO UART.
             // console=hvc0 makes the virtio-console the primary interactive console.
-            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0";
+            // random.trust_bootloader=on: seed CRNG at boot so getrandom() never blocks.
+            // random.trust_cpu=on: trust CPU RNG (RNDR on ARMv8.5+) as additional entropy.
+            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0 random.trust_bootloader=on random.trust_cpu=on nohz=off highres=off";
             let rootfs = if virtio_blk.is_some() {
                 " root=/dev/vda rw init=/init"
-            } else if initrd.is_some() {
-                " rdinit=/init"
             } else {
                 ""
             };
@@ -81,9 +81,12 @@ impl DeviceTree {
         }
         // stdout-path points to the UART node for earlycon
         dt.prop_string("stdout-path", "/pl011@9000000");
-        if let Some((initrd_start, initrd_end)) = initrd {
-            dt.prop_u64("linux,initrd-start", initrd_start);
-            dt.prop_u64("linux,initrd-end", initrd_end);
+        // Seed the kernel CRNG at early boot so userspace never blocks on
+        // /dev/urandom — the virtio-rng hwrng kthread on Linux 4.14 has a
+        // completion race (reinit_completion vs complete from ISR) that can
+        // permanently stall the hwrng feed under NO_HZ.
+        if let Some(seed) = rng_seed {
+            dt.prop_bytes("rng-seed", seed);
         }
         dt.end_node();
 
@@ -141,23 +144,27 @@ impl DeviceTree {
         dt.prop_u32("migrate", 0xc4000005);
         dt.end_node();
 
-        // Timer node (ARM generic timer)
+        // Timer node (ARM generic timer) — the arch timer is the guest's
+        // clocksource AND clockevent. Its PPIs are delivered by the VMM via
+        // the documented HVF vtimer flow (HV_EXIT_REASON_VTIMER_ACTIVATED →
+        // pend PPI 27 in the software GIC → unmask on the guest's EOI).
+        // Interrupt specifiers: GIC_PPI(1), PPI number, IRQ_TYPE_LEVEL_LOW(8).
+        // PPI 13 = secure physical, PPI 14 = non-secure physical,
+        // PPI 11 = virtual (GIC INTID 27), PPI 10 = hypervisor.
         dt.begin_node("timer");
         dt.prop_stringlist("compatible", &["arm,armv8-timer", "arm,armv7-timer"]);
         dt.prop_empty("always-on");
-        // interrupts: secure phys, non-secure phys, virt, hyp phys
-        // Each interrupt specifier: <type irq flags>
-        // GIC_FDT_IRQ_TYPE_PPI = 1
-        // INTID_TO_PPI(irq) = irq - 16
-        // Flags: GIC_FDT_IRQ_FLAGS_LEVEL_HI = 4
-        // Timer IRQs: S_EL1=29→PPI13, NS_EL1=30→PPI14, VIRT=27→PPI11, NS_EL2=26→PPI10
-        let mut interrupts = Vec::new();
-        for irq in &[13u32, 14, 11, 10] {
-            interrupts.extend_from_slice(&1u32.to_be_bytes()); // GIC_FDT_IRQ_TYPE_PPI
-            interrupts.extend_from_slice(&irq.to_be_bytes()); // PPI number
-            interrupts.extend_from_slice(&4u32.to_be_bytes()); // GIC_FDT_IRQ_FLAGS_LEVEL_HI
+        // The arch timer counter runs at the host 24 MHz. Advertising it lets
+        // the kernel's arch_timer driver compute correct delay/clockevent
+        // targets even if CNTFRQ_EL0 reads as 0 from the vCPU.
+        dt.prop_u32("clock-frequency", 24_000_000);
+        let mut timer_irqs = Vec::new();
+        for ppi in &[13u32, 14, 11, 10] {
+            timer_irqs.extend_from_slice(&1u32.to_be_bytes()); // GIC_PPI
+            timer_irqs.extend_from_slice(&ppi.to_be_bytes());
+            timer_irqs.extend_from_slice(&8u32.to_be_bytes()); // IRQ_TYPE_LEVEL_LOW
         }
-        dt.prop_bytes("interrupts", &interrupts);
+        dt.prop_bytes("interrupts", &timer_irqs);
         dt.end_node();
 
         // UART node — PL011 earlycon-only stub (for early boot & panic messages)
@@ -184,112 +191,33 @@ impl DeviceTree {
         dt.end_node();
 
         // Virtio-net MMIO node (optional)
-        if let Some((virtio_base, virtio_spi)) = virtio_net {
-            let node_name = format!("virtio_mmio@{virtio_base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&virtio_base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            // Interrupt: SPI, number, level-high
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&virtio_spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+        if let Some((base, spi)) = virtio_net {
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
-        // Virtio-blk MMIO node (optional)
-        if let Some((blk_base, blk_spi)) = virtio_blk {
-            let node_name = format!("virtio_mmio@{blk_base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&blk_base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&blk_spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+        // Virtio-blk MMIO node (root filesystem)
+        if let Some((base, spi)) = virtio_blk {
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
-        // Data block MMIO node (overlay writable disk, --disk-size)
+        // Data block MMIO node (overlay writable disk, --disk-size / --layer)
         if let Some((base, spi)) = data_blk {
-            let node_name = format!("virtio_mmio@{base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
-        // Virtio-rng MMIO node (optional — provides entropy to the guest)
-        if let Some((rng_base, rng_spi)) = virtio_rng {
-            let node_name = format!("virtio_mmio@{rng_base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&rng_base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&rng_spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+        // Virtio-rng MMIO node (guest entropy)
+        if let Some((base, spi)) = virtio_rng {
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
-        // Virtiofs MMIO nodes (shared filesystem devices)
-        for &(fs_base, fs_spi) in virtiofs {
-            let node_name = format!("virtio_mmio@{fs_base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&fs_base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&fs_spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+        // Virtiofs MMIO nodes (shared directories)
+        for &(base, spi) in virtiofs {
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
         // Virtio-console MMIO node (interactive terminal I/O — hvc0)
-        if let Some((console_base, console_spi)) = virtio_console {
-            let node_name = format!("virtio_mmio@{console_base:x}");
-            dt.begin_node(&node_name);
-            dt.prop_string("compatible", "virtio,mmio");
-            let mut vreg = Vec::new();
-            vreg.extend_from_slice(&console_base.to_be_bytes());
-            vreg.extend_from_slice(&0x200u64.to_be_bytes());
-            dt.prop_bytes("reg", &vreg);
-            let mut virq = Vec::new();
-            virq.extend_from_slice(&0u32.to_be_bytes()); // SPI
-            virq.extend_from_slice(&console_spi.to_be_bytes());
-            virq.extend_from_slice(&4u32.to_be_bytes()); // level-high
-            dt.prop_bytes("interrupts", &virq);
-            dt.prop_empty("dma-coherent");
-            dt.end_node();
+        if let Some((base, spi)) = virtio_console {
+            Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
         // Fixed clock node (needed for PL011 earlycon UART)
@@ -321,8 +249,22 @@ impl DeviceTree {
         self.prop_bytes(name, &value.to_be_bytes());
     }
 
-    fn prop_u64(&mut self, name: &str, value: u64) {
-        self.prop_bytes(name, &value.to_be_bytes());
+    /// Emit one `virtio,mmio` device node with its SPI (level-high).
+    fn virtio_mmio_node(dt: &mut DeviceTree, base: u64, spi: u32) {
+        let node_name = format!("virtio_mmio@{base:x}");
+        dt.begin_node(&node_name);
+        dt.prop_string("compatible", "virtio,mmio");
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&base.to_be_bytes());
+        reg.extend_from_slice(&0x200u64.to_be_bytes());
+        dt.prop_bytes("reg", &reg);
+        let mut irq = Vec::new();
+        irq.extend_from_slice(&0u32.to_be_bytes()); // SPI
+        irq.extend_from_slice(&spi.to_be_bytes());
+        irq.extend_from_slice(&4u32.to_be_bytes()); // level-high
+        dt.prop_bytes("interrupts", &irq);
+        dt.prop_empty("dma-coherent");
+        dt.end_node();
     }
 
     fn prop_string(&mut self, name: &str, value: &str) {

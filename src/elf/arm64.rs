@@ -87,16 +87,6 @@ pub const fn ubfx_x(rd: u32, rn: u32, lsb: u32, width: u32) -> u32 {
 
 // ── Load / store ────────────────────────────────────────────────────────
 
-/// `LDR Xt, [SP, #byte_off]` — load 64-bit from stack (unsigned offset).
-/// `byte_off` must be 8-byte aligned.
-pub const fn ldr_x_sp(rt: u32, byte_off: u32) -> u32 {
-    assert!(
-        byte_off.is_multiple_of(8),
-        "byte_off must be 8-byte aligned"
-    );
-    0xF9400000 | ((byte_off / 8) << 10) | (31 << 5) | rt
-}
-
 /// `LDR Xt, [Xn, #byte_off]` — load 64-bit (unsigned offset).
 /// `byte_off` must be 8-byte aligned.
 pub const fn ldr_x(rt: u32, rn: u32, byte_off: u32) -> u32 {

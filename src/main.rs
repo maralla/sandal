@@ -3,78 +3,22 @@ mod devicetree;
 #[macro_use]
 mod elf;
 mod ext2;
+mod gic;
 mod hypervisor;
 mod init;
 mod initramfs;
 mod net;
 mod rootfs;
-mod snapshot;
 mod tar;
 mod unet;
 mod virtio;
 mod vm;
+mod vmm_trace;
 
 use anyhow::Result;
 use clap::Parser;
 use cli::{Args, Cli, Command, PackArgs};
 use std::fs;
-use std::path::PathBuf;
-use std::time::Instant;
-
-/// Check if a valid snapshot exists and try to restore from it.
-/// Returns `(Option<Result<()>>, Option<PathBuf>)`:
-/// - First element: None if no snapshot found, Some(Ok/Err) if attempted.
-/// - Second element: snapshot path if one was found (for cleanup on failure).
-fn try_snapshot_restore(args: &Args) -> (Option<Result<()>>, Option<PathBuf>) {
-    let t0 = Instant::now();
-
-    // Resolve kernel and rootfs paths.
-    let kernel_path = match &args.kernel {
-        Some(p) => p.clone(),
-        None => match vm::resolve_data_path("vmlinux-sandal") {
-            Some(p) => p,
-            None => return (None, None),
-        },
-    };
-    let default_rootfs = if args.rootfs.is_none() {
-        vm::resolve_data_path("rootfs.ext2")
-    } else {
-        None
-    };
-    let rootfs_path = args.rootfs.as_ref().or(default_rootfs.as_ref());
-
-    let network_enabled = !args.no_network;
-
-    // Fingerprint from file content (reads only 8KB per file, not the
-    // full kernel).  Reliable across copies, git checkouts, etc.
-    let kernel_fp = snapshot::hash_file_content(&kernel_path);
-    let rootfs_fp = if let Some(p) = rootfs_path {
-        snapshot::hash_file_content(p)
-    } else {
-        // No external rootfs — use built-in rootfs fingerprint.
-        // Hash the compressed bytes directly (stable, no decompression needed).
-        snapshot::hash_bytes(rootfs::BUILTIN_ROOTFS_GZ)
-    };
-
-    let fingerprint =
-        snapshot::compute_fingerprint(kernel_fp, rootfs_fp, args.memory, network_enabled);
-
-    let snap_path = match snapshot::snapshot_path(fingerprint) {
-        Ok(p) => p,
-        Err(_) => return (None, None),
-    };
-    if !snap_path.exists() {
-        return (None, None);
-    }
-
-    log::debug!(
-        "[bench] fingerprint check: {:.2}ms total from start",
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
-    log::info!("Found snapshot: {}", snap_path.display());
-    let result = vm::run_from_snapshot(args, &snap_path, fingerprint);
-    (Some(result), Some(snap_path))
-}
 
 fn run_pack(pack_args: &PackArgs) -> Result<()> {
     if !pack_args.dir.is_dir() {
@@ -115,25 +59,6 @@ fn run_vm(args: Args) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        // Try snapshot restore fast path first
-        if !args.no_cache {
-            let (snap_result, snap_path) = try_snapshot_restore(&args);
-            if let Some(result) = snap_result {
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        log::debug!("Snapshot restore failed, falling back to full boot: {e}");
-                        // Delete the stale/invalid snapshot so the next cold
-                        // boot creates a fresh one.
-                        if let Some(p) = snap_path {
-                            log::debug!("Removing stale snapshot: {}", p.display());
-                            let _ = fs::remove_file(&p);
-                        }
-                    }
-                }
-            }
-        }
-
         vm::run(args)?;
     }
 

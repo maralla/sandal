@@ -3,7 +3,7 @@
 # Stress test for the curl-hang bug.
 #
 # Usage:
-#   tests/run_curl_hang.sh [iterations] [disk_size_mb]
+#   tests/test_curl_hang.sh [iterations] [disk_size_mb]
 #
 # Defaults: 10 iterations, 128 MB disk.
 # Requires: curl.layer in project root.

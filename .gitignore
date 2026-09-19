@@ -13,3 +13,8 @@ kernels
 PROGRESS.md
 AGENTS.md
 *.layer
+# VMM debug traces
+sandal_trace*.log
+trace_hang.log
+__pycache__/
+*.pyc

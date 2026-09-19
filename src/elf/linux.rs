@@ -16,12 +16,10 @@ pub mod nr {
     pub const CLOCK_SETTIME: u32 = 112;
     pub const REBOOT: u32 = 142;
     pub const SETSID: u32 = 157;
-    pub const UNAME: u32 = 160;
     pub const SOCKET: u32 = 198;
     pub const CLONE: u32 = 220;
     pub const EXECVE: u32 = 221;
     pub const WAIT4: u32 = 260;
-    pub const FINIT_MODULE: u32 = 273;
 }
 
 // ── Filesystem limits ─────────────────────────────────────────────────

@@ -27,6 +27,16 @@ const SECTOR_SIZE: usize = 512;
 const QUEUE_SIZE: u32 = 128;
 const NUM_QUEUES: usize = 1;
 
+/// `size_max` config value: maximum bytes in a single segment (>= PAGE_SIZE).
+const SIZE_MAX_BYTES: u32 = 32768;
+
+/// `seg_max` config value: maximum data segments per request.  Must leave room
+/// for the request header and status descriptors, hence `QUEUE_SIZE - 2`
+/// (QEMU uses the same convention).  Advertising more lets the guest build a
+/// chain that can never fit the ring, so `virtqueue_add_sgs()` fails with
+/// `-ENOSPC` forever and the guest's block queue is stopped permanently.
+const SEG_MAX: u32 = QUEUE_SIZE - 2;
+
 /// Virtio-blk device backed by an in-memory image.
 pub struct VirtioBlkDevice {
     // MMIO state (same pattern as virtio-net)
@@ -42,6 +52,11 @@ pub struct VirtioBlkDevice {
     // Block device backing store
     pub disk_image: Vec<u8>,
     pub capacity_sectors: u64,
+
+    /// Monotonically increments each time the VMM completes a request.
+    pub work_gen: u64,
+    /// Snapshot of `work_gen` captured when the guest last read INTERRUPT_STATUS.
+    pub work_gen_at_read: u64,
 }
 
 impl VirtioBlkDevice {
@@ -59,17 +74,18 @@ impl VirtioBlkDevice {
             config_generation: 0,
             disk_image,
             capacity_sectors,
+            work_gen: 0,
+            work_gen_at_read: 0,
         }
     }
 
-    /// Recalculate the capacity (in 512-byte sectors) from the current disk image size.
-    /// Call after resizing `disk_image`.
+    /// Recompute `capacity_sectors` after `disk_image` was resized.
     pub fn update_capacity(&mut self) {
         self.capacity_sectors = (self.disk_image.len() / SECTOR_SIZE) as u64;
     }
 
     /// Handle an MMIO read at `offset` within the device's MMIO region.
-    pub fn mmio_read(&self, offset: u64) -> u32 {
+    pub fn mmio_read(&mut self, offset: u64) -> u32 {
         match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC,
             REG_VERSION => VIRTIO_MMIO_VERSION,
@@ -100,7 +116,10 @@ impl VirtioBlkDevice {
                     0
                 }
             }
-            REG_INTERRUPT_STATUS => self.interrupt_status,
+            REG_INTERRUPT_STATUS => {
+                self.work_gen_at_read = self.work_gen;
+                self.interrupt_status
+            }
             REG_STATUS => self.status,
             // Shared memory region: length = ~0 means no SHM available
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => 0xFFFFFFFF,
@@ -116,8 +135,8 @@ impl VirtioBlkDevice {
                 match config_off {
                     0 => (self.capacity_sectors & 0xFFFFFFFF) as u32,
                     4 => ((self.capacity_sectors >> 32) & 0xFFFFFFFF) as u32,
-                    8 => 32768, // size_max: must be >= PAGE_SIZE (4096 on arm64)
-                    12 => 128,  // seg_max
+                    8 => SIZE_MAX_BYTES, // size_max: must be >= PAGE_SIZE
+                    12 => SEG_MAX,
                     _ => 0,
                 }
             }
@@ -163,6 +182,9 @@ impl VirtioBlkDevice {
             }
             REG_INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                if self.work_gen > self.work_gen_at_read {
+                    self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+                }
             }
             REG_STATUS => {
                 self.status = value;
@@ -215,6 +237,8 @@ impl VirtioBlkDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
+        self.work_gen = 0;
+        self.work_gen_at_read = 0;
         for q in &mut self.queues {
             *q = VirtqState::new(QUEUE_SIZE);
         }
@@ -268,32 +292,12 @@ impl VirtioBlkDevice {
                 q.used_addr,
                 used_idx_start.wrapping_add(used_count),
             );
-            self.interrupt_status |= 1;
+            self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+            self.work_gen += 1;
             true
         } else {
             false
         }
-    }
-
-    /// Check if there are unprocessed requests in the avail ring and
-    /// process them.  Returns true if any requests were completed.
-    /// Called from the main loop on every vCPU exit to catch requests
-    /// whose avail-ring writes were not yet visible at QueueNotify time
-    /// (a race between the guest store buffer and the VMM read).
-    pub fn poll_pending(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
-        let q = &self.queues[0];
-        if !q.ready || q.num == 0 {
-            return false;
-        }
-        let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
-            Some(idx) => idx,
-            None => return false,
-        };
-        if avail_idx == self.queues[0].last_avail_idx {
-            return false;
-        }
-        // There are pending requests — process them normally.
-        self.process_queue(memory, ram_base)
     }
 
     /// Handle a single virtio-blk request (descriptor chain).

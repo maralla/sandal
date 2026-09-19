@@ -1,6 +1,6 @@
 //! Generate a compiled ARM64 ELF binary to replace `/init` in the guest VM.
 //!
-//! The binary handles: mounting essential filesystems, loading kernel modules,
+//! The binary handles: mounting essential filesystems,
 //! reading a config blob from the VMM via hypercall, setting up the overlayfs
 //! root, configuring the network, and executing the user command.
 //!
@@ -30,30 +30,6 @@ pub fn init_binary(_tty_device: &str) -> &'static [u8] {
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Build the complete /init ELF binary at compile time.
-// ── Module path components (shared between strings! and emit_module_loading) ──
-const MOD_PREFIX: &str = "/lib/modules/";
-const MOD_KERNEL: &str = "/kernel/";
-const MOD_VIRTIO_MMIO: &str = "drivers/virtio/virtio_mmio.ko";
-const MOD_FAILOVER: &str = "net/core/failover.ko";
-const MOD_NET_FAILOVER: &str = "drivers/net/net_failover.ko";
-const MOD_VIRTIO_NET: &str = "drivers/net/virtio_net.ko";
-const MOD_VIRTIO_RNG: &str = "drivers/char/hw_random/virtio-rng.ko";
-const MOD_VIRTIO_BLK: &str = "drivers/block/virtio_blk.ko";
-const MOD_VIRTIO_CONSOLE: &str = "drivers/char/virtio_console.ko";
-const MOD_FUSE: &str = "fs/fuse/fuse.ko";
-const MOD_VIRTIOFS: &str = "fs/fuse/virtiofs.ko";
-const MOD_SUFFIXES: &[&str] = &[
-    MOD_VIRTIO_MMIO,
-    MOD_FAILOVER,
-    MOD_NET_FAILOVER,
-    MOD_VIRTIO_NET,
-    MOD_VIRTIO_RNG,
-    MOD_VIRTIO_BLK,
-    MOD_VIRTIO_CONSOLE,
-    MOD_FUSE,
-    MOD_VIRTIOFS,
-];
-
 const ENV_PATH_VAR: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CMD_NOT_FOUND_SUFFIX: &str = ": command not found\n";
 const RESOLV_DATA: &str = "nameserver 10.0.2.3\n";
@@ -73,18 +49,7 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         s_tmpfs = "tmpfs",
         s_tmp_path = "/tmp",
         s_slash = "/",
-        s_empty = "",
         s_dot = ".",
-        s_mod_prefix = MOD_PREFIX,
-        s_mod_kernel = MOD_KERNEL,
-        s_mod_virtio_mmio = MOD_VIRTIO_MMIO,
-        s_mod_failover = MOD_FAILOVER,
-        s_mod_net_failover = MOD_NET_FAILOVER,
-        s_mod_virtio_net = MOD_VIRTIO_NET,
-        s_mod_virtio_rng = MOD_VIRTIO_RNG,
-        s_mod_virtio_blk = MOD_VIRTIO_BLK,
-        s_mod_fuse = MOD_FUSE,
-        s_mod_virtiofs = MOD_VIRTIOFS,
         s_mnt_lower = initramfs::MNT_LOWER,
         s_mnt_overlay = initramfs::MNT_OVERLAY,
         s_mnt_tmp = initramfs::MNT_TMP,
@@ -128,19 +93,9 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         initramfs::MNT_TMP,
         "/work",
     ]);
-    let mod_suffixes: [usize; 8] = [
-        s_mod_virtio_mmio,
-        s_mod_failover,
-        s_mod_net_failover,
-        s_mod_virtio_net,
-        s_mod_virtio_rng,
-        s_mod_virtio_blk,
-        s_mod_fuse,
-        s_mod_virtiofs,
-    ];
 
     // ════════════════════════════════════════════════════════════════
-    // PHASE 1: Pre-snapshot — mount essentials + load modules
+    // PHASE 1: Mount essentials
     // ════════════════════════════════════════════════════════════════
 
     mount!(e, s_proc, s_proc_path, s_proc);
@@ -148,14 +103,12 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     mount!(e, s_devtmpfs, s_dev_path, s_devtmpfs);
     mount!(e, s_tmpfs, s_tmp_path, s_tmpfs);
 
-    emit_module_loading(&mut e, s_mod_prefix, s_mod_kernel, &mod_suffixes, s_empty);
-
     chdir!(e, s_slash);
 
-    // Put stdin into raw mode BEFORE the snapshot/config BRK so that
-    // when the VMM pushes config bytes into the UART, the kernel's TTY
-    // line discipline is already in raw mode.  This prevents canonical-
-    // mode processing (ECHO, ICRNL, etc.) from corrupting binary data.
+    // Put stdin into raw mode before the INIT_CONFIG BRK so that when the
+    // VMM pushes config bytes into the UART, the kernel's TTY line
+    // discipline is already in raw mode.  This prevents canonical-mode
+    // processing (ECHO, ICRNL, etc.) from corrupting binary data.
     sub!(e, SP, SP, 48); // termios struct at SP
     movz!(e, x0, 0);
     ioctl!(e, x0, TCGETS); // read termios from fd 0 into [SP]
@@ -167,10 +120,8 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     ioctl!(e, x0, TCSETS); // apply raw mode
     add!(e, SP, SP, 48); // pop termios (x14/x15 hold saved flags)
 
-    brk!(e, initramfs::SNAPSHOT_SIGNAL_IMM);
-
     // ════════════════════════════════════════════════════════════════
-    // PHASE 2: Post-snapshot — read config, setup overlay, network
+    // PHASE 2: Read config, setup overlay, network
     // ════════════════════════════════════════════════════════════════
 
     // BRK #INIT_CONFIG — VMM pushes config blob and sets x0 = size
@@ -363,9 +314,6 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     add!(e, x9, x9, 8);
     str_x!(e, XZR, x9, 0); // envp NULL
 
-    // Signal VMM: config processing done, start forwarding output
-    brk!(e, initramfs::INIT_READY_IMM);
-
     fork!(e);
 
     let child_ph = e.emit_placeholder(); // CBZ → child
@@ -450,77 +398,7 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     e.build()
 }
 
-// ── Helper: load kernel modules via uname + finit_module ────────────────
-const fn emit_module_loading(
-    e: &mut ElfBuilder,
-    prefix: usize,
-    kernel: usize,
-    modules: &[usize],
-    empty: usize,
-) {
-    // Stack layout:
-    //   [SP,            SP+PATH_BUF)     — scratch buffer for full module path
-    //   [SP+PATH_BUF,   SP+PATH_BUF+UTS) — struct utsname (6 × 65 = 390 bytes)
-    const UTS_FIELD: usize = 65; // __NEW_UTS_LEN (64) + NUL
-    const UTS_SIZE: usize = 6 * UTS_FIELD; // sysname, nodename, release, version, machine, domainname
-    const UTS_RELEASE_OFF: usize = 2 * UTS_FIELD; // release is the 3rd field
-
-    // Compute max module path from the actual strings:
-    //   prefix + release (≤64) + kernel + longest suffix + NUL
-    let max_suffix = const_max_str_len(MOD_SUFFIXES);
-    let path_buf: usize = align16(MOD_PREFIX.len() + 64 + MOD_KERNEL.len() + max_suffix + 1);
-    let frame: usize = align16(path_buf + UTS_SIZE);
-
-    sub!(e, SP, SP, frame as u32);
-
-    uname!(e, SP, path_buf as u32);
-
-    // Build base path: /lib/modules/<release>/kernel/
-    add!(e, x0, SP, 0);
-    adr!(e, x1, prefix);
-    emit_strcpy(e);
-    add!(e, x1, SP, (path_buf + UTS_RELEASE_OFF) as u32); // utsname.release
-    emit_strcpy(e);
-    adr!(e, x1, kernel);
-    emit_strcpy(e);
-    mov!(e, x19, x0); // x19 = base path end
-
-    let mut i = 0;
-    while i < modules.len() {
-        mov!(e, x0, x19);
-        adr!(e, x1, modules[i]);
-        emit_strcpy_with_null(e);
-
-        openat!(e, SP, O_RDONLY);
-
-        cmp!(e, x0, 0);
-        let skip_ph = e.emit_placeholder();
-        mov!(e, x11, x0);
-
-        finit_module!(e, x11, empty);
-        close!(e, x11);
-
-        patch_forward!(e, skip_ph, b_lt);
-        i += 1;
-    }
-
-    add!(e, SP, SP, frame as u32);
-}
-
-/// Return the length of the longest string in `strs`.
-const fn const_max_str_len(strs: &[&str]) -> usize {
-    let mut max = 0;
-    let mut i = 0;
-    while i < strs.len() {
-        if strs[i].len() > max {
-            max = strs[i].len();
-        }
-        i += 1;
-    }
-    max
-}
-
-/// Return the length of the longest colon-separated component in `s`.
+/// Length of the longest colon-separated component of `s`.
 const fn max_colon_component_len(s: &str) -> usize {
     let b = s.as_bytes();
     let mut max = 0usize;
@@ -547,15 +425,6 @@ const fn max_colon_component_len(s: &str) -> usize {
 /// Round `n` up to the next multiple of 16.
 const fn align16(n: usize) -> usize {
     (n + 15) & !15
-}
-
-// ── Helper: strcpy [x1] → [x0] (excluding null) ────────────────────────
-const fn emit_strcpy(e: &mut ElfBuilder) {
-    let loop_start = e.offset();
-    ldrb_post!(e, x2, x1);
-    e.emit(cbz(reg!(x2), 3)); // skip STRB + B, land after loop
-    strb_post!(e, x2, x0);
-    b_back!(e, b, loop_start);
 }
 
 // ── Helper: strcpy [x1] → [x0] (including null) ────────────────────────

@@ -28,6 +28,9 @@ make
 
 # Disable networking
 ./target/release/sandal --no-network -- wget https://example.com
+
+# Share a host directory (read/write) with the VM
+./target/release/sandal --share /tmp/data:/mnt/data -- ls /mnt/data
 ```
 
 ## Requirements
