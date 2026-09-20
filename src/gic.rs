@@ -176,6 +176,10 @@ impl Gic {
 
     /// True if there is an enabled, pending interrupt whose priority passes PMR.
     pub fn deliverable(&self) -> bool {
+        // Fast path: nothing pending at all.
+        if self.ispendr == [0, 0] {
+            return false;
+        }
         let group1_ok = self.icc_igrpen1 != 0;
         let group0_ok = self.icc_igrpen0 != 0;
         for intid in 0u32..128 {

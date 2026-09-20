@@ -129,6 +129,10 @@ struct Vmm {
     /// kqueue poller thread that kicks the vCPU when host sockets are readable.
     net_poller: Option<JoinHandle<()>>,
     vtimer_masked: bool,
+    /// Last value written to `hv_vcpu_set_pending_interrupt`.  The pending
+    /// state is one-shot (cleared after `hv_vcpu_run`), so an asserted line is
+    /// re-written every iteration; a redundant `false` write is skipped.
+    irq_line_asserted: bool,
     config_blob: Vec<u8>,
     tty_saved: Option<libc::termios>,
     guest_shutdown: bool,
@@ -308,6 +312,7 @@ impl Vmm {
             virtiofs,
             net_poller,
             vtimer_masked: false,
+            irq_line_asserted: false,
             config_blob: Vec::new(),
             tty_saved,
             guest_shutdown: false,
@@ -484,7 +489,15 @@ impl Vmm {
             // nothing is deliverable.  Leaving it asserted after the guest has
             // taken/completed the interrupt livelocks Linux in a spurious-IRQ
             // storm (IAR reads 1023 forever while the line stays high).
-            let _ = self.vcpu.set_pending_interrupt(0, deliverable);
+            //
+            // `hv_vcpu_set_pending_interrupt` is one-shot: the pending state is
+            // cleared when `hv_vcpu_run` returns, so a deliverable interrupt is
+            // re-asserted before every run.  Idle iterations (nothing
+            // deliverable, line already low) skip the hypervisor call.
+            if deliverable || self.irq_line_asserted {
+                let _ = self.vcpu.set_pending_interrupt(0, deliverable);
+                self.irq_line_asserted = deliverable;
+            }
 
             match self.vcpu.run()? {
                 EXIT_CANCELED => continue,

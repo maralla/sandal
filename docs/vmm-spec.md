@@ -47,9 +47,13 @@ emulated in software by the VMM**.
   interrupt passes PMR, and **de-assert it** when nothing is deliverable. A line
   that stays asserted after the guest has taken the interrupt livelocks Linux in
   a spurious-IRQ storm (IAR returns 1023 forever).
-- The pending bit is consumed at `hv_vcpu_run` entry. A vCPU that is already
-  suspended in WFI is woken because the VMM traps `WFI` (see §2.3) and re-enters
-  `hv_vcpu_run` with the line asserted.
+- The pending bit is consumed at `hv_vcpu_run` entry, so a deliverable
+  interrupt is re-asserted before **every** run (Apple: *"The pending
+  interrupts automatically cleared after hv_vcpu_run returns"*).  A redundant
+  `false` write when the line is already low (idle iterations) is skipped; the
+  VMM tracks the last written state.
+- `Gic::deliverable()` has a fast path for "no pending bits at all", so idle
+  loops do not rescan all 128 INTIDs.
 - When asserted, the guest's `ICC_IAR1_EL1` trap returns the highest-priority
   pending, enabled INTID selected by the software GIC.
 
@@ -176,7 +180,11 @@ The exit carries a syndrome. The VMM handles:
 - **User-space networking:** `src/unet.rs` implements the guest-facing TCP/UDP
   stack plus a NAT to host sockets via `connect()`/`sendto()`; a kqueue poller
   thread kicks the vCPU (`hv_vcpus_exit`) when host data arrives, and
-  `src/net.rs` enforces the protocol/host allow-list.
+  `src/net.rs` enforces the protocol/host allow-list.  Fast path: TCP frames
+  are built in a **single allocation** with in-place checksums (no per-packet
+  temp buffers), host socket reads are **batched** up to the guest's window
+  budget (16 KiB) and split into MSS segments, and the virtio-net TX assembly
+  buffer is reused instead of allocated per packet.
 - **Console:** the host terminal is switched to raw mode on startup and restored
   on exit, so every keystroke (Tab, CSI replies, partial lines) reaches the
   guest instead of being line-buffered by the host tty.

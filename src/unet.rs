@@ -155,6 +155,8 @@ pub struct UserNet {
     /// Channel for receiving ICMP echo replies from proxy threads.
     icmp_rx: mpsc::Receiver<Vec<u8>>,
     icmp_tx: mpsc::Sender<Vec<u8>>,
+    /// Reused buffer for host socket reads (one `read` feeds several segments).
+    read_buf: Vec<u8>,
 }
 
 // Safety: UserNet is only used from the VCPU thread.
@@ -185,6 +187,7 @@ impl UserNet {
             poller_wakeup_fd: None,
             icmp_rx,
             icmp_tx,
+            read_buf: vec![0u8; 16 * 1024],
         })
     }
 
@@ -936,9 +939,16 @@ impl UserNet {
                     break; // Window full — wait for guest ACKs
                 }
 
-                let max_read = (conn.send_window - in_flight).min(TCP_MSS as u32) as usize;
-                let mut buf = [0u8; TCP_MSS];
-                match conn.stream.read(&mut buf[..max_read]) {
+                // Read as much as the guest's advertised window allows in one
+                // syscall, then emit one TCP segment per MSS from that buffer.
+                // This amortizes `read()` and keeps the pipe full on bulk
+                // transfers; single-byte exchanges still read exactly once.
+                let budget = (conn.send_window - in_flight) as usize;
+                let max_read = budget.min(self.read_buf.len());
+                if max_read == 0 {
+                    break;
+                }
+                match conn.stream.read(&mut self.read_buf[..max_read]) {
                     Ok(0) => {
                         // EOF — send FIN
                         let pkt = make_tcp_packet(
@@ -960,20 +970,25 @@ impl UserNet {
                         break;
                     }
                     Ok(n) => {
-                        let pkt = make_tcp_packet(
-                            key.dst_ip,
-                            key.dst_port,
-                            GUEST_IP,
-                            key.guest_port,
-                            conn.our_seq,
-                            conn.their_seq,
-                            TCP_PSH | TCP_ACK,
-                            &buf[..n],
-                            &[],
-                            &mut self.ip_id,
-                        );
-                        self.rx_queue.push_back(pkt);
-                        conn.our_seq = conn.our_seq.wrapping_add(n as u32);
+                        let mut off = 0;
+                        while off < n {
+                            let seg_len = (n - off).min(TCP_MSS);
+                            let pkt = make_tcp_packet(
+                                key.dst_ip,
+                                key.dst_port,
+                                GUEST_IP,
+                                key.guest_port,
+                                conn.our_seq,
+                                conn.their_seq,
+                                TCP_PSH | TCP_ACK,
+                                &self.read_buf[off..off + seg_len],
+                                &[],
+                                &mut self.ip_id,
+                            );
+                            self.rx_queue.push_back(pkt);
+                            conn.our_seq = conn.our_seq.wrapping_add(seg_len as u32);
+                            off += seg_len;
+                        }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         break; // No more data
@@ -1019,7 +1034,11 @@ impl Drop for UserNet {
 
 /// Internet checksum (RFC 1071): ones-complement sum of 16-bit words.
 fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
+    checksum_finish(checksum_add(0, data))
+}
+
+/// Accumulate the ones-complement sum of `data` into `sum`.
+fn checksum_add(mut sum: u32, data: &[u8]) -> u32 {
     let mut i = 0;
     while i + 1 < data.len() {
         sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
@@ -1028,6 +1047,11 @@ fn internet_checksum(data: &[u8]) -> u16 {
     if i < data.len() {
         sum += (data[i] as u32) << 8;
     }
+    sum
+}
+
+/// Fold a checksum accumulator and return its ones-complement.
+fn checksum_finish(mut sum: u32) -> u16 {
     while sum > 0xFFFF {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -1075,55 +1099,22 @@ fn build_ipv4_packet(
     pkt
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_tcp_segment(
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    payload: &[u8],
-    options: &[u8],
-) -> Vec<u8> {
-    let options_padded_len = (options.len() + 3) & !3;
-    let header_len = 20 + options_padded_len;
-    let data_offset = (header_len / 4) as u8;
-
-    let mut seg = vec![0u8; header_len + payload.len()];
-    seg[0..2].copy_from_slice(&src_port.to_be_bytes());
-    seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    seg[4..8].copy_from_slice(&seq.to_be_bytes());
-    seg[8..12].copy_from_slice(&ack.to_be_bytes());
-    seg[12] = data_offset << 4;
-    seg[13] = flags;
-    seg[14..16].copy_from_slice(&window.to_be_bytes());
-    // checksum at [16..18] computed later
-    // urgent ptr at [18..20] is 0
-
-    if !options.is_empty() {
-        seg[20..20 + options.len()].copy_from_slice(options);
-    }
-    if !payload.is_empty() {
-        seg[header_len..].copy_from_slice(payload);
-    }
-
-    seg
-}
-
 fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp_segment: &[u8]) -> u16 {
-    let tcp_len = tcp_segment.len() as u16;
-    let mut pseudo = Vec::with_capacity(12 + tcp_segment.len());
-    pseudo.extend_from_slice(&src_ip);
-    pseudo.extend_from_slice(&dst_ip);
-    pseudo.push(0);
-    pseudo.push(IP_TCP);
-    pseudo.extend_from_slice(&tcp_len.to_be_bytes());
-    pseudo.extend_from_slice(tcp_segment);
-    internet_checksum(&pseudo)
+    // Pseudo-header (src/dst/proto/length) + segment, without a temp buffer.
+    let mut sum: u32 = 0;
+    sum = checksum_add(sum, &src_ip);
+    sum = checksum_add(sum, &dst_ip);
+    sum += IP_TCP as u32;
+    sum += tcp_segment.len() as u32;
+    checksum_finish(checksum_add(sum, tcp_segment))
 }
 
 /// Build a complete Ethernet frame containing a TCP segment.
+///
+/// The whole frame is laid out in a single allocation (one `vec!`): Ethernet →
+/// IPv4 → TCP → payload.  The TCP checksum is computed in place over the
+/// contiguous segment plus its pseudo-header, so there are no intermediate
+/// buffers or extra copies of the payload.
 #[allow(clippy::too_many_arguments)]
 fn make_tcp_packet(
     src_ip: [u8; 4],
@@ -1137,16 +1128,61 @@ fn make_tcp_packet(
     options: &[u8],
     ip_id: &mut u16,
 ) -> Vec<u8> {
-    let mut tcp_seg =
-        build_tcp_segment(src_port, dst_port, seq, ack, flags, 65535, payload, options);
+    const ETH_HDR: usize = 14;
+    const IP_HDR: usize = 20;
+    const TCP_HDR_MIN: usize = 20;
+    const TCP_WINDOW: u16 = 65535;
 
-    // Compute TCP checksum
-    let cksum = tcp_checksum(src_ip, dst_ip, &tcp_seg);
-    tcp_seg[16] = (cksum >> 8) as u8;
-    tcp_seg[17] = (cksum & 0xFF) as u8;
+    let options_padded_len = (options.len() + 3) & !3;
+    let tcp_hdr_len = TCP_HDR_MIN + options_padded_len;
+    let ip_len = IP_HDR + tcp_hdr_len + payload.len();
+    let tcp_off = ETH_HDR + IP_HDR;
+    let mut frame = vec![0u8; ETH_HDR + ip_len];
 
-    let ip = build_ipv4_packet(src_ip, dst_ip, IP_TCP, &tcp_seg, ip_id);
-    build_eth_frame(&GUEST_MAC, &GATEWAY_MAC, ETH_IPV4, &ip)
+    // Ethernet header
+    frame[0..6].copy_from_slice(&GUEST_MAC);
+    frame[6..12].copy_from_slice(&GATEWAY_MAC);
+    frame[12..14].copy_from_slice(&ETH_IPV4.to_be_bytes());
+
+    // IPv4 header
+    let identity = *ip_id;
+    *ip_id = ip_id.wrapping_add(1);
+    {
+        let ip = &mut frame[ETH_HDR..tcp_off];
+        ip[0] = 0x45; // Version 4, IHL 5
+        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        ip[4..6].copy_from_slice(&identity.to_be_bytes());
+        ip[6] = 0x40; // Don't Fragment
+        ip[8] = 64; // TTL
+        ip[9] = IP_TCP;
+        ip[12..16].copy_from_slice(&src_ip);
+        ip[16..20].copy_from_slice(&dst_ip);
+        let cksum = internet_checksum(ip);
+        ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+    }
+
+    // TCP header
+    {
+        let seg = &mut frame[tcp_off..tcp_off + tcp_hdr_len];
+        seg[0..2].copy_from_slice(&src_port.to_be_bytes());
+        seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        seg[4..8].copy_from_slice(&seq.to_be_bytes());
+        seg[8..12].copy_from_slice(&ack.to_be_bytes());
+        seg[12] = (tcp_hdr_len as u8 / 4) << 4;
+        seg[13] = flags;
+        seg[14..16].copy_from_slice(&TCP_WINDOW.to_be_bytes());
+        // checksum at [16..18] computed below; urgent ptr at [18..20] is 0
+        if !options.is_empty() {
+            seg[20..20 + options.len()].copy_from_slice(options);
+        }
+    }
+    frame[tcp_off + tcp_hdr_len..].copy_from_slice(payload);
+
+    // TCP checksum over pseudo-header + the contiguous segment (incl. payload)
+    let cksum = tcp_checksum(src_ip, dst_ip, &frame[tcp_off..]);
+    frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&cksum.to_be_bytes());
+
+    frame
 }
 
 fn build_arp_reply(target_ip: &[u8; 4], sender_mac: &[u8; 6], sender_ip: &[u8; 4]) -> Vec<u8> {

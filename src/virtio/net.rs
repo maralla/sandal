@@ -43,8 +43,9 @@ pub struct VirtioNetDevice {
     pub backend: UserNet,
     pub filter: NetworkFilter,
 
-    // Scratch buffer for packet I/O
+    // Scratch buffers for packet I/O (RX read buffer, TX assembly buffer)
     pkt_buf: Vec<u8>,
+    tx_buf: Vec<u8>,
 }
 
 impl VirtioNetDevice {
@@ -64,6 +65,7 @@ impl VirtioNetDevice {
             backend,
             filter,
             pkt_buf: vec![0u8; 2048],
+            tx_buf: Vec::new(),
         }
     }
 
@@ -249,7 +251,7 @@ impl VirtioNetDevice {
                 None => break,
             };
 
-            let mut packet = Vec::new();
+            self.tx_buf.clear();
             let mut desc_idx = desc_head;
             let mut total_len = 0u32;
             while let Some((addr, len, flags, next)) =
@@ -262,7 +264,8 @@ impl VirtioNetDevice {
                 if offset + len as usize > memory.len() {
                     break;
                 }
-                packet.extend_from_slice(&memory[offset..offset + len as usize]);
+                self.tx_buf
+                    .extend_from_slice(&memory[offset..offset + len as usize]);
                 total_len += len;
 
                 if flags & VIRTQ_DESC_F_NEXT == 0 {
@@ -272,8 +275,8 @@ impl VirtioNetDevice {
             }
 
             // Skip the virtio-net header
-            if packet.len() > VIRTIO_NET_HDR_SIZE {
-                let eth_frame = &packet[VIRTIO_NET_HDR_SIZE..];
+            if self.tx_buf.len() > VIRTIO_NET_HDR_SIZE {
+                let eth_frame = &self.tx_buf[VIRTIO_NET_HDR_SIZE..];
 
                 // Apply network filter
                 if self.filter.filter_tx_packet(eth_frame) {
