@@ -59,9 +59,11 @@ fn run_vm(args: Args) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        vm::run(args)?;
+        let code = vm::run(args)?;
+        std::process::exit(code);
     }
 
+    #[allow(unreachable_code)]
     Ok(())
 }
 

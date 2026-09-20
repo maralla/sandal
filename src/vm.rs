@@ -142,8 +142,12 @@ struct Vmm {
     export_save_path: Option<String>,
     /// Console TX line buffer used to intercept VMM protocol markers.
     tx_line: Vec<u8>,
+    /// Bytes held back because they may start a protocol marker (suffix scan).
+    tx_hold: Vec<u8>,
     /// True while the current TX line is a suppressed protocol marker line.
     tx_suppress_line: bool,
+    /// Guest command exit status from the `SANDAL_EXIT:` marker.
+    guest_exit_code: Option<i32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,8 +195,9 @@ fn virtiofs_index(addr: u64) -> Option<usize> {
     }
 }
 
-/// Run a VM to execute the requested command, returning when the guest exits.
-pub fn run(args: Args) -> Result<()> {
+/// Run a VM to execute the requested command, returning the guest's exit
+/// status when it exits.
+pub fn run(args: Args) -> Result<i32> {
     let mut vmm = Vmm::new(&args)?;
     vmm.boot(&args)?;
     vmm.run_loop(&args)
@@ -320,7 +325,9 @@ impl Vmm {
             vt_off,
             export_save_path: None,
             tx_line: Vec::new(),
+            tx_hold: Vec::new(),
             tx_suppress_line: false,
+            guest_exit_code: None,
         })
     }
 
@@ -471,7 +478,7 @@ impl Vmm {
         (irqs, n)
     }
 
-    fn run_loop(&mut self, _args: &Args) -> Result<()> {
+    fn run_loop(&mut self, _args: &Args) -> Result<i32> {
         loop {
             // Poll the user-space network backend and deliver any incoming
             // packets to the guest's RX queue.
@@ -548,7 +555,7 @@ impl Vmm {
                 break;
             }
         }
-        Ok(())
+        Ok(self.guest_exit_code.unwrap_or(0))
     }
 }
 
@@ -740,34 +747,48 @@ impl Vmm {
         ];
 
         for &ch in data {
+            if self.guest_shutdown {
+                // The guest is shutting down; drop any trailing kernel output
+                // (e.g. the poweroff path's `reboot: Power down`).
+                break;
+            }
             self.tx_line.push(ch);
 
-            if !self.tx_suppress_line {
-                let buf = &self.tx_line;
-                let is_full = MARKERS.iter().any(|m| buf == m);
-                let is_prefix = buf.len() <= MARKERS.iter().map(|m| m.len()).max().unwrap_or(0)
-                    && MARKERS
-                        .iter()
-                        .any(|m| buf.len() <= m.len() && buf[..] == m[..buf.len()]);
-                let prev_was_prefix = buf.len() > 1
-                    && MARKERS.iter().any(|m| {
-                        m.len() >= buf.len() - 1 && buf[..buf.len() - 1] == m[..buf.len() - 1]
-                    });
-
-                if is_full {
+            if self.tx_suppress_line {
+                // Swallow the rest of the marker line.
+            } else {
+                self.tx_hold.push(ch);
+                if MARKERS.iter().any(|m| self.tx_hold.ends_with(m)) {
+                    // Full marker: discard it and swallow the rest of the line.
+                    self.tx_hold.clear();
                     self.tx_suppress_line = true;
-                } else if is_prefix {
-                    // Keep buffering: a marker may still complete.
-                } else if prev_was_prefix {
-                    // The marker was aborted mid-line: flush the buffered bytes.
-                    let _ = stdout.write_all(buf);
                 } else {
-                    let _ = stdout.write_all(&[ch]);
+                    // Hold back only the longest suffix that could still become
+                    // a marker; everything before it is safe to print.
+                    let hold = &self.tx_hold;
+                    let keep = if MARKERS.iter().any(|m| m.starts_with(hold)) {
+                        hold.len()
+                    } else {
+                        (1..hold.len())
+                            .rev()
+                            .find(|&k| {
+                                MARKERS
+                                    .iter()
+                                    .any(|m| m.starts_with(&hold[hold.len() - k..]))
+                            })
+                            .unwrap_or(0)
+                    };
+                    let flush_len = self.tx_hold.len() - keep;
+                    if flush_len > 0 {
+                        let _ = stdout.write_all(&self.tx_hold[..flush_len]);
+                        self.tx_hold.drain(..flush_len);
+                    }
                 }
             }
 
             if ch == b'\n' {
                 self.tx_suppress_line = false;
+                self.tx_hold.clear();
                 let line = std::mem::take(&mut self.tx_line);
                 self.process_console_line(&line);
             }
@@ -783,6 +804,12 @@ impl Vmm {
         };
         let trimmed = line.trim_end_matches(['\n', '\r']);
 
+        if let Some(pos) = trimmed.find(initramfs::EXIT_MARKER) {
+            let code = trimmed[pos + initramfs::EXIT_MARKER.len()..].trim();
+            self.guest_exit_code = code.parse::<i32>().ok();
+            self.guest_shutdown = true;
+            return;
+        }
         if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
             let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
             if !path.is_empty() {

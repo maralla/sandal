@@ -190,7 +190,11 @@ The exit carries a syndrome. The VMM handles:
   guest instead of being line-buffered by the host tty.
 - **Guest init protocol:** `/init` uses `BRK #imm` for its config blob and for
   `sandal-export`; `SANDAL_EXIT:` / `SANDAL_EXPORT_PATH:` console markers are
-  intercepted by the VMM.
+  intercepted by the VMM (detected at any position in the line, with
+  marker-prefix bytes held back so mid-line markers are still hidden).  The
+  `SANDAL_EXIT:<code>` marker sets the guest exit status and shuts the VM down
+  immediately, so the kernel's poweroff print is never forwarded; the code is
+  returned as sandal's process exit status.
 
 ---
 
@@ -247,6 +251,15 @@ the `make test` gate:
   protocol (otherwise init dies with SIGTRAP).
 - `CNTV_TVAL` writes must be translated to `CNTV_CVAL` when trapped; the arm64
   clockevent arms the tick through TVAL.
+- **Never enable `CONFIG_MAGIC_SYSRQ` in the guest kernel.** The hvc
+  (virtio-console) driver implements sysrq as a `^O` (Ctrl-O) toggle followed
+  by the next byte as the command (`hvc_console.c`, `#ifdef CONFIG_MAGIC_SYSRQ`).
+  A stray Ctrl-O — or the byte after it, which is often a terminal DSR reply —
+  is consumed as a sysrq command instead of reaching the shell.  `h`/unknown
+  keys print the sysrq help, a digit changes the console loglevel (0 silences
+  it), and `b`/`o` reboot/power off; all of these look exactly like a VMM hang.
+  The diagnostic kernel therefore keeps the passive options (KALLSYMS,
+  STACKTRACE, DEBUG_FS, DETECT_HUNG_TASK) but **not** MAGIC_SYSRQ.
 - `seg_max` must leave room for the header and status descriptors
   (`seg_max <= QUEUE_SIZE - 2`).  Advertising `seg_max == 128` on a
   128-descriptor ring let the guest build 128-segment requests (130
