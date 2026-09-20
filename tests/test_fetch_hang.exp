@@ -14,7 +14,7 @@ if {$disk_size eq ""} { set disk_size 128 }
 set timeout 8
 set binary "./target/release/sandal"
 
-spawn $binary --disk-size $disk_size --layer curl.layer -- sh
+spawn $binary --disk-size $disk_size -- sh
 
 # Wait for shell prompt
 expect {
@@ -23,7 +23,7 @@ expect {
 }
 
 # Type the curl command character by character with 50ms delay (simulates human typing)
-set cmd "curl -sf http://10.0.2.2:18199\r"
+set cmd "wget -q -O - http://10.0.2.2:18199\r"
 foreach c [split $cmd ""] {
     send -- $c
     after 50

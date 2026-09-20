@@ -1,10 +1,11 @@
-//! Thin Rust bindings over the `src/hypervisor/ffi.c` wrappers for Apple's
+//! Thin Rust bindings over the `src/hypervisor/hvf/ffi.c` wrappers for Apple's
 //! Hypervisor.framework.
 //!
 //! Only the API surface actually used by the software-GIC VMM (see
 //! `docs/vmm-spec.md`) is bound here.  In particular there are no
 //! `hv_gic_create`/SPI/ICC bindings: HVF's native GIC is deliberately not used.
 
+use crate::hypervisor::Reg;
 use std::ffi::c_void;
 
 pub type HvReturn = i32;
@@ -12,65 +13,8 @@ pub type HvVcpu = u32;
 
 pub const HV_SUCCESS: HvReturn = 0;
 
-// Memory permissions
-pub const HV_MEMORY_READ: u64 = 1 << 0;
-pub const HV_MEMORY_WRITE: u64 = 1 << 1;
-pub const HV_MEMORY_EXEC: u64 = 1 << 2;
-
-/// ARM64 CPU registers (`hv_reg_t`).
-#[repr(u32)]
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)] // the full register file is part of the FFI surface
-pub enum HvReg {
-    X0 = 0,
-    X1 = 1,
-    X2 = 2,
-    X3 = 3,
-    X4 = 4,
-    X5 = 5,
-    X6 = 6,
-    X7 = 7,
-    X8 = 8,
-    X9 = 9,
-    X10 = 10,
-    X11 = 11,
-    X12 = 12,
-    X13 = 13,
-    X14 = 14,
-    X15 = 15,
-    X16 = 16,
-    X17 = 17,
-    X18 = 18,
-    X19 = 19,
-    X20 = 20,
-    X21 = 21,
-    X22 = 22,
-    X23 = 23,
-    X24 = 24,
-    X25 = 25,
-    X26 = 26,
-    X27 = 27,
-    X28 = 28,
-    Fp = 29,   // Frame pointer (X29)
-    Lr = 30,   // Link register (X30)
-    Pc = 31,   // Program counter
-    Fpcr = 32, // Floating-point control register
-    Fpsr = 33, // Floating-point status register
-    Cpsr = 34, // Current Program Status Register
-}
-
-impl HvReg {
-    /// Convert a general-purpose register index (0-30) to the corresponding
-    /// `HvReg`. Returns `None` for index 31 (XZR) or out-of-range values.
-    pub fn from_gpr(index: u8) -> Option<Self> {
-        if index <= 30 {
-            // Safety: HvReg is #[repr(u32)] with values 0-30 mapping to X0-Lr.
-            Some(unsafe { std::mem::transmute::<u32, HvReg>(index as u32) })
-        } else {
-            None
-        }
-    }
-}
+/// The shared register enum, aliased under its HVF name.
+pub type HvReg = Reg;
 
 #[repr(C)]
 pub struct HvVcpuExitException {
@@ -113,6 +57,7 @@ extern "C" {
     #[cfg(target_arch = "aarch64")]
     pub fn hv_vcpu_set_trap_debug_exceptions_wrapper(vcpu: HvVcpu, value: bool) -> HvReturn;
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)] // the HVF kick primitive; reserved for the net wake path
     pub fn hv_vcpus_exit_wrapper(vcpus: *mut u64, vcpu_count: u32) -> HvReturn;
 }
 

@@ -1042,7 +1042,7 @@ fn read_le32(buf: &[u8], offset: usize) -> u32 {
 }
 
 /// Parsed ext2 superblock — only the fields we need.
-struct Ext2Superblock {
+pub struct Ext2Superblock {
     inodes_count: u32,
     blocks_count: u32,
     blocks_per_group: u32,
@@ -1053,7 +1053,7 @@ struct Ext2Superblock {
 }
 
 impl Ext2Superblock {
-    fn parse(image: &[u8]) -> Result<Self> {
+    pub fn parse(image: &[u8]) -> Result<Self> {
         if image.len() < SUPERBLOCK_OFFSET + 256 {
             anyhow::bail!("Image too small for ext2 superblock");
         }
@@ -1095,12 +1095,12 @@ struct Ext2Bgd {
 }
 
 /// All block group descriptors for the filesystem.
-struct Ext2BgdTable {
+pub struct Ext2BgdTable {
     groups: Vec<Ext2Bgd>,
 }
 
 impl Ext2BgdTable {
-    fn parse(image: &[u8], sb: &Ext2Superblock) -> Result<Self> {
+    pub fn parse(image: &[u8], sb: &Ext2Superblock) -> Result<Self> {
         // Block group descriptor table is in the block after the superblock.
         let bgdt_offset = sb.block_size; // Block 1 for 4K blocks, or block 2 for 1K blocks
         let num_groups = sb.num_groups() as usize;
@@ -1863,7 +1863,7 @@ fn ensure_dir_path(
 /// Write a regular file into the ext2 image. If the file already exists, it is
 /// replaced (the old inode's blocks are not freed — this is acceptable for
 /// injecting a handful of small runtime files).
-fn inject_file(
+pub fn inject_file(
     image: &mut [u8],
     sb: &Ext2Superblock,
     bgdt: &Ext2BgdTable,
@@ -2295,8 +2295,11 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
     // hvc0: virtio-console device (major 229, minor 0)
     inject_chardev(image, &sb, &bgdt, "dev/hvc0", 0o666, 229, 0)?;
 
-    // CA certificates
+    // CA certificates (TLS for apk/curl inside the guest). The directory
+    // must exist: OpenSSL stats /etc/ssl/certs even when SSL_CERT_FILE
+    // points at the bundle file.
     if network {
+        ensure_dir_path(image, &sb, &bgdt, "etc/ssl/certs")?;
         if let Some(ca_data) = initramfs::load_host_ca_certificates() {
             inject_file(
                 image,
@@ -2308,6 +2311,19 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
             )?;
         }
     }
+
+    // Controlling-terminal helper: /bin/ctty claims the console as the user
+    // command's controlling terminal (job control + tty signals in the
+    // guest). A crafted x86_64 ELF — pure machine code, no toolchain.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        "bin/ctty",
+        initramfs::ctty_helper(),
+        0o755,
+    )?;
 
     // Export helpers: resize + done BRK binaries, and the sandal-export script.
     // Used by the guest `sandal-export [path]` command to turn the overlay

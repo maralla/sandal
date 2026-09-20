@@ -32,7 +32,7 @@ def phase_export(tmp: pathlib.Path) -> pathlib.Path:
     try:
         vm.boot("export boot")
         vm.run(
-            f"echo {MARKER.decode()} > /root/roundtrip.txt; echo WRITE_DONE",
+            f"echo {MARKER.decode()} > /root/roundtrip.txt; echo WRITE\"\"_DONE",
             "WRITE_DONE",
         )
         vm.run(f"sandal-export {layer}", "Layer exported", count=1)
@@ -48,7 +48,7 @@ def phase_load(layer: pathlib.Path) -> None:
     vm = Vm(["--disk-size", "64", "--layer", str(layer)])
     try:
         vm.boot("load boot")
-        out = vm.run("cat /root/roundtrip.txt; echo LOAD_DONE", "LOAD_DONE")
+        out = vm.run("cat /root/roundtrip.txt; echo LOAD\"\"_DONE", "LOAD_DONE")
         if MARKER.decode() not in out:
             raise AssertionError("load: round-trip file content missing in guest")
     finally:

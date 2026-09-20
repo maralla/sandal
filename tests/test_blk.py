@@ -32,7 +32,7 @@ def main() -> None:
             "B=$(md5sum /root/blk.bin | cut -d' ' -f1); "
             'echo "BLK_MD5 $A $B"; '
             "dd if=/dev/vda of=/dev/null bs=1M count=9 2>/dev/null; "
-            "echo BLK_DONE",
+            "echo BLK\"\"_DONE",
             "BLK_DONE",
         )
     finally:

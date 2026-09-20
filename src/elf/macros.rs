@@ -7,6 +7,12 @@
 //! Register arguments use ARM64-style names (`x0`–`x30`, `SP`, `XZR`)
 //! resolved at compile time via the [`reg!`] pattern-matching macro.
 
+// The instruction macros (arm64) is an intentionally complete reference toolkit: crafted
+// guest binaries use subsets of it, and unused entries document the
+// surrounding UAPI surface.
+#![allow(dead_code)]
+#![allow(unused_macros)]
+
 // ── Register name → number mapping ──────────────────────────────────────
 
 /// Map ARM64 register names to their numeric encoding.
@@ -383,7 +389,7 @@ macro_rules! mount {
         adr!($e, x2, $fs);
         movz!($e, x3, $flags);
         movz!($e, x4, 0);
-        syscall!($e, $crate::elf::linux::nr::MOUNT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::MOUNT);
     }};
     ($e:expr, $src:expr, $tgt:expr, $fs:expr, $flags:expr, $data:tt) => {{
         adr!($e, x0, $src);
@@ -391,7 +397,7 @@ macro_rules! mount {
         adr!($e, x2, $fs);
         movz!($e, x3, $flags);
         mov!($e, x4, $data);
-        syscall!($e, $crate::elf::linux::nr::MOUNT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::MOUNT);
     }};
 }
 
@@ -401,30 +407,30 @@ macro_rules! mount_bind {
         adr!($e, x0, $src);
         adr!($e, x1, $tgt);
         movz!($e, x2, 0);
-        movz!($e, x3, $crate::elf::linux::MS_BIND);
+        movz!($e, x3, $crate::elf::aarch64_linux::MS_BIND);
         movz!($e, x4, 0);
-        syscall!($e, $crate::elf::linux::nr::MOUNT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::MOUNT);
     }};
 }
 
 /// `mkdir path` — mkdirat(AT_FDCWD, path, 0755).
 macro_rules! mkdir {
     ($e:expr, $path:expr) => {{
-        movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
+        movn!($e, x0, $crate::elf::aarch64_linux::AT_FDCWD_NEG);
         adr!($e, x1, $path);
         movz!($e, x2, 0x1ED);
-        syscall!($e, $crate::elf::linux::nr::MKDIRAT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::MKDIRAT);
     }};
 }
 
 /// `mkdir_under parent, child` — openat(parent) + mkdirat(fd, child, 0755) + close.
 macro_rules! mkdir_under {
     ($e:expr, $parent:expr, $child:expr) => {{
-        openat!($e, $parent, $crate::elf::linux::O_RDONLY);
+        openat!($e, $parent, $crate::elf::aarch64_linux::O_RDONLY);
         mov!($e, x11, x0); // save fd for close
         adr!($e, x1, $child);
         movz!($e, x2, 0x1ED);
-        syscall!($e, $crate::elf::linux::nr::MKDIRAT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::MKDIRAT);
         close!($e, x11);
     }};
 }
@@ -433,7 +439,7 @@ macro_rules! mkdir_under {
 macro_rules! chdir {
     ($e:expr, $path:expr) => {{
         adr!($e, x0, $path);
-        syscall!($e, $crate::elf::linux::nr::CHDIR);
+        syscall!($e, $crate::elf::aarch64_linux::nr::CHDIR);
     }};
 }
 
@@ -442,7 +448,7 @@ macro_rules! pivot_root {
     ($e:expr, $new:expr, $old:expr) => {{
         adr!($e, x0, $new);
         adr!($e, x1, $old);
-        syscall!($e, $crate::elf::linux::nr::PIVOT_ROOT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::PIVOT_ROOT);
     }};
 }
 
@@ -453,23 +459,23 @@ macro_rules! pivot_root {
 ///   - `openat!(e, SP, flags)` — path buffer at SP
 macro_rules! openat {
     ($e:expr, SP, $flags:expr) => {{
-        movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
+        movn!($e, x0, $crate::elf::aarch64_linux::AT_FDCWD_NEG);
         add!($e, x1, SP, 0);
         movz!($e, x2, $flags);
-        syscall!($e, $crate::elf::linux::nr::OPENAT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::OPENAT);
     }};
     ($e:expr, $path:expr, $flags:expr) => {{
-        movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
+        movn!($e, x0, $crate::elf::aarch64_linux::AT_FDCWD_NEG);
         adr!($e, x1, $path);
         movz!($e, x2, $flags);
-        syscall!($e, $crate::elf::linux::nr::OPENAT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::OPENAT);
     }};
     ($e:expr, $path:expr, $flags:expr, $mode:expr) => {{
-        movn!($e, x0, $crate::elf::linux::AT_FDCWD_NEG);
+        movn!($e, x0, $crate::elf::aarch64_linux::AT_FDCWD_NEG);
         adr!($e, x1, $path);
         movz!($e, x2, $flags);
         movz!($e, x3, $mode);
-        syscall!($e, $crate::elf::linux::nr::OPENAT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::OPENAT);
     }};
 }
 
@@ -477,7 +483,7 @@ macro_rules! openat {
 macro_rules! close {
     ($e:expr, $reg:tt) => {{
         mov!($e, x0, $reg);
-        syscall!($e, $crate::elf::linux::nr::CLOSE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::CLOSE);
     }};
 }
 
@@ -485,7 +491,7 @@ macro_rules! close {
 macro_rules! exit {
     ($e:expr, $code:expr) => {{
         movz!($e, x0, $code);
-        syscall!($e, $crate::elf::linux::nr::EXIT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::EXIT);
     }};
 }
 
@@ -496,20 +502,20 @@ macro_rules! ioctl {
         mov!($e, x0, $fd);
         movz!($e, x1, $cmd);
         add!($e, x2, SP, 0);
-        syscall!($e, $crate::elf::linux::nr::IOCTL);
+        syscall!($e, $crate::elf::aarch64_linux::nr::IOCTL);
     }};
     ($e:expr, $fd:tt, $cmd:expr, $val:expr) => {{
         mov!($e, x0, $fd);
         movz!($e, x1, $cmd);
         movz!($e, x2, $val);
-        syscall!($e, $crate::elf::linux::nr::IOCTL);
+        syscall!($e, $crate::elf::aarch64_linux::nr::IOCTL);
     }};
 }
 
 /// `setsid()` — create a new session.
 macro_rules! setsid {
     ($e:expr) => {{
-        syscall!($e, $crate::elf::linux::nr::SETSID);
+        syscall!($e, $crate::elf::aarch64_linux::nr::SETSID);
     }};
 }
 
@@ -519,19 +525,19 @@ macro_rules! dup3 {
         mov!($e, x0, $oldfd);
         movz!($e, x1, $newfd);
         movz!($e, x2, 0);
-        syscall!($e, $crate::elf::linux::nr::DUP3);
+        syscall!($e, $crate::elf::aarch64_linux::nr::DUP3);
     }};
 }
 
 /// `fork()` — clone(SIGCHLD, 0, 0, 0, 0), child pid in x0.
 macro_rules! fork {
     ($e:expr) => {{
-        movz!($e, x0, $crate::elf::linux::SIGCHLD);
+        movz!($e, x0, $crate::elf::aarch64_linux::SIGCHLD);
         movz!($e, x1, 0);
         movz!($e, x2, 0);
         movz!($e, x3, 0);
         movz!($e, x4, 0);
-        syscall!($e, $crate::elf::linux::nr::CLONE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::CLONE);
     }};
 }
 
@@ -542,7 +548,7 @@ macro_rules! wait4 {
         add!($e, x1, SP, 0);
         movz!($e, x2, 0);
         movz!($e, x3, 0);
-        syscall!($e, $crate::elf::linux::nr::WAIT4);
+        syscall!($e, $crate::elf::aarch64_linux::nr::WAIT4);
     }};
 }
 
@@ -556,7 +562,7 @@ macro_rules! reboot {
         movz!($e, x2, 0xFEDC);
         movk!($e, x2, 0x4321, 16);
         movz!($e, x3, 0);
-        syscall!($e, $crate::elf::linux::nr::REBOOT);
+        syscall!($e, $crate::elf::aarch64_linux::nr::REBOOT);
     }};
 }
 
@@ -568,13 +574,13 @@ macro_rules! execve {
         mov!($e, x0, $path);
         add!($e, x1, SP, 0);
         mov!($e, x2, $envp);
-        syscall!($e, $crate::elf::linux::nr::EXECVE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::EXECVE);
     }};
     ($e:expr, SP + $path_off:expr, SP + $argv_off:expr, $envp:tt) => {{
         add!($e, x0, SP, $path_off);
         add!($e, x1, SP, $argv_off);
         mov!($e, x2, $envp);
-        syscall!($e, $crate::elf::linux::nr::EXECVE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::EXECVE);
     }};
 }
 
@@ -584,7 +590,7 @@ macro_rules! socket {
         movz!($e, x0, $domain);
         movz!($e, x1, $type);
         movz!($e, x2, 0);
-        syscall!($e, $crate::elf::linux::nr::SOCKET);
+        syscall!($e, $crate::elf::aarch64_linux::nr::SOCKET);
     }};
 }
 
@@ -593,7 +599,7 @@ macro_rules! clock_settime {
     ($e:expr, $clockid:expr) => {{
         movz!($e, x0, $clockid);
         add!($e, x1, SP, 0);
-        syscall!($e, $crate::elf::linux::nr::CLOCK_SETTIME);
+        syscall!($e, $crate::elf::aarch64_linux::nr::CLOCK_SETTIME);
     }};
 }
 
@@ -607,19 +613,19 @@ macro_rules! sys_write {
     ($e:expr, $fd:literal, $buf:tt) => {{
         movz!($e, x0, $fd);
         mov!($e, x1, $buf);
-        syscall!($e, $crate::elf::linux::nr::WRITE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::WRITE);
     }};
     ($e:expr, $fd:literal, $buf:expr, $len:expr) => {{
         movz!($e, x0, $fd);
         adr!($e, x1, $buf);
         movz!($e, x2, $len);
-        syscall!($e, $crate::elf::linux::nr::WRITE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::WRITE);
     }};
     ($e:expr, $fd:tt, $buf:expr, $len:expr) => {{
         mov!($e, x0, $fd);
         adr!($e, x1, $buf);
         movz!($e, x2, $len);
-        syscall!($e, $crate::elf::linux::nr::WRITE);
+        syscall!($e, $crate::elf::aarch64_linux::nr::WRITE);
     }};
 }
 

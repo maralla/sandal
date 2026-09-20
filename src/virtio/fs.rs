@@ -71,6 +71,10 @@ const FUSE_DESTROY: u32 = 38;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_RENAME2: u32 = 45;
+/// Whole-filesystem flush (`syncfs(2)` / busybox `sync`).
+const FUSE_SYNCFS: u32 = 50;
+/// File handle the kernel uses for a whole-filesystem SYNCFS request.
+const FUSE_SYNCFS_ALL: u64 = 0xffff_ffff_ffff_ffff;
 
 // ---- FUSE INIT capability flags ----
 const FUSE_BIG_WRITES: u32 = 1 << 5;
@@ -750,6 +754,7 @@ impl VirtioFsDevice {
             FUSE_WRITE => self.handle_write(&mut buf, unique),
             FUSE_RELEASE => self.handle_release(&mut buf, unique),
             FUSE_FLUSH => self.handle_flush(&mut buf, unique),
+            FUSE_SYNCFS => self.handle_syncfs(&mut buf, unique),
             FUSE_FSYNC => self.handle_fsync(&mut buf, unique),
             FUSE_OPENDIR => self.handle_opendir(unique, nodeid),
             FUSE_READDIR => self.handle_readdir(&mut buf, unique),
@@ -1042,6 +1047,28 @@ impl VirtioFsDevice {
         // fuse_flush_in: fh(8) + unused(4) + padding(4) + lock_owner(8)
         let fh = buf.read_u64().unwrap_or(0);
         if let Some(h) = self.handles.get(&fh) {
+            if let HandleInner::File(ref f) = h.inner {
+                let _ = f.sync_all();
+            }
+        }
+        WriteBuf::fuse_out(unique).finish()
+    }
+
+    /// `syncfs(2)`: flush every open file to the host. The kernel sends a
+    /// single request with the reserved all-filesystem handle; data written
+    /// through the writeback cache must reach the host before we reply, or
+    /// an immediate guest shutdown can lose it.
+    fn handle_syncfs(&mut self, buf: &mut ParseBuf, unique: u64) -> Vec<u8> {
+        // fuse_syncfs_in: fh(8) + padding(4)
+        let fh = buf.read_u64().unwrap_or(0);
+        let _ = buf.read_u32();
+        if fh == FUSE_SYNCFS_ALL || fh == 0 {
+            for h in self.handles.values() {
+                if let HandleInner::File(ref f) = h.inner {
+                    let _ = f.sync_all();
+                }
+            }
+        } else if let Some(h) = self.handles.get(&fh) {
             if let HandleInner::File(ref f) = h.inner {
                 let _ = f.sync_all();
             }

@@ -6,14 +6,7 @@
 //! state: distributor/redistributor MMIO registers, CPU-interface sysregs, and
 //! level-triggered device SPIs.
 
-// Interrupt numbers (GIC INTID). SPIs: INTID = 32 + spi_num.
-pub const IRQ_VTIMER: u32 = 27; // PPI 11 (virtual timer)
-pub const SPI_NET: u32 = 16;
-pub const SPI_CONSOLE: u32 = 17;
-pub const SPI_BLK: u32 = 18;
-pub const SPI_DATA_BLK: u32 = 19;
-pub const SPI_RNG: u32 = 20;
-pub const SPI_FS_START: u32 = 21; // virtiofs devices take SPI_FS_START + i
+// Interrupt numbers live in src/irqs.rs and are shared with the KVM backend.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Software GICv3

@@ -1,6 +1,8 @@
 /target/
 Cargo.lock
 *.kernel
+vmlinux-sandal-x86
+kernel-build/
 *.img
 *.initrd
 .DS_Store

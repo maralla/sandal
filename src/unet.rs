@@ -1,3 +1,7 @@
+// The kqueue/pipe poller machinery is the macOS HVF net wake path; on
+// Linux the run loops poll the backend directly.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use log::debug;
 /// User-space network stack (SLIRP-style NAT).
@@ -18,8 +22,6 @@ use std::ptr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::hypervisor::Vcpu;
-
 // ============= NETWORK CONFIGURATION =============
 
 pub const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
@@ -33,18 +35,37 @@ const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 const TCP_MSS: usize = 1460; // MTU(1500) - IP(20) - TCP(20)
 
 // ============= ICMP SOCKET FFI =============
-// Non-privileged ICMP sockets (SOCK_DGRAM + IPPROTO_ICMP) on macOS.
+// Non-privileged ICMP sockets (SOCK_DGRAM + IPPROTO_ICMP).
 
 const ICMP_AF_INET: i32 = 2;
 const ICMP_SOCK_DGRAM: i32 = 2;
 const ICMP_IPPROTO_ICMP: i32 = 1;
-const ICMP_SOL_SOCKET: i32 = 0xFFFF;
-const ICMP_SO_RCVTIMEO: i32 = 0x1006;
 
+// SOL_SOCKET / SO_RCVTIMEO values differ between BSD and Linux.
+#[cfg(target_os = "macos")]
+const ICMP_SOL_SOCKET: i32 = 0xFFFF;
+#[cfg(target_os = "macos")]
+const ICMP_SO_RCVTIMEO: i32 = 0x1006;
+#[cfg(target_os = "linux")]
+const ICMP_SOL_SOCKET: i32 = 1;
+#[cfg(target_os = "linux")]
+const ICMP_SO_RCVTIMEO: i32 = 20;
+
+// BSD sockaddr_in carries sin_len; Linux does not (family is a u16 at offset 0).
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct libc_sockaddr_in {
     sin_len: u8,
     sin_family: u8,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [u8; 8],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct libc_sockaddr_in {
+    sin_family: u16,
     sin_port: u16,
     sin_addr: u32,
     sin_zero: [u8; 8],
@@ -195,11 +216,11 @@ impl UserNet {
         GUEST_MAC
     }
 
-    /// Create a `NetPoller` for this network backend's sockets.
-    /// The DNS socket is registered immediately; TCP sockets are registered
-    /// as connections are established.
-    pub fn create_poller(&mut self, vcpu_id: u64) -> NetPoller {
-        let poller = NetPoller::new(vcpu_id, self.dns_socket.as_raw_fd());
+    /// Create a network poller for the user-space networking backend.
+    /// `wake` is called on a poller thread whenever a host socket becomes
+    /// readable; it must wake the vCPU (HVF: forced exit; KVM: IRQ line).
+    pub fn create_poller(&mut self, wake: Box<dyn Fn() + Send>) -> NetPoller {
+        let poller = NetPoller::new(wake, self.dns_socket.as_raw_fd());
         self.poller_fd_tx = Some(poller.fd_sender());
         self.poller_wakeup_fd = Some(poller.wakeup_fd());
         poller
@@ -249,7 +270,7 @@ impl UserNet {
         if !self.rx_queue.is_empty() {
             if let Some(fd) = self.poller_wakeup_fd {
                 let byte: u8 = 1;
-                unsafe { kq::write(fd, &byte, 1) };
+                sys::write(fd, byte);
             }
         }
     }
@@ -370,7 +391,7 @@ impl UserNet {
                 // Wake the poller so the vcpu processes the reply promptly.
                 if let Some(fd) = wakeup_fd {
                     let byte: u8 = 1;
-                    unsafe { kq::write(fd, &byte, 1) };
+                    sys::write(fd, byte);
                 }
             });
         }
@@ -378,7 +399,7 @@ impl UserNet {
 
     /// Send an ICMP echo request to a real host and relay the reply back.
     fn proxy_icmp_echo(dst_ip: [u8; 4], data: &[u8], tx: &mpsc::Sender<Vec<u8>>, ip_id: &mut u16) {
-        // Create a non-privileged ICMP socket (macOS SOCK_DGRAM + IPPROTO_ICMP).
+        // Create a non-privileged ICMP socket (SOCK_DGRAM + IPPROTO_ICMP).
         let sock = unsafe {
             let fd = libc_socket(ICMP_AF_INET, ICMP_SOCK_DGRAM, ICMP_IPPROTO_ICMP);
             if fd < 0 {
@@ -389,9 +410,17 @@ impl UserNet {
 
         // Build the ICMP echo request payload. macOS kernel rewrites the
         // identifier field, so we send the original data as-is.
+        #[cfg(target_os = "macos")]
         let addr = libc_sockaddr_in {
             sin_len: std::mem::size_of::<libc_sockaddr_in>() as u8,
             sin_family: ICMP_AF_INET as u8,
+            sin_port: 0,
+            sin_addr: u32::from_be_bytes(dst_ip).to_be(),
+            sin_zero: [0; 8],
+        };
+        #[cfg(target_os = "linux")]
+        let addr = libc_sockaddr_in {
+            sin_family: ICMP_AF_INET as u16,
             sin_port: 0,
             sin_addr: u32::from_be_bytes(dst_ip).to_be(),
             sin_zero: [0; 8],
@@ -432,7 +461,7 @@ impl UserNet {
                 ptr::null_mut(),
             );
 
-            kq::close(sock);
+            sys::close(sock);
 
             if n <= 0 {
                 return;
@@ -812,7 +841,7 @@ impl UserNet {
             // Wake the poller so it kicks the vcpu to process this connection.
             if let Some(fd) = wakeup_fd {
                 let byte: u8 = 1;
-                unsafe { kq::write(fd, &byte, 1) };
+                sys::write(fd, byte);
             }
         });
     }
@@ -845,7 +874,7 @@ impl UserNet {
                         // and registers it with kqueue before blocking again.
                         if let Some(fd) = self.poller_wakeup_fd {
                             let byte: u8 = 1;
-                            unsafe { kq::write(fd, &byte, 1) };
+                            sys::write(fd, byte);
                         }
                     }
 
@@ -1257,21 +1286,60 @@ fn get_host_dns() -> SocketAddr {
 
 // ============= EVENT-DRIVEN NETWORK POLLER =============
 
-/// kqueue-based I/O poller that monitors host-side sockets and kicks the
-/// vcpu (via `hv_vcpus_exit`) only when data actually arrives.
+/// Socket-event poller that monitors host-side sockets and wakes the vCPU
+/// only when data actually arrives. Registered sockets:
+///   - the DNS UDP socket (DNS replies wake the vCPU)
+///   - every established TCP connection (remote data wakes the vCPU)
+///   - a wakeup pipe (shutdown signal + registration kick)
 ///
 /// This replaces a fixed-interval timer thread, giving zero idle CPU usage
-/// and sub-microsecond wakeup latency.
+/// and sub-microsecond wakeup latency. The backend-specific vCPU kick is
+/// injected as a `wake` callback by the VMM (HVF: `hv_vcpus_exit`; KVM:
+/// raise the net SPI line via `KVM_IRQ_LINE`).
 pub struct NetPoller {
-    kq: RawFd,
+    wake: Box<dyn Fn() + Send>,
     wakeup_read: RawFd,
     wakeup_write: RawFd,
-    vcpu_id: u64,
+    #[cfg(target_os = "linux")]
+    dns_fd: RawFd,
     fd_rx: mpsc::Receiver<RawFd>,
     fd_tx: mpsc::Sender<RawFd>,
+    #[cfg(target_os = "macos")]
+    kq: RawFd,
+    #[cfg(target_os = "linux")]
+    sockets: Vec<RawFd>,
 }
 
-// kqueue / kevent FFI — just the handful of definitions we need.
+/// Minimal libc helpers shared by the poller implementations.
+mod sys {
+    use std::os::fd::RawFd;
+
+    pub fn write(fd: RawFd, byte: u8) -> isize {
+        unsafe { libc::write(fd, &byte as *const u8 as *const _, 1) }
+    }
+
+    pub fn read(fd: RawFd, buf: &mut [u8]) -> isize {
+        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) }
+    }
+
+    pub fn close(fd: RawFd) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    pub fn pipe() -> Option<(RawFd, RawFd)> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+            Some((fds[0], fds[1]))
+        } else {
+            None
+        }
+    }
+}
+
+// kqueue / kevent FFI — just the handful of definitions we need (macOS only).
+#[cfg(target_os = "macos")]
 mod kq {
     use std::ffi::c_void;
     use std::os::fd::RawFd;
@@ -1297,7 +1365,7 @@ mod kq {
     unsafe impl Send for Kevent {}
 
     // We always pass null for the timeout (block forever), so we just
-    // declare it as *const c_void to avoid a libc dependency.
+    // declare it as *const c_void.
     extern "C" {
         pub fn kqueue() -> RawFd;
         pub fn kevent(
@@ -1308,10 +1376,6 @@ mod kq {
             nevents: i32,
             timeout: *const c_void,
         ) -> i32;
-        pub fn pipe(fds: *mut [RawFd; 2]) -> i32;
-        pub fn close(fd: RawFd) -> i32;
-        pub fn read(fd: RawFd, buf: *mut u8, count: usize) -> isize;
-        pub fn write(fd: RawFd, buf: *const u8, count: usize) -> isize;
     }
 
     /// Register a file descriptor for EVFILT_READ on the given kqueue.
@@ -1333,30 +1397,34 @@ mod kq {
 impl NetPoller {
     /// Create a new poller. `dns_fd` is the DNS UDP socket's raw fd, which
     /// is registered immediately so DNS replies wake the vcpu.
-    pub fn new(vcpu_id: u64, dns_fd: RawFd) -> Self {
+    pub fn new(wake: Box<dyn Fn() + Send>, dns_fd: RawFd) -> Self {
+        let (wakeup_read, wakeup_write) = sys::pipe().expect("pipe() failed");
+
+        #[cfg(target_os = "macos")]
         let kq = unsafe { kq::kqueue() };
+        #[cfg(target_os = "macos")]
         assert!(kq >= 0, "kqueue() failed");
-
-        let mut pipe_fds: [RawFd; 2] = [0; 2];
-        let ret = unsafe { kq::pipe(&mut pipe_fds) };
-        assert!(ret == 0, "pipe() failed");
-
-        let wakeup_read = pipe_fds[0];
-        let wakeup_write = pipe_fds[1];
-
         // Register the wakeup pipe and DNS socket with kqueue.
-        kq::register_fd(kq, wakeup_read);
-        kq::register_fd(kq, dns_fd);
+        #[cfg(target_os = "macos")]
+        {
+            kq::register_fd(kq, wakeup_read);
+            kq::register_fd(kq, dns_fd);
+        }
 
         let (fd_tx, fd_rx) = mpsc::channel();
 
         NetPoller {
-            kq,
+            wake,
             wakeup_read,
             wakeup_write,
-            vcpu_id,
+            #[cfg(target_os = "linux")]
+            dns_fd,
             fd_rx,
             fd_tx,
+            #[cfg(target_os = "macos")]
+            kq,
+            #[cfg(target_os = "linux")]
+            sockets: Vec::new(),
         }
     }
 
@@ -1372,9 +1440,18 @@ impl NetPoller {
     }
 
     /// Blocking event loop — run this on a dedicated thread.
-    /// Blocks on kevent() until a monitored socket becomes readable,
-    /// then kicks the vcpu. Exits when a byte is read from the wakeup pipe.
+    /// Blocks until a monitored socket becomes readable, then wakes the
+    /// vCPU. Exits when a byte is read from the wakeup pipe.
     pub fn run(self) {
+        #[cfg(target_os = "macos")]
+        self.run_kqueue();
+        #[cfg(target_os = "linux")]
+        self.run_poll();
+    }
+
+    /// macOS event loop (kqueue).
+    #[cfg(target_os = "macos")]
+    fn run_kqueue(self) {
         let mut events: [kq::Kevent; 32] = [kq::Kevent {
             ident: 0,
             filter: 0,
@@ -1412,7 +1489,7 @@ impl NetPoller {
                 if ev.ident == self.wakeup_read as usize {
                     // Drain the pipe and check for the shutdown sentinel (0xFF).
                     let mut buf = [0u8; 64];
-                    let nread = unsafe { kq::read(self.wakeup_read, buf.as_mut_ptr(), buf.len()) };
+                    let nread = sys::read(self.wakeup_read, &mut buf);
                     if nread > 0 && buf[..nread as usize].contains(&0xFF) {
                         shutdown = true;
                     }
@@ -1425,16 +1502,98 @@ impl NetPoller {
                 break;
             }
 
-            // A host socket has data — kick the vcpu so the VM loop polls.
-            Vcpu::force_exit(&[self.vcpu_id]).ok();
+            // A host socket has data — kick the vCPU so the VM loop polls.
+            (self.wake)();
         }
 
         // Cleanup
-        unsafe {
-            kq::close(self.kq);
-            kq::close(self.wakeup_read);
-            kq::close(self.wakeup_write);
+        sys::close(self.kq);
+        sys::close(self.wakeup_read);
+        sys::close(self.wakeup_write);
+    }
+
+    /// Linux event loop (poll(2)). TCP sockets are kept in `self.sockets`
+    /// and polled together with the wakeup pipe and the DNS socket; sockets
+    /// closed by the VM thread (POLLNVAL) are dropped from the set.
+    #[cfg(target_os = "linux")]
+    fn run_poll(mut self) {
+        loop {
+            // Pick up newly-established TCP sockets that the VM thread sent.
+            while let Ok(fd) = self.fd_rx.try_recv() {
+                if !self.sockets.contains(&fd) {
+                    self.sockets.push(fd);
+                }
+            }
+
+            let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(self.sockets.len() + 2);
+            pfds.push(libc::pollfd {
+                fd: self.wakeup_read,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            pfds.push(libc::pollfd {
+                fd: self.dns_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            for &fd in &self.sockets {
+                pfds.push(libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+            if n <= 0 {
+                continue; // spurious wakeup or EINTR
+            }
+
+            let mut shutdown = false;
+            let mut invalid = false;
+            for p in &pfds {
+                if p.revents == 0 {
+                    continue;
+                }
+                if p.fd == self.wakeup_read {
+                    // Drain the pipe and check for the shutdown sentinel (0xFF).
+                    let mut buf = [0u8; 64];
+                    let nread = sys::read(self.wakeup_read, &mut buf);
+                    if nread > 0 && buf[..nread as usize].contains(&0xFF) {
+                        shutdown = true;
+                    }
+                    // Non-shutdown wakeups (e.g. new fd to register) just
+                    // cause us to loop back and pick up the fd from fd_rx.
+                } else if p.revents & libc::POLLNVAL != 0 {
+                    invalid = true;
+                }
+            }
+
+            if shutdown {
+                break;
+            }
+            if invalid {
+                // A socket was closed by the VM thread; drop it from the set
+                // so we do not spin on POLLNVAL.
+                self.sockets.retain(|&fd| {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: 0,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 0) };
+                    pfd.revents & libc::POLLNVAL == 0
+                });
+                continue;
+            }
+
+            // A host socket has data — kick the vCPU so the VM loop polls.
+            (self.wake)();
         }
+
+        // Cleanup
+        sys::close(self.wakeup_read);
+        sys::close(self.wakeup_write);
     }
 }
 
@@ -1442,5 +1601,5 @@ impl NetPoller {
 /// This is called when UserNet is dropped (i.e. VM shutdown).
 fn signal_poller_shutdown(wakeup_fd: RawFd) {
     let byte: u8 = 0xFF;
-    unsafe { kq::write(wakeup_fd, &byte, 1) };
+    sys::write(wakeup_fd, byte);
 }

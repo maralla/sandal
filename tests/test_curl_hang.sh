@@ -12,6 +12,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The guest is an arm64 VM: skip (do not fail) on hosts that cannot run it.
+case "$(uname -m)" in
+    aarch64 | arm64 | x86_64) ;;
+    *)
+        echo "test_curl_hang: SKIP: host cannot run the guest (machine=$(uname -m))"
+        exit 0
+        ;;
+esac
+
 ITERATIONS=${1:-10}
 DISK_SIZE=${2:-128}
 PORT=18199
@@ -48,7 +57,7 @@ sleep 0.3
 echo "=== curl-hang stress test: ${ITERATIONS} iterations, disk_size=${DISK_SIZE}MB ==="
 
 for i in $(seq 1 "$ITERATIONS"); do
-    if expect tests/test_curl_hang.exp "$DISK_SIZE" 2>/tmp/sandal_test_stderr; then
+    if expect tests/test_fetch_hang.exp "$DISK_SIZE" 2>/tmp/sandal_test_stderr; then
         PASS=$((PASS + 1))
         printf "  [%2d/%d] PASS\n" "$i" "$ITERATIONS"
     else

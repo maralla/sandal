@@ -48,7 +48,7 @@ def main() -> None:
                 "echo \"MAXSZ $(cat /sys/block/vda/queue/max_segment_size)\"; "
                 "echo \"RNG1 $(dd if=/dev/hwrng bs=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1)\"; "
                 "echo \"RNG2 $(dd if=/dev/hwrng bs=32 count=1 2>/dev/null | md5sum | cut -d' ' -f1)\"; "
-                "echo DEVICES_DONE",
+                "echo DEVICES\"\"_DONE",
                 "DEVICES_DONE",
             )
         finally:

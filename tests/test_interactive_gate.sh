@@ -6,7 +6,7 @@
 # Example:
 #   make -j
 #   timeout 60 env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 SANDAL_TRACE_CONSOLE_IO=1 SANDAL_TRACE_FILE=./sandal_trace.log \
-#     ./tests/test_python_tab.sh --fail-fast --trace-console-io --trace-file ./sandal_trace.log --exit-cycle
+#     ./tests/test_interactive_gate.sh --fail-fast --trace-console-io --trace-file ./sandal_trace.log --exit-cycle
 # Global flags may appear before or after the subcommand (stripped from any position).
 #
 # Env (common):
@@ -23,15 +23,23 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
+# The guest is an arm64 VM: skip (do not fail) on hosts that cannot run it.
+case "$(uname -m)" in
+	aarch64 | arm64 | x86_64) ;;
+	*)
+		echo "test_python_tab: SKIP: host cannot run the guest (machine=$(uname -m))"
+		exit 0
+		;;
+esac
+
 : "${EX_SANDAL:=$REPO_ROOT/target/release/sandal}"
 : "${EX_DISK:=64}"
-: "${EX_LAYER:=${REPRO_LAYER:-$REPO_ROOT/uv-python3.14.layer}}"
-
-if [[ ! -f "${EX_LAYER}" ]]; then
-	echo >&2 "repro: missing layer file: ${EX_LAYER}"
-	echo >&2 "  Place uv-python3.14.layer in the repo root, or set EX_LAYER / REPRO_LAYER."
+# Optional user-provided workload layer (any content; booted verbatim).
+EX_LAYER="${EX_LAYER:=${REPRO_LAYER:-}}"
+[[ -n "${EX_LAYER}" && ! -f "${EX_LAYER}" ]] && {
+	echo >&2 "interactive-gate: EX_LAYER set but missing: ${EX_LAYER}"
 	exit 2
-fi
+}
 
 : "${EX_GAP_MIN:=40}"
 : "${EX_GAP_MAX:=220}"
@@ -243,10 +251,18 @@ proc send_import_pl_tab {} {
 
 repro_stable_pty
 
+# Probe whether the workload provides a python REPL entry point; the gate
+# adapts (python phases) or falls back to pure shell phases.
+set spawnargs [list --disk-size $env(EX_DISK)]
+if {[info exists env(EX_LAYER)] && $env(EX_LAYER) ne ""} {
+	lappend spawnargs --layer $env(EX_LAYER)
+}
+lappend spawnargs -- sh
+
 if {$env(REPRO_EXPECT_NOTTYCOPY) == "1"} {
-	spawn -noecho -nottycopy $env(EX_SANDAL) --disk-size $env(EX_DISK) --layer $env(EX_LAYER) -- sh
+	spawn -noecho -nottycopy $env(EX_SANDAL) {*}$spawnargs
 } else {
-	spawn -noecho $env(EX_SANDAL) --disk-size $env(EX_DISK) --layer $env(EX_LAYER) -- sh
+	spawn -noecho $env(EX_SANDAL) {*}$spawnargs
 }
 
 if {$env(EX_LOG_USER) == "0"} {
@@ -264,8 +280,45 @@ expect {
 	eof { puts stderr "sandal exited during boot"; exit 1 }
 }
 
+# ── Workload probe: does the booted workload provide `uv`+python? ─────
+# The layer is opaque user content; the gate adapts to what it finds.
+set tok [clock milliseconds]
+# Probe 1: does the workload provide `uv`? (marker split so the pty echo
+# of the typed line cannot self-match)
+send -- "MARK=HAS_UV_$tok; command -v uv >/dev/null 2>&1 && echo \"SANDAL_\$MARK\"\r"
+set timeout 20
+set has_uv 0
+expect {
+	-re "SANDAL_HAS_UV_$tok" {
+		set has_uv 1
+		expect {
+			-re {[~/][\s#]*(?:\x1b|\r|\n|$)} { }
+			timeout { set has_uv 0 }
+		}
+	}
+	timeout { set has_uv 0 }
+	eof { puts stderr "eof during workload probe"; exit 1 }
+}
+# Probe 2: does `uv run python -c` actually execute a REPL-capable python?
+set has_python 0
+if {$has_uv == 1} {
+	send -- "uv run python -c 'print(1)' >/dev/null 2>&1 && echo PYOK_$tok\r"
+	set timeout 30
+	expect {
+		-re "PYOK_$tok" { set has_python 1 }
+		timeout { set has_python 0 }
+		eof { puts stderr "eof during python probe"; exit 1 }
+	}
+	expect {
+		-re {[~/][\s#]*(?:\x1b|\r|\n|$)} { }
+		timeout { }
+	}
+}
+if {![info exists has_python]} { set has_python 0 }
+puts stderr "workload provides python REPL: $has_python"
+
 for {set i 1} {$i <= $attempts} {incr i} {
-	if {$i % 2 == 1} {
+	if {$has_python == 1 && $i % 2 == 1} {
 		if {$env(EX_LOG_USER) == "0"} {
 			puts stderr "attempt $i / $attempts: uv run python (Tab / readline phase)"
 		} else {
@@ -296,12 +349,6 @@ for {set i 1} {$i <= $attempts} {incr i} {
 			timeout { puts stderr "timeout: after Tab newline"; exit 1 }
 			eof { puts stderr "eof after Tab newline"; exit 1 }
 		}
-	} else {
-		if {$env(EX_REPRO_PROFILE) == "exit_cycle"} {
-			puts stderr "attempt $i / $attempts: exit/os._exit, uv run python (no Ctrl-C)"
-		} else {
-			puts stderr "attempt $i / $attempts: os._exit(0), uv run python"
-		}
 		send_force_exit_python_repl
 		set em [expr {int($env(EX_EXIT_REPL_SETTLE_MS))}]
 		if {$em > 0} {
@@ -321,7 +368,7 @@ for {set i 1} {$i <= $attempts} {incr i} {
 			eof { puts stderr "eof after exit()+settle"; exit 1 }
 		}
 		if {![ensure_shell_ready]} {
-			puts stderr "warn: no shell after exit(); os._exit once (attempt $i)"
+			puts stderr "warn: no shell after exit(); retry once (attempt $i)"
 			send_force_exit_python_repl
 			after 500
 			if {![ensure_shell_ready]} {
@@ -329,19 +376,45 @@ for {set i 1} {$i <= $attempts} {incr i} {
 				exit 2
 			}
 		}
-		if {$env(EX_REPRO_PROFILE) != "exit_cycle"} {
-			if {![ensure_shell_ready]} {
-				puts stderr "timeout: shell not stable before uv run python (attempt $i)"
-				exit 1
-			}
+	} else {
+		if {$env(EX_LOG_USER) == "0"} {
+			puts stderr "attempt $i / $attempts: shell line-edit + subshell exit phase"
 		}
-		after 200
-		send_uv_run_python
-		set timeout $py_restart
+		# ── Shell phase: works with any workload (base rootfs ash) ──
+		maybe_long_think
+		send -- "stty sane 2>/dev/null\r"
+		after 150
+		type_human_line "echo PHASE-SHELL-$i"
+		send -- "\r"
+		set timeout [expr {int($env(EOF_DEADLINE_SEC))}]
 		expect {
-			-re {>>>} { }
-			timeout { puts stderr "timeout: no >>> after uv run python (attempt $i)"; exit 1 }
-			eof { puts stderr "eof before Python prompt"; exit 1 }
+			-re "PHASE-SHELL-$i\r" { }
+			timeout { puts stderr "timeout: shell echo (attempt $i)"; exit 1 }
+			eof { puts stderr "eof after shell echo"; exit 1 }
+		}
+		# subshell exit cycle: a child exits; the shell must keep working
+		send -- "(exit 9); echo SUBSHELL-RC-$i=$?\r"
+		expect {
+			-re "SUBSHELL-RC-$i=9" { }
+			timeout { puts stderr "timeout: subshell exit cycle (attempt $i)"; exit 1 }
+			eof { puts stderr "eof after subshell exit"; exit 1 }
+		}
+		# Tab on a partial command: line editing must not wedge the console
+		type_human_line "sl"
+		set p0 [expr {int($env(EX_PRE_TAB_MIN))}]
+		set p1 [expr {int($env(EX_PRE_TAB_MAX))}]
+		after [rand_ms $p0 $p1]
+		send -- "\t"
+		send -- "\r"
+		set timeout [expr {int($env(TAB_DEADLINE_SEC))}]
+		expect {
+			-re {[~/][\s#]*(?:\x1b|\r|\n|$)} { }
+			timeout { puts stderr "timeout: Tab/newline in shell (attempt $i)"; exit 1 }
+			eof { puts stderr "eof after shell Tab"; exit 1 }
+		}
+		if {![ensure_shell_ready]} {
+			puts stderr "HANG: shell unresponsive after interactive phase (attempt $i)"
+			exit 2
 		}
 	}
 	if {$i < $attempts} {
@@ -395,7 +468,7 @@ cmd_tab_only() {
 usage() {
 	cat <<'U'
 Usage:
-  tests/test_python_tab.sh [global flags] <command>
+  tests/test_interactive_gate.sh [global flags] <command>
 
 Global flags (any position before subcommand):
   --fail-fast

@@ -59,13 +59,17 @@ impl Vcpu {
     }
 
     /// Hypervisor vCPU handle.
+    #[allow(dead_code)] // hvf kick API (net wake path)
     pub fn id(&self) -> HvVcpu {
         self.id
     }
 
     /// Force one or more vCPUs out of `hv_vcpu_run` (returns a CANCELED exit).
-    /// Used by the network poller to wake an idle guest.
+    /// Used by the network poller to wake an idle guest. Currently
+    /// unwired (the macOS run loops poll the backend after every exit);
+    /// kept as the documented HVF kick primitive.
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)]
     pub fn force_exit(vcpu_ids: &[u64]) -> Result<()> {
         let ret =
             unsafe { hv_vcpus_exit_wrapper(vcpu_ids.as_ptr() as *mut _, vcpu_ids.len() as u32) };

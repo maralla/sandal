@@ -16,7 +16,7 @@ impl Vm {
         }
 
         // HVF's native GIC (`hv_gic_create`) is intentionally not used; the
-        // software GIC lives in `src/gic.rs` (see docs/vmm-spec.md §1.1/§1.3).
+        // software GIC lives in this module's `gic.rs` (see docs/vmm-spec.md §1.1/§1.3).
         // The guest's arch timer depends on the documented vtimer mask flow:
         // HVF masks the vtimer on HV_EXIT_REASON_VTIMER_ACTIVATED, and it may
         // only be unmasked once the guest has serviced INTID 27 (unmasking

@@ -10,8 +10,8 @@
 //! A set of declarative macros (defined in `elf/macros.rs`) makes the
 //! builder read like ARM64 assembly rather than raw instruction emission.
 
-use crate::elf::arm64::*;
-use crate::elf::linux::*;
+use crate::elf::aarch64::*;
+use crate::elf::aarch64_linux::*;
 use crate::elf::ElfBuilder;
 use crate::initramfs;
 

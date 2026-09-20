@@ -1,9 +1,10 @@
-/// Virtio-net device implementation.
-///
-/// Provides a paravirtualized network interface to the guest using the
-/// virtio MMIO transport. The backend is a user-space network stack that
-/// proxies TCP, UDP, ICMP, ARP, and DHCP through host-side BSD sockets
-/// without requiring root privileges.
+//! Virtio-net device implementation.
+//!
+//! Provides a paravirtualized network interface to the guest using the
+//! virtio MMIO transport. The backend is a user-space network stack that
+//! proxies TCP, UDP, ICMP, ARP, and DHCP through host-side BSD sockets
+//! without requiring root privileges.
+
 use super::*;
 use crate::net::NetworkFilter;
 use crate::unet::{NetPoller, UserNet};
@@ -217,9 +218,21 @@ impl VirtioNetDevice {
         }
     }
 
-    /// Create a kqueue-based network poller for the user-space networking backend.
-    pub fn create_poller(&mut self, vcpu_id: u64) -> NetPoller {
-        self.backend.create_poller(vcpu_id)
+    /// Create a network poller for the user-space networking backend. `wake`
+    /// is called by the poller thread when a host socket becomes readable (to
+    /// kick the vCPU: force-exit on HVF, IRQ-line raise on KVM).
+    /// kqueue/pipe poller for the macOS HVF wake path (unused on Linux,
+    /// where the run loops poll the backend after every exit).
+    #[allow(dead_code)]
+    pub fn create_poller(&mut self, wake: Box<dyn Fn() + Send>) -> NetPoller {
+        self.backend.create_poller(wake)
+    }
+
+    /// Whether the backend still holds packets that could not be delivered to
+    /// the guest (no RX buffers available). Used to keep the IRQ line asserted.
+    #[cfg(target_os = "linux")]
+    pub fn has_packets(&self) -> bool {
+        self.backend.has_packets()
     }
 
     /// Poll the network backend for incoming data.

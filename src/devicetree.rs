@@ -157,6 +157,14 @@ impl DeviceTree {
         // The arch timer counter runs at the host 24 MHz. Advertising it lets
         // the kernel's arch_timer driver compute correct delay/clockevent
         // targets even if CNTFRQ_EL0 reads as 0 from the vCPU.
+        //
+        // Only on HVF: there the VMM owns the vtimer and the guest reads a
+        // 24 MHz Apple Silicon counter. Under KVM the counter frequency is
+        // the host's CNTFRQ (e.g. 50 MHz on Ampere), reported to the guest
+        // by KVM itself — hard-coding a value here would desynchronize the
+        // guest timer, so the property is omitted and the driver uses
+        // CNTFRQ_EL0.
+        #[cfg(target_os = "macos")]
         dt.prop_u32("clock-frequency", 24_000_000);
         let mut timer_irqs = Vec::new();
         for ppi in &[13u32, 14, 11, 10] {

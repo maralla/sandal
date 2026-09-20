@@ -3,6 +3,12 @@
 //! All functions are `const fn` — they are pure arithmetic and can be
 //! evaluated at compile time.
 
+// The ELF builder helpers (arm64) is an intentionally complete reference toolkit: crafted
+// guest binaries use subsets of it, and unused entries document the
+// surrounding UAPI surface.
+#![allow(dead_code)]
+#![allow(unused_macros)]
+
 // ── Move instructions ───────────────────────────────────────────────────
 
 /// `MOVN Xd, #imm16` — move wide with NOT (64-bit).

@@ -1,0 +1,60 @@
+# sandal x86_64 guest kernel fragment (applied over x86_64_defconfig).
+#
+# The VMM is a KVM userspace VMM with:
+#   - PVH direct boot (ELF vmlinux, hvm_start_info) — no firmware
+#   - virtio-mmio devices registered via the `virtio_mmio.device=` cmdline
+#     parameter (no PCI bus emulation), IRQs from the legacy ISA range
+#     (delivered through the in-kernel i8259 PIC / IOAPIC GSI 0-15)
+#   - virtio-console (hvc0) as the interactive console, 8250 for earlycon
+#   - ext2 (via ext4 driver) root on /dev/vda, overlayfs upper on /dev/vdb
+#   - virtiofs (FUSE) for --share directories, virtio-rng for entropy
+
+# ── PVH direct boot ─────────────────────────────────────────────────────
+CONFIG_PVH=y
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_KVM_GUEST=y
+# Deterministic boot: the ELF entry point is the load address.
+CONFIG_RANDOMIZE_BASE=n
+
+# ── virtio (mmio transport only, no PCI) ────────────────────────────────
+CONFIG_PCI=n
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_RNG=y
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+CONFIG_VIRTIO_FS=y
+CONFIG_FUSE_FS=y
+
+# ── networking (user-space NAT behind virtio-net) ───────────────────────
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_UNIX=y
+CONFIG_IPV6=y
+
+# ── filesystems ─────────────────────────────────────────────────────────
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_USE_FOR_EXT2=y
+CONFIG_OVERLAY_FS=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+
+# ── console ─────────────────────────────────────────────────────────────
+CONFIG_TTY=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_VT=n
+
+# ── keep it small ───────────────────────────────────────────────────────
+CONFIG_MODULES=n
+CONFIG_DEBUG_INFO_NONE=y
+# No firmware / ACPI on the PVH path; avoid probing noise.
+CONFIG_ACPI=n

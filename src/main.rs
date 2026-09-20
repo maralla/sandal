@@ -1,12 +1,13 @@
 mod cli;
+#[cfg(target_arch = "aarch64")]
 mod devicetree;
 #[macro_use]
 mod elf;
 mod ext2;
-mod gic;
 mod hypervisor;
 mod init;
 mod initramfs;
+mod irqs;
 mod net;
 mod rootfs;
 mod tar;
@@ -51,13 +52,13 @@ fn run_vm(args: Args) -> Result<()> {
         .format_target(false)
         .init();
 
-    // Ensure we're running on macOS
-    #[cfg(not(target_os = "macos"))]
+    // Check we're running on a supported host.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        anyhow::bail!("sandal only supports macOS");
+        anyhow::bail!("sandal only supports macOS (Hypervisor.framework) and Linux (KVM)");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let code = vm::run(args)?;
         std::process::exit(code);

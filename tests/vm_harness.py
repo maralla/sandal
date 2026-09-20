@@ -2,13 +2,16 @@
 """Shared pty harness for the sandal integration tests.
 
 Boots `target/release/sandal` on a pty and provides helpers to send guest
-shell commands and wait for their output.  Requires the codesigned release
-binary (`make`) and macOS/HVF.
+shell commands and wait for their output.  Requires the built release binary
+(`make`) and a supported host: macOS/HVF on Apple Silicon, Linux/arm64 with
+/dev/kvm, or Linux/x86_64 with /dev/kvm.
 """
 
 import fcntl
 import os
 import pathlib
+import re
+import platform
 import select
 import struct
 import subprocess
@@ -86,13 +89,16 @@ class Vm:
         command: str,
         marker: str,
         timeout: float = CMD_TIMEOUT,
-        count: int = 2,
+        count: int = 1,
     ) -> str:
         """Send one shell command; return output up to `marker`.
 
-        `count` is the number of marker occurrences to wait for: 2 for a
-        marker printed by the command (echo + result), 1 for output-only
-        markers that are not part of the echoed command line.
+        The wait is line-anchored: only a marker at the start of a line
+        counts (the guest echoes the command, which may wrap and split or
+        repeat marker substrings inside the echoed text). Markers must
+        therefore never appear verbatim inside the command — split them in
+        the command text (e.g. `echo DONE""_1`) so only the real output can
+        match.
         """
         origin = len(self.buf)
         self.send_line(command)
@@ -121,8 +127,37 @@ class Vm:
             pass
 
 
+def host_can_run_vm() -> bool:
+    """True when this machine can actually execute the arm64 guest.
+
+    The sandal guest is an arm64 Linux VM, so integration tests need an
+    arm64 host: macOS on Apple Silicon (HVF), or Linux on arm64 with an
+    accessible /dev/kvm. On other hosts (e.g. x86_64 CI runners) the VM
+    cannot start, and tests skip instead of failing.
+    """
+    machine = platform.machine().lower()
+    if machine not in ("aarch64", "arm64", "x86_64"):
+        return False
+    if sys.platform == "darwin":
+        return machine in ("aarch64", "arm64")
+    if sys.platform.startswith("linux"):
+        return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    return False
+
+
+def skip_reason() -> str:
+    machine = platform.machine().lower()
+    return (
+        "host cannot run the guest "
+        "(needs macOS/Apple Silicon, Linux/arm64 with /dev/kvm, or Linux/x86_64 with /dev/kvm)"
+    )
+
+
 def test_main(name: str, fn) -> int:
     """Run a test body, printing `test_<name>: PASS`/`FAIL`."""
+    if not host_can_run_vm():
+        print(f"test_{name}: SKIP: {skip_reason()}")
+        return 0
     if not SANDAL.is_file():
         print(f"error: {SANDAL} not found; run `make` first", file=sys.stderr)
         return 2

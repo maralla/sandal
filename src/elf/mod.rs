@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use crate::elf::arm64::*;
+//! use crate::elf::aarch64::*;
 //! use crate::elf::ElfBuilder;
 //!
 //! const BINARY: ([u8; ElfBuilder::MAX_ELF], usize) = {
@@ -19,13 +19,20 @@
 //! // BINARY.0[..BINARY.1] is the valid ELF.
 //! ```
 
+#![allow(dead_code)]
+#![allow(unused_macros)]
 #[macro_use]
 mod macros;
-pub mod linux;
+pub mod aarch64_linux;
 
-pub mod arm64;
+pub mod aarch64;
+pub mod x86_64;
+pub mod x86_64_linux;
 
 // ── Helpers for writing little-endian values in const context ────────────
+// Part of the crafted-binary toolkit; individual helpers are used by the
+// arm64 builder (and reserved for future guests). Unused ones are expected
+// (see the module-level allow at the top of this file).
 
 /// Write a little-endian u16 into `$buf` at `$pos`, advancing `$pos`.
 macro_rules! write_le_u16 {
@@ -85,6 +92,7 @@ macro_rules! write_le_u64 {
 /// };
 /// // BINARY.0[..BINARY.1] is the valid ELF bytes.
 /// ```
+#[cfg(target_arch = "aarch64")]
 pub struct ElfBuilder {
     code: [u8; Self::MAX_CODE],
     code_len: usize,
@@ -95,6 +103,7 @@ pub struct ElfBuilder {
     fixup_count: usize,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl ElfBuilder {
     pub const MAX_CODE: usize = 4096;
     pub const MAX_DATA: usize = 2048;
@@ -169,7 +178,7 @@ impl ElfBuilder {
     /// The actual PC-relative offset is patched during [`build`].
     pub const fn emit_adr_data(&mut self, rd: u32, data_offset: usize) {
         let code_offset = self.code_len;
-        self.emit(arm64::nop());
+        self.emit(aarch64::nop());
         self.fixups[self.fixup_count] = (code_offset, rd, data_offset);
         self.fixup_count += 1;
     }
@@ -178,7 +187,7 @@ impl ElfBuilder {
     /// Use with [`patch`] for forward branches.
     pub const fn emit_placeholder(&mut self) -> usize {
         let offset = self.code_len;
-        self.emit(arm64::nop());
+        self.emit(aarch64::nop());
         offset
     }
 
@@ -206,7 +215,7 @@ impl ElfBuilder {
         while i < self.fixup_count {
             let (code_off, rd, data_off) = self.fixups[i];
             let byte_offset = (code_len - code_off) + data_off;
-            let insn = arm64::adr_x(rd, byte_offset as i32);
+            let insn = aarch64::adr_x(rd, byte_offset as i32);
             let bytes = insn.to_le_bytes();
             self.code[code_off] = bytes[0];
             self.code[code_off + 1] = bytes[1];

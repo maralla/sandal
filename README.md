@@ -1,8 +1,13 @@
 # Sandal
 
-A high-performance, lightweight sandbox for running untrusted code securely on macOS Apple Silicon.
+A high-performance, lightweight sandbox for running untrusted code securely.
 
 Sandal executes commands in a hardware-isolated environment with sub-second startup, full network access, and an interactive terminal — all without requiring root privileges.
+
+It runs on two hypervisor backends:
+
+- **macOS** on Apple Silicon via Hypervisor.framework (software GIC, see `docs/vmm-spec.md`)
+- **Linux** on arm64 via KVM (in-kernel GICv3/vtimer)
 
 ## Features
 
@@ -35,7 +40,9 @@ make
 
 ## Requirements
 
-- macOS 11.0+ on Apple Silicon (M1/M2/M3/M4)
+- macOS 11.0+ on Apple Silicon (M1/M2/M3/M4), or
+- Linux on arm64 with `/dev/kvm` available (user must have access, e.g. be in
+  the `kvm` group). No root privileges required.
 
 ## License
 

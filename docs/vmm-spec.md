@@ -1,10 +1,18 @@
 # VMM Specification — sandal on Apple Hypervisor.framework
 
-**Purpose.** Single source of truth for the VMM implementation (`src/vm.rs`,
-`src/gic.rs`, `src/hypervisor/`). It is derived from authoritative sources —
-Apple's Hypervisor.framework API/headers, the ARM Architecture Reference Manual
-(generic timer, GICv3, WFI), and the Linux arm64 boot/driver requirements — and
-documents the design that is actually implemented.
+**Purpose.** Single source of truth for the HVF backend (`src/vm.rs`
+`run_loop_hvf`, and the HVF backend under `src/hypervisor/hvf/`). It is derived
+from authoritative sources — Apple's Hypervisor.framework API/headers, the ARM
+Architecture Reference Manual (generic timer, GICv3, WFI), and Linux arm64
+boot/driver requirements — and documents the design that is actually
+implemented.
+
+The Linux/KVM backend (`src/hypervisor/kvm/`, `run_loop_kvm`) follows a
+different contract: the GICv3 (VGIC) and the virtual timer are emulated
+in-kernel, device interrupts are level lines driven via `KVM_IRQ_LINE`, WFI
+blocks inside `KVM_RUN`, the BRK protocol arrives as `KVM_EXIT_DEBUG`, and
+PSCI shutdown as `KVM_EXIT_SYSTEM_EVENT`. See the module documentation in
+`src/hypervisor/kvm/mod.rs` for the full model.
 
 ---
 
@@ -97,7 +105,7 @@ emulated in software by the VMM**.
 
 ### 2.2 GICv3 (software emulation, subset sufficient for Linux)
 
-`src/gic.rs` implements enough of the GICv3 for Linux's `gic-v3` driver:
+`src/hypervisor/hvf/gic.rs` implements enough of the GICv3 for Linux's `gic-v3` driver:
 
 - **Distributor (GICD) MMIO:** CTLR, TYPER, IIDR, PIDR0–4; IGROUPR,
   ISENABLER/ICENABLER, ISPENDR/ICPENDR, ISACTIVER/ICACTIVER, IGRPMODR,
@@ -125,7 +133,7 @@ emulated in software by the VMM**.
   virtio-net = SPI 16 (INTID 48), virtio-console = SPI 17 (49),
   root virtio-blk = SPI 18 (50), data virtio-blk = SPI 19 (51),
   virtio-rng = SPI 20 (52), virtio-fs devices = SPI 21+*i* (53+*i*, one per
-  `--share`).  `src/gic.rs` owns the SPI constants; the DTB passes the SPI
+  `--share`).  `src/irqs.rs` owns the SPI constants; the DTB passes the SPI
   number in the second interrupt cell.
 
 ### 2.3 WFI

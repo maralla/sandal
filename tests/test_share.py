@@ -7,7 +7,8 @@ Boots the sandal VM with a virtiofs share and verifies both directions:
   * guest -> host: the guest creates files (incl. a nested directory) and the
     host sees them with the expected content.
 
-Requires the codesigned release binary (`make`) and macOS/HVF.
+Requires the codesigned release binary (`make`) and a host that can run the
+guest (see `vm_harness.host_can_run_vm`).
 
 Usage (from the repo root, after `make`):
     uv run python tests/test_share.py
@@ -51,7 +52,7 @@ def main() -> None:
 
             print("share: host -> guest read...")
             out = vm.run(
-                f"cat {GUEST_PATH}/host_to_guest.txt; echo READ_DONE",
+                f"cat {GUEST_PATH}/host_to_guest.txt; echo READ\"\"_DONE",
                 "READ_DONE",
             )
             if HOST_MARKER not in out:
@@ -62,7 +63,7 @@ def main() -> None:
                 f"echo {GUEST_MARKER} > {GUEST_PATH}/from_guest.txt; "
                 f"mkdir -p {GUEST_PATH}/sub; "
                 f"echo {GUEST_MARKER}_nested > {GUEST_PATH}/sub/nested.txt; "
-                "sync; echo WRITE_DONE",
+                "sync; echo WRITE\"\"_DONE",
                 "WRITE_DONE",
             )
         finally:

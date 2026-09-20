@@ -1,5 +1,11 @@
 //! Linux aarch64 syscall numbers and kernel constants.
 
+// The Linux/arm64 UAPI tables is an intentionally complete reference toolkit: crafted
+// guest binaries use subsets of it, and unused entries document the
+// surrounding UAPI surface.
+#![allow(dead_code)]
+#![allow(unused_macros)]
+
 // ── Syscall numbers (aarch64) ──────────────────────────────────────────
 pub mod nr {
     pub const DUP3: u32 = 24;
