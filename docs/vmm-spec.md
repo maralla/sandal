@@ -187,7 +187,9 @@ The exit carries a syndrome. The VMM handles:
   buffer is reused instead of allocated per packet.
 - **Console:** the host terminal is switched to raw mode on startup and restored
   on exit, so every keystroke (Tab, CSI replies, partial lines) reaches the
-  guest instead of being line-buffered by the host tty.
+  guest instead of being line-buffered by the host tty.  The user command is
+  started with **cwd = the guest home** (`/root`, matching `HOME`), so an
+  interactive shell opens in `~` instead of `/`.
 - **Guest init protocol:** `/init` uses `BRK #imm` for its config blob and for
   `sandal-export`; `SANDAL_EXIT:` / `SANDAL_EXPORT_PATH:` console markers are
   intercepted by the VMM (detected at any position in the line, with

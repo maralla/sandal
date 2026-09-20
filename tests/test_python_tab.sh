@@ -257,8 +257,8 @@ set py_restart [expr {int($env(EX_PY_RESTART))}]
 set attempts [expr {int($env(EX_ATTEMPTS))}]
 
 expect {
-	# Root ash is often `/ # ` with a DSR `\033[6n` (or similar) appended — `/[\s#]*$` never matches.
-	-re {/[\s#]*(?:\x1b|\r|\n|$)} { }
+	# Root ash is `~ # `/`/ # ` (HOME=/root) with a DSR `\033[6n` appended.
+	-re {[~/][\s#]*(?:\x1b|\r|\n|$)} { }
 	-re {>>>} { }
 	timeout { puts stderr "timeout: boot / shell prompt"; exit 1 }
 	eof { puts stderr "sandal exited during boot"; exit 1 }
@@ -314,9 +314,9 @@ for {set i 1} {$i <= $attempts} {incr i} {
 		if {$sw < 8} { set sw 8 }
 		set timeout $sw
 		expect {
-			-re {\r?\n.*?/\s*#\s} { }
+			-re {\r?\n.*?[~/]\s*#\s} { }
 			timeout {
-				puts stderr "warn: no ash \`/ #\` seen after exit+settle (attempt $i); continuing to shell probe"
+				puts stderr "warn: no shell prompt seen after exit+settle (attempt $i); continuing to shell probe"
 			}
 			eof { puts stderr "eof after exit()+settle"; exit 1 }
 		}

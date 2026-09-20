@@ -18,7 +18,7 @@ spawn $binary --disk-size $disk_size --layer curl.layer -- sh
 
 # Wait for shell prompt
 expect {
-    "/ #" {}
+    -re {[~/] #} {}
     timeout { puts stderr "FAIL: timeout waiting for shell prompt"; exit 1 }
 }
 
@@ -32,7 +32,7 @@ foreach c [split $cmd ""] {
 # Wait for any response that indicates curl ran (success or error)
 expect {
     -re "SANDAL_TEST_OK|HTTP|html|<!" { exit 0 }
-    "/ #" { exit 0 }
+    -re {[~/] #} { exit 0 }
     "curl:" { exit 0 }
     timeout { puts stderr "FAIL: curl hung (disk_size=${disk_size}MB)"; exit 1 }
 }

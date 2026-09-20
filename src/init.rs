@@ -49,6 +49,7 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         s_tmpfs = "tmpfs",
         s_tmp_path = "/tmp",
         s_slash = "/",
+        s_home = "/root",
         s_dot = ".",
         s_mnt_lower = initramfs::MNT_LOWER,
         s_mnt_overlay = initramfs::MNT_OVERLAY,
@@ -313,6 +314,9 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     str_x!(e, x0, x9, 0);
     add!(e, x9, x9, 8);
     str_x!(e, XZR, x9, 0); // envp NULL
+
+    // Start the command in the guest home directory (HOME=/root).
+    chdir!(e, s_home);
 
     fork!(e);
 

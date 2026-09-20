@@ -18,7 +18,7 @@ import time
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SANDAL = REPO_ROOT / "target" / "release" / "sandal"
-PROMPT = b"/ #"
+PROMPTS = (b"~ #", b"/ #")
 BOOT_TIMEOUT = 90.0
 CMD_TIMEOUT = 30.0
 
@@ -69,6 +69,15 @@ class Vm:
             self.read_more(0.2)
         return self.buf.count(needle) >= count
 
+    def wait_for_any(self, needles, timeout: float) -> bool:
+        """Wait until any of `needles` has appeared at least once."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if any(n in self.buf for n in needles):
+                return True
+            self.read_more(0.2)
+        return any(n in self.buf for n in needles)
+
     def send_line(self, line: str) -> None:
         os.write(self.master, line.encode() + b"\r")
 
@@ -92,7 +101,7 @@ class Vm:
         return self.buf[origin:].decode("utf-8", "replace")
 
     def boot(self, label: str = "boot") -> None:
-        if not self.wait_for(PROMPT, 1, BOOT_TIMEOUT):
+        if not self.wait_for_any(PROMPTS, BOOT_TIMEOUT):
             raise AssertionError(f"{label}: shell prompt did not appear")
         # Give the shell a moment to settle at the prompt.
         time.sleep(0.5)
