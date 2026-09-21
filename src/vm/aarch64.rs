@@ -72,7 +72,11 @@ impl Vmm {
             GICD_SIZE as usize,
             GICR_BASE,
             GICR_SIZE as usize,
-            self.net.as_ref().map(|_| (VIRTIO_NET_BASE, SPI_NET)),
+            self.net
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|_| (VIRTIO_NET_BASE, SPI_NET)),
             Some((VIRTIO_BLK_BASE, SPI_BLK)), // vda (root)
             self.data_blk
                 .as_ref()

@@ -114,7 +114,7 @@ impl Vmm {
         // probe noise (i8042, WMI, ...) stays in dmesg, not on screen.
         // (err-level and below are hidden; emerg/alert/crit still show.)
         let mut cmdline = String::from(
-            "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=7 random.trust_cpu=on nohz=off highres=off nokaslr",
+            "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on nohz=off highres=off nokaslr",
         );
         let mut devices: Vec<(u64, u32)> = vec![
             (VIRTIO_NET_BASE, ISA_IRQ_POOL[0]),
@@ -123,7 +123,7 @@ impl Vmm {
             (DATA_BLK_BASE, ISA_IRQ_POOL[3]),
             (VIRTIO_RNG_BASE, ISA_IRQ_POOL[4]),
         ];
-        if self.net.is_none() {
+        if self.net.lock().unwrap().is_none() {
             // Keep the mmio layout (and thus the cmdline) stable whether or
             // not networking is enabled: the device region stays reserved but
             // must not be described to the kernel.
@@ -143,7 +143,7 @@ impl Vmm {
         let mut described: Vec<(u64, u32)> = Vec::new();
         for (idx, (base, irq)) in devices.iter().enumerate() {
             let present = match idx {
-                0 => self.net.is_some(),
+                0 => self.net.lock().unwrap().is_some(),
                 1 => true,                          // console always present
                 2 => self.blk.is_some(),            // root blk
                 3 => self.data_blk.is_some(),       // data blk

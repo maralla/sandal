@@ -240,6 +240,18 @@ impl VirtioNetDevice {
         self.backend.poll();
     }
 
+    /// fds an event-driven poller should block on (see `UserNet::watch_fds`).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn watch_fds(&self) -> Vec<std::os::fd::RawFd> {
+        self.backend.watch_fds()
+    }
+
+    /// Drain the netstack's wakeup pipe.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn drain_wakeup(&self) {
+        self.backend.drain_wakeup();
+    }
+
     /// Process the TX queue: read packets from guest memory and send to backend.
     /// Returns true if the used ring was updated (interrupt needed).
     pub fn process_tx(&mut self, memory: &mut [u8], ram_base: u64) -> bool {

@@ -23,8 +23,10 @@ use super::{
 };
 use crate::hypervisor::{KvmExit, Vm};
 use crate::virtio::console::VirtioConsoleDevice;
+use crate::virtio::net::VirtioNetDevice;
 use anyhow::{anyhow, Result};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -70,7 +72,7 @@ impl Vmm {
             // Drain host input and network data into the guest, then mirror
             // the device state onto the SPI lines.
             {
-                if let Some(net) = self.net.as_mut() {
+                if let Some(net) = self.net.lock().unwrap().as_mut() {
                     net.poll_backend();
                     net.process_rx(self.memory.as_shared_slice(), RAM_BASE);
                 }
@@ -112,6 +114,8 @@ impl Vmm {
             SPI_RNG => self.rng.as_ref().is_some_and(|d| d.interrupt_status != 0),
             SPI_NET => self
                 .net
+                .lock()
+                .unwrap()
                 .as_ref()
                 .is_some_and(|d| d.interrupt_status != 0 || d.has_packets()),
             s if s >= SPI_FS_START && s < SPI_FS_START + MAX_FS_DEVICES as u32 => self
@@ -145,6 +149,125 @@ impl Vmm {
             }
         }
     }
+}
+
+/// Net kick thread: event-driven net backend pump.
+///
+/// Blocks in `epoll(7)` on the netstack's host sockets (TCP streams, DNS,
+/// wakeup pipe) instead of blindly polling, so an idle guest costs zero
+/// CPU and incoming data is noticed within microseconds. On any event it
+/// pumps the backend (delivering packets into the guest RX virtqueue) and
+/// pulses the net IRQ line; the lock is held across "pump + raise" so a
+/// concurrently-arriving packet can never be lowered away by the main
+/// loop's line update.
+///
+/// fd lifecycle: the netstack's wakeup pipe fires whenever a connection is
+/// established (and whenever data is stranded in the RX backlog), at which
+/// point the watch set is re-synced. Closed sockets are removed from the
+/// epoll set by the kernel automatically when their last fd reference is
+/// dropped; stale registrations are also pruned on every sync. The thread
+/// exits when `stop` is set (bounded by the 100 ms wait timeout).
+#[cfg(target_os = "linux")]
+pub(super) fn spawn_net_kicker(
+    vm: Vm,
+    net: Arc<Mutex<Option<VirtioNetDevice>>>,
+    memory: Arc<GuestRam>,
+    irq_lock: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    use std::collections::HashSet;
+
+    std::thread::spawn(move || {
+        let line = super::x86_64::x86_irq_for_slot(0); // net = ISA pool slot 0
+        let pulse = |line: u32| {
+            let _ = vm.irq_line(line, true);
+            // The PIC latches edges: pulse high->low->high.
+            let _ = vm.irq_line(line, false);
+            let _ = vm.irq_line(line, true);
+        };
+
+        let epfd = unsafe { libc::epoll_create1(0) };
+        if epfd < 0 {
+            return; // no net pump this boot; the run loop still polls per exit
+        }
+        let mut registered: HashSet<RawFd> = HashSet::new();
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Pump: deliver anything pending, then sync + wait on the fds.
+            {
+                let _guard = irq_lock.lock();
+                let mut guard = net.lock().unwrap();
+                let delivered = match guard.as_mut() {
+                    Some(net) => {
+                        net.poll_backend();
+                        let delivered = net.process_rx(memory.as_shared_slice(), RAM_BASE);
+                        net.drain_wakeup();
+                        delivered
+                    }
+                    None => false,
+                };
+                if delivered {
+                    pulse(line);
+                }
+                // Sync the epoll watch set with the netstack's current fds:
+                // add new ones (per connection), drop entries for fds that
+                // are gone. Done under the already-held guards — re-locking
+                // the irq/net mutexes here would self-deadlock.
+                let current: HashSet<RawFd> = guard
+                    .as_ref()
+                    .map(|n| n.watch_fds())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                for fd in registered.difference(&current).copied().collect::<Vec<_>>() {
+                    unsafe {
+                        libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+                    }
+                    registered.remove(&fd);
+                }
+                for fd in current {
+                    if registered.insert(fd) {
+                        let mut ev = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: fd as u64,
+                        };
+                        unsafe {
+                            libc::epoll_ctl(
+                                epfd,
+                                libc::EPOLL_CTL_ADD,
+                                fd,
+                                &mut ev as *mut libc::epoll_event,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+            let n = unsafe {
+                libc::epoll_wait(
+                    epfd,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    100, // bounds stop-flag latency; also polls new-conn setup
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err != Some(libc::EINTR) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            // Any readiness (data, wakeup, EOF) is handled by the pump at
+            // the top of the next iteration.
+        }
+
+        unsafe { libc::close(epfd) };
+    })
 }
 
 /// Console interrupt line (the same mapping the main loop uses).

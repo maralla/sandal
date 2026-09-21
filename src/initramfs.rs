@@ -367,6 +367,8 @@ mod helper_tests {
         if std::env::var_os("SANDAL_DUMP_HELPERS").is_some() {
             std::fs::write("/tmp/helper-done", super::export_done_helper()).unwrap();
             std::fs::write("/tmp/helper-resize", super::export_resize_helper()).unwrap();
+            #[cfg(target_arch = "x86_64")]
+            std::fs::write("/tmp/helper-ctty", super::ctty_helper()).unwrap();
         }
     }
 }

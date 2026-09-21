@@ -74,7 +74,13 @@ impl Vmm {
         if self.rng.as_ref().is_some_and(|d| d.interrupt_status != 0) {
             push(32 + SPI_RNG);
         }
-        if self.net.as_ref().is_some_and(|d| d.interrupt_status != 0) {
+        if self
+            .net
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|d| d.interrupt_status != 0)
+        {
             push(32 + SPI_NET);
         }
         for (i, dev) in self.virtiofs.iter().enumerate() {
@@ -90,7 +96,7 @@ impl Vmm {
         loop {
             // Poll the user-space network backend and deliver any incoming
             // packets to the guest's RX queue.
-            if let Some(net) = self.net.as_mut() {
+            if let Some(net) = self.net.lock().unwrap().as_mut() {
                 net.poll_backend();
                 net.process_rx(self.memory.as_shared_slice(), RAM_BASE);
             }

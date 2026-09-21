@@ -170,9 +170,12 @@ pub struct UserNet {
     ip_id: u16,
     /// Sender to register new TCP socket fds with the NetPoller's kqueue.
     poller_fd_tx: Option<mpsc::Sender<RawFd>>,
-    /// Write end of the NetPoller's wakeup pipe. The connect thread writes
-    /// a byte here so the poller kicks the vcpu to process the new connection.
+    /// Write end of the wakeup pipe: any async producer (connect thread,
+    /// ICMP proxy, stranded RX data) writes a byte so an event-driven
+    /// poller wakes and processes the queue.
     poller_wakeup_fd: Option<RawFd>,
+    /// Read end of the wakeup pipe (drained by the poller).
+    poller_wakeup_r: Option<RawFd>,
     /// Channel for receiving ICMP echo replies from proxy threads.
     icmp_rx: mpsc::Receiver<Vec<u8>>,
     icmp_tx: mpsc::Sender<Vec<u8>>,
@@ -193,6 +196,19 @@ impl UserNet {
         let (icmp_tx, icmp_rx) = mpsc::channel();
         let host_dns = get_host_dns();
 
+        // The wakeup pipe is created unconditionally: the Linux net-kick
+        // thread blocks on its read end (plus the host sockets) instead of
+        // blindly polling. BOTH ends are non-blocking: the kicker drains
+        // the read end while holding the net mutex (a blocking read on an
+        // empty pipe would deadlock the VMM), and producers must not block
+        // on a full pipe.
+        let (wakeup_r, wakeup_w) =
+            sys::pipe().ok_or_else(|| anyhow::anyhow!("failed to create the net wakeup pipe"))?;
+        for fd in [wakeup_r, wakeup_w] {
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+        }
+
         Ok(UserNet {
             rx_queue: VecDeque::new(),
             tcp_conns: HashMap::new(),
@@ -205,11 +221,36 @@ impl UserNet {
             next_isn: 0x10000,
             ip_id: 1,
             poller_fd_tx: None,
-            poller_wakeup_fd: None,
+            poller_wakeup_fd: Some(wakeup_w),
+            poller_wakeup_r: Some(wakeup_r),
             icmp_rx,
             icmp_tx,
             read_buf: vec![0u8; 16 * 1024],
         })
+    }
+
+    /// fds an event-driven poller should block on: every established TCP
+    /// stream, the DNS socket, and the wakeup pipe's read end.
+    pub fn watch_fds(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .tcp_conns
+            .values()
+            .filter(|c| c.state == TcpState::Established)
+            .map(|c| c.stream.as_raw_fd())
+            .collect();
+        fds.push(self.dns_socket.as_raw_fd());
+        if let Some(r) = self.poller_wakeup_r {
+            fds.push(r);
+        }
+        fds
+    }
+
+    /// Drain the wakeup pipe (non-blocking) after a poll reported it ready.
+    pub fn drain_wakeup(&self) {
+        if let Some(r) = self.poller_wakeup_r {
+            let mut buf = [0u8; 64];
+            while sys::read(r, &mut buf) > 0 {}
+        }
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
@@ -815,7 +856,6 @@ impl UserNet {
 
         // Spawn a thread to connect (non-blocking from the VM loop's perspective)
         let tx = self.connect_tx.clone();
-        let wakeup_fd = self.poller_wakeup_fd;
         // Map the virtual gateway IP (10.0.2.2) to localhost so the guest
         // can reach host-local services (e.g. HTTP proxies).
         let host_ip = if dst_ip == GATEWAY_IP {
@@ -825,6 +865,7 @@ impl UserNet {
         };
         let dst_addr = SocketAddr::new(IpAddr::V4(host_ip), dst_port);
         let key_clone = key.clone();
+        let wakeup_fd = self.poller_wakeup_fd;
 
         std::thread::spawn(move || {
             let result = TcpStream::connect_timeout(&dst_addr, Duration::from_secs(10));
@@ -838,6 +879,11 @@ impl UserNet {
                 guest_isn,
             })
             .ok();
+            // Wake the poller: the new connection's fd must join the watch
+            // set and the SYN-ACK must go out promptly.
+            if let Some(fd) = wakeup_fd {
+                sys::write(fd, 1);
+            }
             // Wake the poller so it kicks the vcpu to process this connection.
             if let Some(fd) = wakeup_fd {
                 let byte: u8 = 1;

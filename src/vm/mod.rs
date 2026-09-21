@@ -12,6 +12,9 @@
 
 #[cfg(target_os = "macos")]
 use crate::hypervisor::Gic;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::sync::atomic::Ordering;
+
 use crate::hypervisor::{Vcpu, Vm};
 use crate::initramfs;
 use crate::net::NetworkFilter;
@@ -182,12 +185,19 @@ struct Vmm {
     console: Arc<Mutex<VirtioConsoleDevice>>,
     blk: Option<VirtioBlkDevice>,
     data_blk: Option<VirtioBlkDevice>,
-    net: Option<VirtioNetDevice>,
+    /// Net device behind a mutex: the Linux net-kick thread pumps the
+    /// backend and raises the net IRQ independently of the run loop (an
+    /// idle guest would otherwise wait for its own delayed-ACK exit before
+    /// more host data is delivered).
+    net: Arc<Mutex<Option<VirtioNetDevice>>>,
     rng: Option<VirtioRngDevice>,
     virtiofs: Vec<VirtioFsDevice>,
     config_blob: Vec<u8>,
     #[cfg(target_os = "linux")]
     host: linux::KvmHost,
+    /// Set on drop so the net-kick thread exits.
+    #[cfg(target_os = "linux")]
+    net_kick_stop: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "macos")]
     vt_off: u64,
     #[cfg(target_os = "macos")]
@@ -409,6 +419,26 @@ impl Vmm {
 
         let console = Arc::new(Mutex::new(VirtioConsoleDevice::new(120, 40)));
 
+        // User-space networking (enabled unless --no-network). The run loops
+        // poll the backend after every guest exit and the Linux net-kick
+        // thread pumps it independently, so an idle guest never waits for
+        // its own delayed-ACK timer before more host data is delivered.
+        let net = if args.no_network {
+            Arc::new(Mutex::new(None))
+        } else {
+            let backend =
+                UserNet::new().map_err(|e| anyhow!("failed to create user-space network: {e}"))?;
+
+            let mut filter = NetworkFilter::new();
+
+            filter.set_protocols(NetworkFilter::parse_protocols(&args.protocols));
+            if let Some(ref hosts) = args.allowed_hosts {
+                filter.set_allowed_hosts(NetworkFilter::parse_hosts(hosts));
+            }
+
+            Arc::new(Mutex::new(Some(VirtioNetDevice::new(backend, filter))))
+        };
+
         // Per-boot exit-protocol token (x86_64): the init script echoes
         // `<token><status>`; the VMM only treats that as the protocol, so
         // user output containing the old fixed `SANDAL_EXIT:0` string is
@@ -420,10 +450,12 @@ impl Vmm {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
+
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 (nanos, std::process::id(), args.command.first()).hash(&mut h);
                 format!("{:08x}", h.finish() as u32)
             }
+
             #[cfg(not(target_arch = "x86_64"))]
             {
                 initramfs::EXIT_MARKER.trim_end_matches(':').to_string()
@@ -447,23 +479,18 @@ impl Vmm {
             }
         };
 
-        // User-space networking (enabled unless --no-network). The run loops
-        // poll the backend after every guest exit and raise the net IRQ line
-        // when packets are pending.
-        let net = if args.no_network {
-            None
-        } else {
-            let backend =
-                UserNet::new().map_err(|e| anyhow!("failed to create user-space network: {e}"))?;
-            let mut filter = NetworkFilter::new();
-            filter.set_protocols(NetworkFilter::parse_protocols(&args.protocols));
-            if let Some(ref hosts) = args.allowed_hosts {
-                filter.set_allowed_hosts(NetworkFilter::parse_hosts(hosts));
-            }
-            Some(VirtioNetDevice::new(backend, filter))
-        };
+        #[cfg(target_os = "linux")]
+        let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Virtiofs devices for --share host:guest pairs.
+        #[cfg(target_os = "linux")]
+        linux::spawn_net_kicker(
+            vm.clone(),
+            net.clone(),
+            memory.clone(),
+            host.irq_lock.clone(),
+            net_kick_stop.clone(),
+        );
+
         let mut virtiofs = Vec::new();
         for (tag, host_path, _guest) in parse_shares(args)? {
             virtiofs.push(VirtioFsDevice::new(host_path, tag));
@@ -484,6 +511,8 @@ impl Vmm {
             config_blob: Vec::new(),
             #[cfg(target_os = "linux")]
             host,
+            #[cfg(target_os = "linux")]
+            net_kick_stop,
             #[cfg(target_os = "macos")]
             vt_off,
             #[cfg(target_os = "macos")]
@@ -550,6 +579,7 @@ impl Vmm {
                 &self.exit_marker,
             );
         }
+
         #[cfg(target_arch = "aarch64")]
         {
             self.config_blob = initramfs::build_init_config(
@@ -567,7 +597,9 @@ impl Vmm {
                 .map_err(|e| anyhow!("failed to read rootfs {}: {e}", path.display()))?,
             None => crate::rootfs::load(),
         };
+
         crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network)?;
+
         #[cfg(target_arch = "x86_64")]
         {
             // The init script reads the run configuration from this file.
@@ -582,22 +614,29 @@ impl Vmm {
                 0o644,
             )?;
         }
+
         self.blk = Some(VirtioBlkDevice::new(rootfs_img));
 
         // ── Load the kernel ─────────────────────────────────────────────
         #[cfg(target_arch = "x86_64")]
         self.boot_kernel_x86(args)?;
+
         #[cfg(target_arch = "aarch64")]
         self.boot_kernel_arm64(args)?;
+
         Ok(())
     }
 }
 
 impl Drop for Vmm {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.net_kick_stop.store(true, Ordering::Relaxed);
+
         if let Some(ref orig) = self.tty_out_saved {
             restore_terminal(1, orig);
         }
+
         if let Some(ref orig) = self.tty_saved {
             restore_terminal(0, orig);
         }
@@ -615,10 +654,12 @@ impl Vmm {
             if (aarch64::GICD_BASE..aarch64::GICD_BASE + aarch64::GICD_SIZE).contains(&addr) {
                 return self.gic.gicd_read(addr - aarch64::GICD_BASE) as u64;
             }
+
             if (aarch64::GICR_BASE..aarch64::GICR_BASE + aarch64::GICR_SIZE).contains(&addr) {
                 return self.gic.gicr_read(addr - aarch64::GICR_BASE) as u64;
             }
         }
+
         if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + 0x200).contains(&addr) {
             return self
                 .console
@@ -626,37 +667,45 @@ impl Vmm {
                 .unwrap()
                 .mmio_read(addr - VIRTIO_CONSOLE_BASE, sas);
         }
-        if let Some(net) = self.net.as_mut() {
+
+        if let Some(net) = self.net.lock().unwrap().as_mut() {
             if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + 0x200).contains(&addr) {
                 return net.mmio_read(addr - VIRTIO_NET_BASE) as u64;
             }
         }
+
         if let Some(b) = self.blk.as_mut() {
             if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + 0x200).contains(&addr) {
                 return b.mmio_read(addr - VIRTIO_BLK_BASE) as u64;
             }
         }
+
         if let Some(b) = self.data_blk.as_mut() {
             if (DATA_BLK_BASE..DATA_BLK_BASE + 0x200).contains(&addr) {
                 return b.mmio_read(addr - DATA_BLK_BASE) as u64;
             }
         }
+
         if let Some(rng) = self.rng.as_ref() {
             if (VIRTIO_RNG_BASE..VIRTIO_RNG_BASE + 0x200).contains(&addr) {
                 return rng.mmio_read(addr - VIRTIO_RNG_BASE) as u64;
             }
         }
+
         if let Some(idx) = virtiofs_index(addr) {
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 return dev.mmio_read(addr - VIRTIOFS_BASE_START - idx as u64 * VIRTIOFS_SIZE)
                     as u64;
             }
         }
+
         #[cfg(target_arch = "aarch64")]
         if (aarch64::UART_BASE..aarch64::UART_BASE + 0x1000).contains(&addr) {
             return self.uart_read(addr - aarch64::UART_BASE);
         }
+
         log::debug!("mmio read 0x{addr:x} len {len}");
+
         0
     }
 
@@ -672,6 +721,7 @@ impl Vmm {
                 return;
             }
         }
+
         if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + 0x200).contains(&addr) {
             let mut console = self.console.lock().unwrap();
             let notify = console.mmio_write(addr - VIRTIO_CONSOLE_BASE, val as u32);
@@ -682,8 +732,10 @@ impl Vmm {
                     console.drain_rx_backlog(self.memory.as_shared_slice(), RAM_BASE);
                 }
             }
+
             return;
         }
+
         if let Some(b) = self.blk.as_mut() {
             if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + 0x200).contains(&addr) {
                 let _ = b.mmio_write(addr - VIRTIO_BLK_BASE, val as u32);
@@ -691,6 +743,7 @@ impl Vmm {
                 return;
             }
         }
+
         if let Some(b) = self.data_blk.as_mut() {
             if (DATA_BLK_BASE..DATA_BLK_BASE + 0x200).contains(&addr) {
                 let _ = b.mmio_write(addr - DATA_BLK_BASE, val as u32);
@@ -698,7 +751,8 @@ impl Vmm {
                 return;
             }
         }
-        if let Some(net) = self.net.as_mut() {
+
+        if let Some(net) = self.net.lock().unwrap().as_mut() {
             if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + 0x200).contains(&addr) {
                 if let Some(qidx) = net.mmio_write(addr - VIRTIO_NET_BASE, val as u32) {
                     match qidx {
@@ -715,6 +769,7 @@ impl Vmm {
                 return;
             }
         }
+
         if let Some(rng) = self.rng.as_mut() {
             if (VIRTIO_RNG_BASE..VIRTIO_RNG_BASE + 0x200).contains(&addr) {
                 if rng.mmio_write(addr - VIRTIO_RNG_BASE, val as u32).is_some() {
@@ -723,6 +778,7 @@ impl Vmm {
                 return;
             }
         }
+
         if let Some(idx) = virtiofs_index(addr) {
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 let off = addr - VIRTIOFS_BASE_START - idx as u64 * VIRTIOFS_SIZE;
@@ -732,11 +788,13 @@ impl Vmm {
                 return;
             }
         }
+
         #[cfg(target_arch = "aarch64")]
         if (aarch64::UART_BASE..aarch64::UART_BASE + 0x1000).contains(&addr) {
             self.uart_write(addr - aarch64::UART_BASE, val);
             return;
         }
+
         #[cfg(target_arch = "x86_64")]
         if (x86_64::HYPERCALL_PAGE..x86_64::HYPERCALL_PAGE + 0x200).contains(&addr) {
             // Hypercall page: a u32 write of the port number signals the VMM
@@ -748,6 +806,7 @@ impl Vmm {
             }
             return;
         }
+
         log::debug!("mmio write 0x{addr:x} = 0x{val:x}");
     }
 
@@ -761,9 +820,11 @@ impl Vmm {
             log::warn!("export resize: no data disk");
             return;
         };
+
         if dev.disk_image.len() >= EXPORT_DISK_SIZE {
             return;
         }
+
         dev.disk_image.resize(EXPORT_DISK_SIZE, 0);
         dev.update_capacity();
         dev.config_generation = dev.config_generation.wrapping_add(1);
@@ -805,6 +866,7 @@ impl Vmm {
             eprintln!("sandal: export failed to gzip layer: {e}");
             return;
         }
+
         let gz_data = match encoder.finish() {
             Ok(data) => data,
             Err(e) => {
@@ -870,15 +932,19 @@ impl Vmm {
                     }
                     continue;
                 }
+
                 if ch.is_ascii_digit() {
                     self.vt_param = self.vt_param * 10 + (ch - b'0') as u32;
                 }
+
                 if (0x40..=0x7e).contains(&ch) {
                     // Final byte: the sequence is complete.
                     self.end_vt_sequence(&mut dsr_reply);
                 }
+
                 continue;
             }
+
             if ch == 0x1b {
                 self.vt_esc = true;
                 self.vt_csi = 0;
@@ -911,6 +977,7 @@ impl Vmm {
                 self.process_console_line(&line);
             }
         }
+
         let _ = stdout.flush();
 
         // Answer cursor-position queries (DSR): the reply goes into the
@@ -922,10 +989,12 @@ impl Vmm {
                 RAM_BASE,
                 reply.as_bytes(),
             );
+
             #[cfg(target_os = "linux")]
             {
                 let line = self.irq_line_for_spi(crate::irqs::SPI_CONSOLE);
                 let _ = self.vm.irq_line(line, true);
+
                 #[cfg(target_arch = "x86_64")]
                 {
                     let _ = self.vm.irq_line(line, false);
@@ -943,6 +1012,7 @@ impl Vmm {
         if std::env::var_os("SANDAL_DEBUG_KVM").is_some() {
             eprintln!("DBG-SEQ param={} seq={seq:02x?}", self.vt_param);
         }
+
         self.vt_esc = false;
         self.vt_csi = 0;
 
@@ -952,8 +1022,10 @@ impl Vmm {
             && seq[1] == b'['
             && seq[seq.len() - 1] == b'n'
             && (self.vt_param == 6 || self.vt_param == 0);
+
         self.vt_dsr = false;
         self.vt_param = 0;
+
         if is_dsr_query {
             // Cursor position is 1-based: after N printable columns the
             // cursor sits at column N+1.
@@ -993,7 +1065,9 @@ impl Vmm {
             // Swallow the rest of the marker line.
             return;
         }
+
         self.tx_hold.push(ch);
+
         if markers.iter().any(|m| self.tx_hold.ends_with(m)) {
             // Full marker: discard it and swallow the rest of the line.
             self.tx_hold.clear();
@@ -1014,7 +1088,9 @@ impl Vmm {
                     })
                     .unwrap_or(0)
             };
+
             let flush_len = self.tx_hold.len() - keep;
+
             if flush_len > 0 {
                 let _ = stdout.write_all(&self.tx_hold[..flush_len]);
                 self.tx_hold.drain(..flush_len);
@@ -1028,6 +1104,7 @@ impl Vmm {
         let Ok(line) = std::str::from_utf8(line) else {
             return;
         };
+
         let trimmed = line.trim_end_matches(['\n', '\r']);
 
         if let Some(pos) = trimmed.find(&self.exit_marker) {
@@ -1042,6 +1119,7 @@ impl Vmm {
             }
             // Not the protocol — fall through to the export marker.
         }
+
         if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
             let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
             // The protocol always carries an absolute host path; ignore
