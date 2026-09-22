@@ -54,14 +54,21 @@ pub(crate) use x86_64::x86_hypercall_page_off;
 pub(crate) use x86_64::{MAX_FS_DEVICES, RAM_BASE};
 
 // ── Virtio-MMIO device addresses (both architectures) ──────────────────
+// The x86_64 device window sits at 1 GB, ABOVE the guest RAM: the flat
+// physical address space starts at 0, and a device region inside "System
+// RAM" would make the kernel's request_mem_region fail with -EBUSY (and
+// capping RAM below the devices would shrink tmpfs /tmp, breaking larger
+// installs like uv). RAM is capped at MMIO_BASE.
 #[cfg(target_arch = "x86_64")]
+pub(crate) const MMIO_BASE: u64 = 0x4000_0000;
+#[cfg(target_arch = "aarch64")]
 pub(crate) const MMIO_BASE: u64 = 0x0a00_0000;
-pub(crate) const VIRTIO_NET_BASE: u64 = 0x0a00_0000;
-pub(crate) const VIRTIO_CONSOLE_BASE: u64 = 0x0a00_0200;
-pub(crate) const VIRTIO_BLK_BASE: u64 = 0x0a00_0400;
-pub(crate) const DATA_BLK_BASE: u64 = 0x0a00_0600;
-pub(crate) const VIRTIO_RNG_BASE: u64 = 0x0a00_0800;
-pub(crate) const VIRTIOFS_BASE_START: u64 = 0x0a00_1000;
+pub(crate) const VIRTIO_NET_BASE: u64 = MMIO_BASE;
+pub(crate) const VIRTIO_CONSOLE_BASE: u64 = MMIO_BASE + 0x200;
+pub(crate) const VIRTIO_BLK_BASE: u64 = MMIO_BASE + 0x400;
+pub(crate) const DATA_BLK_BASE: u64 = MMIO_BASE + 0x600;
+pub(crate) const VIRTIO_RNG_BASE: u64 = MMIO_BASE + 0x800;
+pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + 0x1000;
 pub(crate) const VIRTIOFS_SIZE: u64 = 0x200;
 
 // ── Host terminal helpers ────────────────────────────────────────────────
