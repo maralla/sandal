@@ -204,6 +204,25 @@ pub fn write_used_ring(
     Some(())
 }
 
+/// Read one entry from the used ring (descriptor id, written length).
+pub fn read_used_ring_entry(
+    memory: &[u8],
+    ram_base: u64,
+    used_addr: u64,
+    idx: u16,
+    queue_size: u32,
+) -> Option<(u32, u32)> {
+    let ring_entry_offset = 4 + (idx % queue_size as u16) as u64 * 8;
+    let offset = used_addr.checked_sub(ram_base)? as usize + ring_entry_offset as usize;
+    if offset + 8 > memory.len() {
+        return None;
+    }
+    fence(Ordering::SeqCst);
+    let id = volatile_read_u32(memory, offset);
+    let len = volatile_read_u32(memory, offset + 4);
+    Some((id, len))
+}
+
 /// Update the used ring index
 pub fn write_used_idx(memory: &mut [u8], ram_base: u64, used_addr: u64, idx: u16) -> Option<()> {
     let offset = used_addr.checked_sub(ram_base)? as usize + 2;

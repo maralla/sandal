@@ -71,6 +71,11 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 
+# PTYs: tmux/screen/shells-with-job-control need the devpts mount for
+# /dev/pts (devtmpfs provides /dev/ptmx but not the pts filesystem).
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null
+
 # ── Virtiofs shares (--share host:guest) ──────────────────────────────
 printf '%b' "$SHARES_TEXT" | while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -92,15 +97,21 @@ stty -F /dev/console rows "$ROWS" cols "$COLS" 2>/dev/null
 # script alone can never do this). With a controlling terminal the guest
 # shell has working job control and tty signals (Ctrl-C, Ctrl-Z).
 # The crafted helper has no PATH search — resolve the command first.
+#
+# Stdin MUST be opened read-write (<>): the interactive tty fd is inherited
+# by everything on the console — tmux's client passes STDIN_FILENO to the
+# server as its terminal fd, and a server writing a redraw to an O_RDONLY
+# fd gets EBADF on every write, so the attached pane never draws (input
+# still works, which makes the hang extra confusing). `>` for stdout stays
+# one-way; the console is the same file anyway.
 if [ -x /bin/ctty ]; then
     CMD="$(command -v "$1")"
     [ -n "$CMD" ] || CMD="$1"
     shift
-    /bin/ctty "$CMD" "$@" < /dev/console > /dev/console 2>&1
+    /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
     STATUS=$?
 else
-    # Fallback: no ctty — job control stays off.
-    setsid sh -c 'exec "$@"' sh "$@" < /dev/console > /dev/console 2>&1
+    setsid sh -c 'exec "$@"' sh "$@" <> /dev/console > /dev/console 2>&1
     STATUS=$?
 fi
 

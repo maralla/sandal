@@ -176,6 +176,317 @@ impl Drop for GuestRam {
     }
 }
 
+/// The console TX pipeline: escape-sequence tracking (DSR/DA query replies),
+/// protocol-marker filtering, and the line/cursor state. Owned by whichever
+/// thread drains the console TX virtqueue (the net-kick thread on Linux,
+/// the run loop on macOS).
+pub(crate) struct ConsoleTxFilter {
+    /// The per-boot exit-protocol token.
+    pub exit_marker: String,
+    /// Console TX line buffer used to intercept protocol markers.
+    tx_line: Vec<u8>,
+    /// Bytes held back because they may start a protocol marker.
+    tx_hold: Vec<u8>,
+    /// True while the current TX line is a suppressed marker line.
+    tx_suppress_line: bool,
+    /// Escape-sequence tracking state (see the module docs).
+    vt_esc: bool,
+    vt_csi: u8,
+    vt_seq: Vec<u8>,
+    vt_param: u32,
+    vt_priv: u8,
+    vt_dsr: bool,
+    vt_row: u32,
+    vt_col: u32,
+    /// Set by feed(): the guest's exit code from the exit marker.
+    pub exit_code: Option<i32>,
+    /// Set by feed(): the export save path from the export marker.
+    pub export_path: Option<String>,
+    /// Set by feed(): true when a query reply was injected into the console
+    /// RX (the caller must pulse the console IRQ so the guest reads it).
+    pub replied: bool,
+    /// DA1 (`ESC[c`) answered once: tmux re-sends DA1 around redraws while
+    /// its own reply is still in flight; its parser consumes the FIRST
+    /// response and treats every later one as plain keys (TTY_HAVEDA is
+    /// already set), which would leak into the focused pane as typed text.
+    /// A real terminal answers every query, but tmux only needs the first —
+    /// later queries are swallowed silently.
+    da1_answered: bool,
+    /// DA2 (`ESC[>c`) — same once-only treatment as DA1.
+    da2_answered: bool,
+    /// True while a fullscreen app owns the terminal (alternate screen:
+    /// tmux attaches with `ESC[?1049h`, leaves with `ESC[?1049l`). Under
+    /// alt-screen the outer console shell is parked, so console-level DSR
+    /// replies have no consumer — the attached client forwards them as
+    /// unknown keys into the focused pane, where they leak as typed text
+    /// (a probe reply racing the attach is what skewed ash's cursor state).
+    /// Pane-level probes are answered by the guest's own tmux and are
+    /// unaffected.
+    alt_screen: bool,
+}
+
+impl ConsoleTxFilter {
+    pub(crate) fn new(exit_marker: String) -> Self {
+        ConsoleTxFilter {
+            exit_marker,
+            tx_line: Vec::new(),
+            tx_hold: Vec::new(),
+            tx_suppress_line: false,
+            vt_esc: false,
+            vt_csi: 0,
+            vt_seq: Vec::new(),
+            vt_param: 0,
+            vt_priv: 0,
+            vt_dsr: false,
+            vt_row: 1,
+            vt_col: 1,
+            exit_code: None,
+            export_path: None,
+            replied: false,
+            da1_answered: false,
+            da2_answered: false,
+            alt_screen: false,
+        }
+    }
+
+    /// Feed guest console TX bytes: track the escape state, answer terminal
+    /// queries (into the console RX), filter protocol markers, and append
+    /// the visible bytes to `out`.
+    pub(crate) fn feed(
+        &mut self,
+        data: &[u8],
+        console: &Arc<Mutex<VirtioConsoleDevice>>,
+        memory: &Arc<GuestRam>,
+        ram_base: u64,
+        out: &mut Vec<u8>,
+    ) {
+        let mut replies: Vec<Vec<u8>> = Vec::new();
+
+        for &ch in data {
+            if self.exit_code.is_some() {
+                // The guest is shutting down; drop trailing output.
+                break;
+            }
+
+            // ── Virtual-terminal escape handling ──────────────────────
+            // The guest's line editor probes the terminal with `ESC [ 6 n`
+            // and reads the reply from its input; tmux also probes with
+            // DA1/DA2 before its first draw. The VMM is the virtual
+            // terminal: those queries are answered here from a tracked
+            // cursor position. Every OTHER escape sequence (erase, colors,
+            // cursor movement) is forwarded verbatim — swallowing those
+            // breaks guest-side erases like the backspace path's `ESC[J`.
+            if self.vt_esc {
+                self.vt_seq.push(ch);
+                if self.vt_csi == 0 {
+                    if ch == b'[' {
+                        self.vt_csi = b'[';
+                    } else {
+                        self.end_vt_sequence(&mut replies, out);
+                    }
+                    continue;
+                }
+                if ch == b'>' && self.vt_param == 0 {
+                    self.vt_priv = 2;
+                } else if ch == b'?' {
+                    self.vt_priv = 1;
+                } else if ch.is_ascii_digit() {
+                    self.vt_param = self.vt_param * 10 + (ch - b'0') as u32;
+                }
+                if (0x40..=0x7e).contains(&ch) {
+                    self.end_vt_sequence(&mut replies, out);
+                }
+                continue;
+            }
+            if ch == 0x1b {
+                self.vt_esc = true;
+                self.vt_csi = 0;
+                self.vt_seq.clear();
+                self.vt_seq.push(0x1b);
+                self.vt_param = 0;
+                self.vt_priv = 0;
+                self.vt_dsr = false;
+                continue;
+            }
+
+            // Cursor tracking for the DSR replies (printable +1, BS -1).
+            if (0x20..0x7f).contains(&ch) {
+                self.vt_col += 1;
+            } else if ch == b'\x08' {
+                self.vt_col = self.vt_col.saturating_sub(1);
+            } else if ch == b'\n' || ch == b'\r' {
+                self.vt_col = 0;
+                self.vt_row += 1;
+            }
+
+            self.emit_tx_byte(ch, out);
+
+            if ch == b'\n' {
+                self.tx_suppress_line = false;
+                self.tx_hold.clear();
+                let line = std::mem::take(&mut self.tx_line);
+                self.process_console_line(&line);
+            }
+        }
+
+        // Inject query replies into the console RX.
+        if !replies.is_empty() {
+            let mut blob = Vec::new();
+            for r in &replies {
+                blob.extend_from_slice(r);
+            }
+            console
+                .lock()
+                .unwrap()
+                .push_rx_and_drain(memory.as_shared_slice(), ram_base, &blob);
+            self.replied = true;
+        }
+    }
+
+    /// Finish the escape sequence accumulated in `vt_seq`: answer terminal
+    /// queries, forward everything else verbatim, apply cursor movement.
+    fn end_vt_sequence(&mut self, replies: &mut Vec<Vec<u8>>, out: &mut Vec<u8>) {
+        let seq = std::mem::take(&mut self.vt_seq);
+        self.vt_esc = false;
+        self.vt_csi = 0;
+
+        let final_byte = seq[seq.len() - 1];
+        let is_csi = seq.len() >= 3 && seq[1] == b'[';
+
+        // Alternate-screen tracking (DEC private modes 47/1047/1049): a
+        // fullscreen app (tmux) owns the terminal while set — see the
+        // `alt_screen` field docs for why DSR replies are suppressed then.
+        if is_csi
+            && self.vt_priv == 1
+            && (final_byte == b'h' || final_byte == b'l')
+            && matches!(self.vt_param, 47 | 1047 | 1049)
+        {
+            self.alt_screen = final_byte == b'h';
+        }
+
+        // DSR cursor-position query: `ESC [ 6 n` (empty parameter = same).
+        // Suppressed under alt-screen: the outer shell is parked and the
+        // reply would be forwarded by the attached client into the focused
+        // pane as keys (the pane-level probes are answered by the guest's
+        // own tmux with the pane cursor, so nothing needs this reply).
+        if is_csi && self.vt_priv == 0 && final_byte == b'n' && self.vt_param <= 6 {
+            if !self.alt_screen {
+                replies.push(format!("\x1b[{};{}R", self.vt_row, self.vt_col + 1).into_bytes());
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // DA1 (primary device attributes): `ESC [ c` / `ESC [ 0 c`. tmux and
+        // friends block their first draw waiting for this reply. Answered
+        // once; tmux re-sends DA1 around redraws while its first reply is
+        // still in flight, and its parser treats every later response as
+        // plain keys (TTY_HAVEDA is already set) which would leak into the
+        // focused pane as typed text — later queries are swallowed silently.
+        if is_csi && self.vt_priv == 0 && final_byte == b'c' && self.vt_param <= 1 {
+            if !self.da1_answered {
+                replies.push(b"\x1b[?1;2c".to_vec()); // VT102 with AVO
+                self.da1_answered = true;
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // DA2 (secondary device attributes): `ESC [ > c` — once only.
+        if is_csi && self.vt_priv == 2 && final_byte == b'c' {
+            if !self.da2_answered {
+                replies.push(b"\x1b[>0;95;0c".to_vec());
+                self.da2_answered = true;
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // XTGETTCAP (`ESC [ > q`): swallowed without forwarding or reply —
+        // forwarding reaches the outer terminal, whose answer returns as
+        // console input at an unpredictable time and can leak into the
+        // focused pane; not answering is handled fine by tmux.
+        if is_csi && self.vt_priv == 2 && final_byte == b'q' {
+            self.vt_param = 0;
+            return;
+        }
+        self.vt_dsr = false;
+        self.vt_param = 0;
+
+        // Apply cursor movement so the tracker stays usable across redraws.
+        match final_byte {
+            b'C' => self.vt_col += self.vt_param.max(1),
+            b'D' => self.vt_col = self.vt_col.saturating_sub(self.vt_param.max(1)),
+            b'G' => self.vt_col = self.vt_param.saturating_sub(1),
+            _ => {}
+        }
+
+        // Forward the sequence to the user's terminal verbatim.
+        for b in seq {
+            self.emit_tx_byte(b, out);
+        }
+    }
+
+    fn emit_tx_byte(&mut self, ch: u8, out: &mut Vec<u8>) {
+        self.tx_line.push(ch);
+
+        if self.tx_suppress_line {
+            return;
+        }
+        let markers: [&[u8]; 2] = [
+            self.exit_marker.as_bytes(),
+            initramfs::EXPORT_PATH_MARKER.as_bytes(),
+        ];
+        self.tx_hold.push(ch);
+        if markers.iter().any(|m| self.tx_hold.ends_with(m)) {
+            self.tx_hold.clear();
+            self.tx_suppress_line = true;
+        } else {
+            let hold = &self.tx_hold;
+            let keep = if markers.iter().any(|m| m.starts_with(hold)) {
+                hold.len()
+            } else {
+                (1..hold.len())
+                    .rev()
+                    .find(|&k| {
+                        markers
+                            .iter()
+                            .any(|m| m.starts_with(&hold[hold.len() - k..]))
+                    })
+                    .unwrap_or(0)
+            };
+            let flush_len = self.tx_hold.len() - keep;
+            if flush_len > 0 {
+                out.extend_from_slice(&self.tx_hold[..flush_len]);
+                self.tx_hold.drain(..flush_len);
+            }
+        }
+    }
+
+    /// Handle one complete guest console line (marker side effects only —
+    /// visible output has already been streamed).
+    fn process_console_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            return;
+        };
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+
+        if let Some(pos) = trimmed.find(&self.exit_marker) {
+            let code = trimmed[pos + self.exit_marker.len()..].trim();
+            // Only a real integer is the exit protocol. Commands like
+            // `cat /init` surface the script's unexpanded placeholder —
+            // that must not shut the VM down.
+            if let Ok(code) = code.parse::<i32>() {
+                self.exit_code = Some(code);
+                return;
+            }
+        }
+        if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
+            let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
+            if path.starts_with('/') {
+                self.export_path = Some(path.to_string());
+            }
+        }
+    }
+}
+
 // ── The virtual machine monitor ──────────────────────────────────────────
 
 struct Vmm {
@@ -190,6 +501,18 @@ struct Vmm {
     /// Console device (shared with the stdin poller thread on Linux, which
     /// injects keystrokes directly into the RX virtqueue).
     console: Arc<Mutex<VirtioConsoleDevice>>,
+    /// Shared console-TX pipeline state (escape tracking, terminal-query
+    /// replies, protocol markers). The main loop and the net-kick thread
+    /// BOTH drain the TX queue; the filter must be singular or escape
+    /// sequences tear apart at drain boundaries.
+    #[cfg(target_os = "linux")]
+    console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
+    /// Terminal-query reply dedup for the macOS path (no shared filter —
+    /// the run loop's own tracker does the answering).
+    #[cfg(target_os = "macos")]
+    da1_answered: bool,
+    #[cfg(target_os = "macos")]
+    da2_answered: bool,
     blk: Option<VirtioBlkDevice>,
     data_blk: Option<VirtioBlkDevice>,
     /// Net device behind a mutex: the Linux net-kick thread pumps the
@@ -227,34 +550,82 @@ struct Vmm {
     exit_marker: String,
     /// Save path from the guest's `SANDAL_EXPORT_PATH:` console marker.
     export_save_path: Option<String>,
-    /// Console TX line buffer used to intercept VMM protocol markers.
-    tx_line: Vec<u8>,
-    /// Bytes held back because they may start a protocol marker (suffix scan).
-    tx_hold: Vec<u8>,
-    /// True while the current TX line is a suppressed protocol marker line.
-    tx_suppress_line: bool,
     /// Guest command exit status from the exit marker.
     guest_exit_code: Option<i32>,
-    /// Virtual-terminal escape tracking: the guest's line editor (busybox
-    /// ash) probes the terminal with `ESC [ 6 n` (device status report:
-    /// cursor position) and reads the reply from its input. The VMM is the
-    /// virtual terminal: it intercepts that one query and answers it from a
-    /// conservatively tracked cursor position, so the editor's line-wrap
-    /// and redraw logic stay correct on long input lines. Every OTHER
-    /// escape sequence (erase, colors, cursor movement) is forwarded to
-    /// the user's terminal untouched — swallowing those breaks guest-side
-    /// erases like the backspace path's `ESC [ J`.
+    /// Virtual-terminal escape tracking for the macOS run loop (on Linux
+    /// this state lives in the shared `console_tx_filter` instead): the
+    /// guest's line editor (busybox ash) probes the terminal with
+    /// `ESC [ 6 n` (device status report: cursor position) and reads the
+    /// reply from its input. The VMM is the virtual terminal: it intercepts
+    /// that one query and answers it from a conservatively tracked cursor
+    /// position, so the editor's line-wrap and redraw logic stay correct on
+    /// long input lines. Every OTHER escape sequence (erase, colors, cursor
+    /// movement) is forwarded to the user's terminal untouched — swallowing
+    /// those breaks guest-side erases like the backspace path's `ESC [ J`.
+    #[cfg(target_os = "macos")]
+    tx_line: Vec<u8>,
+    #[cfg(target_os = "macos")]
+    tx_hold: Vec<u8>,
+    #[cfg(target_os = "macos")]
+    tx_suppress_line: bool,
+    #[cfg(target_os = "macos")]
     vt_esc: bool,
+    #[cfg(target_os = "macos")]
     vt_csi: u8,
     /// Bytes of the escape sequence currently being parsed.
+    #[cfg(target_os = "macos")]
     vt_seq: Vec<u8>,
     /// Numeric parameter accumulated from the current CSI sequence.
+    #[cfg(target_os = "macos")]
     vt_param: u32,
     /// True when the accumulated CSI parameter is 6 (a DSR query).
+    #[cfg(target_os = "macos")]
     vt_dsr: bool,
+    /// CSI private-marker byte: 0 = none, 1 = `?` (DEC), 2 = `>` (VT).
+    #[cfg(target_os = "macos")]
+    vt_priv: u8,
     /// Tracked terminal cursor (1-based) for DSR cursor-position replies.
+    #[cfg(target_os = "macos")]
     vt_row: u32,
+    #[cfg(target_os = "macos")]
     vt_col: u32,
+    /// Alternate-screen state for DSR suppression (see `ConsoleTxFilter`).
+    #[cfg(target_os = "macos")]
+    alt_screen: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Host terminal geometry
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set by the SIGWINCH handler when the host terminal is resized.
+static HOST_WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn winch_handler(_sig: i32) {
+    HOST_WINCH.store(true, Ordering::Relaxed);
+}
+
+/// The guest console geometry: the host tty's size, so the guest screen
+/// matches the terminal it renders into. A hardcoded size mismatches the
+/// user's pane — a guest screen taller than the host pane scrolls the
+/// prompt out of view (the guest tmux status line would be the only thing
+/// left visible). Falls back to 120x40 when stdout is not a tty (tests
+/// drive their own pty and pipes have no size).
+fn host_tty_size() -> (u16, u16) {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: `ws` is a valid winsize; TIOCGWINSZ only fills it in.
+        let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
+        if ok && ws.ws_col > 0 && ws.ws_row > 0 {
+            return (ws.ws_col, ws.ws_row);
+        }
+    }
+    (120, 40)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +795,22 @@ impl Vmm {
             (saved, out_saved)
         };
 
-        let console = Arc::new(Mutex::new(VirtioConsoleDevice::new(120, 40)));
+        let console = {
+            let (cols, rows) = host_tty_size();
+            Arc::new(Mutex::new(VirtioConsoleDevice::new(cols, rows)))
+        };
+
+        // Track host terminal resizes: the SIGWINCH handler only sets a
+        // flag; the run loop applies the new geometry (and interrupts the
+        // guest) on its next iteration.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = winch_handler as extern "C" fn(i32) as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+        }
 
         // User-space networking (enabled unless --no-network). The run loops
         // poll the backend after every guest exit and the Linux net-kick
@@ -472,29 +858,38 @@ impl Vmm {
         #[cfg(target_os = "linux")]
         let host = {
             let irq_lock = Arc::new(Mutex::new(()));
+            let irq_levels = linux::new_irq_levels();
             let (stdin_thread, stdin_stop_w) = linux::spawn_stdin_poller(
                 vm.clone(),
                 console.clone(),
                 memory.clone(),
                 irq_lock.clone(),
+                irq_levels.clone(),
             )?;
             linux::KvmHost {
                 irq_lock,
                 stdin_stop_w,
                 stdin_thread: Some(stdin_thread),
-                irq_levels: [false; linux::NUM_TRACKED_SPIS],
+                irq_levels,
             }
         };
 
         #[cfg(target_os = "linux")]
         let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
+            exit_marker.trim_end_matches(':').to_string(),
+        )));
 
         #[cfg(target_os = "linux")]
         linux::spawn_net_kicker(
             vm.clone(),
             net.clone(),
+            console.clone(),
             memory.clone(),
+            console_tx_filter.clone(),
             host.irq_lock.clone(),
+            host.irq_levels.clone(),
             net_kick_stop.clone(),
         );
 
@@ -510,6 +905,12 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             gic: Gic::new(),
             console,
+            #[cfg(target_os = "linux")]
+            console_tx_filter,
+            #[cfg(target_os = "macos")]
+            da1_answered: false,
+            #[cfg(target_os = "macos")]
+            da2_answered: false,
             blk: None,
             data_blk: None,
             net,
@@ -529,20 +930,37 @@ impl Vmm {
             tty_saved,
             tty_out_saved,
             guest_shutdown: false,
-            verbose_uart: args.verbose,
+            // -v or SANDAL_VERBOSE_UART=1: mirror guest serial-port (0x3f8)
+            // THR writes to stderr — a diagnostics channel that bypasses
+            // the guest tty stack entirely (see tests/test_tmux_attached.py).
+            verbose_uart: args.verbose || std::env::var_os("SANDAL_VERBOSE_UART").is_some(),
             exit_marker,
             export_save_path: None,
+            #[cfg(target_os = "macos")]
             tx_line: Vec::new(),
+            #[cfg(target_os = "macos")]
             tx_hold: Vec::new(),
+            #[cfg(target_os = "macos")]
             tx_suppress_line: false,
             guest_exit_code: None,
+            #[cfg(target_os = "macos")]
             vt_esc: false,
+            #[cfg(target_os = "macos")]
             vt_csi: 0,
+            #[cfg(target_os = "macos")]
             vt_seq: Vec::new(),
+            #[cfg(target_os = "macos")]
             vt_param: 0,
+            #[cfg(target_os = "macos")]
+            vt_priv: 0,
+            #[cfg(target_os = "macos")]
             vt_dsr: false,
+            #[cfg(target_os = "macos")]
             vt_row: 1,
+            #[cfg(target_os = "macos")]
             vt_col: 1,
+            #[cfg(target_os = "macos")]
+            alt_screen: false,
         })
     }
 
@@ -900,9 +1318,13 @@ impl Vmm {
     /// Feed guest console TX bytes to stdout while intercepting the VMM
     /// protocol markers (the per-boot exit token and
     /// `SANDAL_EXPORT_PATH:`), which are consumed here instead of being
-    /// shown to the user.
+    /// shown to the user. macOS only: on Linux the run loop and the
+    /// net-kick thread share `console_tx_filter` instead (a singular
+    /// escape/marker state — two trackers would tear sequences apart at
+    /// drain boundaries).
+    #[cfg(target_os = "macos")]
     fn process_console_tx(&mut self, data: &[u8]) {
-        let mut dsr_reply: Option<(u32, u32)> = None;
+        let mut replies: Vec<Vec<u8>> = Vec::new();
         let exit_marker = self.exit_marker.clone();
         let markers: [&[u8]; 2] = [
             exit_marker.as_bytes(),
@@ -935,7 +1357,7 @@ impl Vmm {
                         self.vt_csi = b'[';
                     } else {
                         // Two-byte non-CSI escape (e.g. ESC 7): forward.
-                        self.end_vt_sequence(&mut dsr_reply);
+                        self.end_vt_sequence(&mut replies);
                     }
                     continue;
                 }
@@ -946,7 +1368,7 @@ impl Vmm {
 
                 if (0x40..=0x7e).contains(&ch) {
                     // Final byte: the sequence is complete.
-                    self.end_vt_sequence(&mut dsr_reply);
+                    self.end_vt_sequence(&mut replies);
                 }
 
                 continue;
@@ -958,6 +1380,7 @@ impl Vmm {
                 self.vt_seq.clear();
                 self.vt_seq.push(0x1b);
                 self.vt_param = 0;
+                self.vt_priv = 0;
                 self.vt_dsr = false;
                 continue;
             }
@@ -987,26 +1410,33 @@ impl Vmm {
 
         let _ = stdout.flush();
 
-        // Answer cursor-position queries (DSR): the reply goes into the
-        // console RX — the guest's line editor reads it as terminal input.
-        if let Some((row, col)) = dsr_reply {
-            let reply = format!("\x1b[{row};{col}R");
+        // Answer terminal queries (DSR, DA, XTGETTCAP): the replies go
+        // into the console RX — guest terminal applications read them as
+        // input. One IRQ pulse for the whole batch.
+        if !replies.is_empty() {
+            let mut blob = Vec::new();
+            for r in &replies {
+                blob.extend_from_slice(r);
+            }
             self.console.lock().unwrap().push_rx_and_drain(
                 self.memory.as_shared_slice(),
                 RAM_BASE,
-                reply.as_bytes(),
+                &blob,
             );
 
             #[cfg(target_os = "linux")]
             {
-                let line = self.irq_line_for_spi(crate::irqs::SPI_CONSOLE);
-                let _ = self.vm.irq_line(line, true);
-
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = self.vm.irq_line(line, false);
-                    let _ = self.vm.irq_line(line, true);
-                }
+                // Raise the console line under the irq_lock so this raise
+                // can never be reordered after the pollers'/main loop's
+                // line updates (a lost interrupt).
+                let _guard = self.host.irq_lock.lock();
+                let idx = (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize;
+                linux::irq_pulse(
+                    &self.host.irq_levels,
+                    idx,
+                    &self.vm,
+                    self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
+                );
             }
         }
     }
@@ -1014,7 +1444,8 @@ impl Vmm {
     /// Finish the escape sequence accumulated in `vt_seq`: answer DSR
     /// cursor-position queries, forward everything else to the user's
     /// terminal, and apply cursor-movement sequences to the tracker.
-    fn end_vt_sequence(&mut self, dsr_reply: &mut Option<(u32, u32)>) {
+    #[cfg(target_os = "macos")]
+    fn end_vt_sequence(&mut self, replies: &mut Vec<Vec<u8>>) {
         let seq = std::mem::take(&mut self.vt_seq);
         if std::env::var_os("SANDAL_DEBUG_KVM").is_some() {
             eprintln!("DBG-SEQ param={} seq={seq:02x?}", self.vt_param);
@@ -1023,26 +1454,65 @@ impl Vmm {
         self.vt_esc = false;
         self.vt_csi = 0;
 
-        // DSR cursor-position query: `ESC [ 6 n` (some senders use an
-        // empty parameter, which means the same thing).
-        let is_dsr_query = seq.len() >= 3
-            && seq[1] == b'['
-            && seq[seq.len() - 1] == b'n'
-            && (self.vt_param == 6 || self.vt_param == 0);
+        let final_byte = seq[seq.len() - 1];
+        let is_csi = seq.len() >= 3 && seq[1] == b'[';
 
+        // Alternate-screen tracking (see `ConsoleTxFilter`).
+        if is_csi
+            && self.vt_priv == 1
+            && (final_byte == b'h' || final_byte == b'l')
+            && matches!(self.vt_param, 47 | 1047 | 1049)
+        {
+            self.alt_screen = final_byte == b'h';
+        }
+
+        // DSR cursor-position query: `ESC [ 6 n` (empty parameter = same).
+        // Suppressed under alt-screen (a fullscreen app owns the terminal;
+        // the reply would have no consumer).
+        if is_csi && self.vt_priv == 0 && final_byte == b'n' && self.vt_param <= 6 {
+            if !self.alt_screen {
+                // Cursor position is 1-based: after N printable columns the
+                // cursor sits at column N+1.
+                replies.push(format!("\x1b[{};{}R", self.vt_row, self.vt_col + 1).into_bytes());
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // DA1 (primary device attributes): `ESC [ c` / `ESC [ 0 c`. tmux and
+        // friends block their first draw waiting for this reply. Answered
+        // once; later queries are swallowed (see `da1_answered`).
+        if is_csi && self.vt_priv == 0 && final_byte == b'c' && self.vt_param <= 1 {
+            if !self.da1_answered {
+                replies.push(b"\x1b[?1;2c".to_vec()); // VT102 with AVO
+                self.da1_answered = true;
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // DA2 (secondary device attributes): `ESC [ > c` — once only.
+        if is_csi && self.vt_priv == 2 && final_byte == b'c' {
+            if !self.da2_answered {
+                replies.push(b"\x1b[>0;95;0c".to_vec());
+                self.da2_answered = true;
+            }
+            self.vt_param = 0;
+            return;
+        }
+        // XTGETTCAP (`ESC [ > q`): swallowed without forwarding and without
+        // a reply. Forwarding it would reach the user's outer terminal,
+        // whose answer comes back as console input at an unpredictable time
+        // and can leak into the focused pane as keys; not answering just
+        // leaves tmux's terminfo-feature probing unanswered, which it
+        // handles fine (it worked before query answering existed).
+        if is_csi && self.vt_priv == 2 && final_byte == b'q' {
+            self.vt_param = 0;
+            return;
+        }
         self.vt_dsr = false;
         self.vt_param = 0;
 
-        if is_dsr_query {
-            // Cursor position is 1-based: after N printable columns the
-            // cursor sits at column N+1.
-            *dsr_reply = Some((self.vt_row, self.vt_col + 1));
-            return;
-        }
-
         // Apply cursor movement so the tracker stays usable across
         // redraws: `C` (forward), `D` (back), `G` (column absolute).
-        let final_byte = seq[seq.len() - 1];
         match final_byte {
             b'C' => self.vt_col += self.vt_param.max(1),
             b'D' => self.vt_col = self.vt_col.saturating_sub(self.vt_param.max(1)),
@@ -1065,6 +1535,7 @@ impl Vmm {
     /// Emit one visible TX byte: track the current line for marker
     /// detection, hold back bytes that could start a protocol marker, and
     /// stream everything else to the user's terminal.
+    #[cfg(target_os = "macos")]
     fn emit_tx_byte(&mut self, ch: u8, stdout: &mut std::io::Stdout, markers: &[&[u8]]) {
         self.tx_line.push(ch);
 
@@ -1107,6 +1578,7 @@ impl Vmm {
 
     /// Handle one complete guest console line (marker side effects only —
     /// visible output has already been streamed to stdout).
+    #[cfg(target_os = "macos")]
     fn process_console_line(&mut self, line: &[u8]) {
         let Ok(line) = std::str::from_utf8(line) else {
             return;

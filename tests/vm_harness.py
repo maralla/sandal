@@ -62,15 +62,24 @@ class Vm:
     def wait_for(self, needle: bytes, count: int, timeout: float) -> bool:
         """Wait until `needle` appeared at least `count` times.
 
-        Commands are echoed by the guest, so requiring two occurrences
-        (echo + output) distinguishes the command from its result.
+        Occurrences are counted line-anchored: the marker must start a
+        line. The guest echoes commands (and long lines wrap), so a marker
+        embedded in the echoed text must not count — only the real output
+        puts the marker at the start of a line. Callers therefore pass
+        markers that never appear verbatim in the command (split them,
+        e.g. `echo DONE""_1`).
         """
+        import re as _re
+
+        def occurrences() -> int:
+            return len(_re.findall(b"(?m)^" + _re.escape(needle), self.buf))
+
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.buf.count(needle) >= count:
+            if occurrences() >= count:
                 return True
             self.read_more(0.2)
-        return self.buf.count(needle) >= count
+        return occurrences() >= count
 
     def wait_for_any(self, needles, timeout: float) -> bool:
         """Wait until any of `needles` has appeared at least once."""
@@ -83,6 +92,9 @@ class Vm:
 
     def send_line(self, line: str) -> None:
         os.write(self.master, line.encode() + b"\r")
+
+    def send_raw(self, data: bytes) -> None:
+        os.write(self.master, data)
 
     def run(
         self,

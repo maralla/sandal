@@ -18,8 +18,8 @@
 
 use super::GuestRam;
 use super::{
-    Args, Vmm, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET,
-    SPI_RNG,
+    host_tty_size, Args, Vmm, HOST_WINCH, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE,
+    SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG,
 };
 use crate::hypervisor::{KvmExit, Vm};
 use crate::virtio::console::VirtioConsoleDevice;
@@ -43,35 +43,146 @@ pub(super) struct KvmHost {
     /// Write end of the pipe used to stop the stdin poller thread.
     pub(super) stdin_stop_w: RawFd,
     pub(super) stdin_thread: Option<JoinHandle<()>>,
-    /// Last level issued for each tracked SPI (index: INTID - 32).
-    pub(super) irq_levels: [bool; NUM_TRACKED_SPIS],
+    /// Last level issued for each tracked line (index: INTID - 32).
+    /// Shared with the poller threads (see [`IrqLevels`]).
+    pub(super) irq_levels: IrqLevels,
 }
 
-/// Tracked SPI INTIDs: SPI_NET (INTID 48) through
+/// Shared tracked level for each IRQ line (index: INTID - 32 on arm64,
+/// ISA-pool slot on x86_64). The main loop and the poller threads both
+/// drive the same lines; this state must be shared, or a poller's direct
+/// pulse desyncs the main loop's view and the next raise becomes an
+/// edge-less no-op on the x86 edge-triggered PIC (a silently lost
+/// interrupt).
+pub(super) type IrqLevels = Arc<[AtomicBool; NUM_TRACKED_SPIS]>;
+
+pub(super) fn new_irq_levels() -> IrqLevels {
+    Arc::new(std::array::from_fn(|_| AtomicBool::new(false)))
+}
+
+/// Raise/lower a tracked line. `level == tracked` is a no-op for lower and
+/// a re-pend for raise: on x86 the edge-triggered PIC needs a fresh
+/// high-edge, so an already-high line that re-pends is pulsed
+/// (high→low→high); on arm64 the VGIC re-delivers level lines by itself.
+pub(super) fn irq_set_level(levels: &IrqLevels, idx: usize, vm: &Vm, line: u32, level: bool) {
+    let tracked = levels[idx].load(Ordering::Relaxed);
+    if level {
+        if tracked {
+            // Already high and the device re-pended: create a new edge on
+            // x86 (the VGIC needs nothing).
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = vm.irq_line(line, false);
+                let _ = vm.irq_line(line, true);
+            }
+        } else {
+            let _ = vm.irq_line(line, true);
+            levels[idx].store(true, Ordering::Relaxed);
+        }
+    } else if tracked {
+        let _ = vm.irq_line(line, false);
+        levels[idx].store(false, Ordering::Relaxed);
+    }
+}
+
+/// Create a fresh interrupt edge on a line this thread just made pending
+/// (data injected or a completion written). The line must be high
+/// afterwards; the tracked state records that.
+pub(super) fn irq_pulse(levels: &IrqLevels, idx: usize, vm: &Vm, line: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = vm.irq_line(line, false);
+        let _ = vm.irq_line(line, true);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = vm.irq_line(line, true);
+    }
+    levels[idx].store(true, Ordering::Relaxed);
+}
+
 impl Vmm {
     #[cfg(target_os = "linux")]
     pub(super) fn run_loop_kvm(&mut self, _args: &Args) -> Result<i32> {
         loop {
+            // Host terminal resized: re-apply the geometry to the guest
+            // console and interrupt it (the virtio console driver feeds the
+            // config change to hvc_resize, so the guest tty tracks the host
+            // window live).
+            if HOST_WINCH.swap(false, Ordering::Relaxed) {
+                let (cols, rows) = host_tty_size();
+                let config_change = self.console.lock().unwrap().set_size(cols, rows);
+                if config_change {
+                    let _guard = self.host.irq_lock.lock();
+                    irq_pulse(
+                        &self.host.irq_levels,
+                        (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
+                        &self.vm,
+                        self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
+                    );
+                }
+            }
+
             match self.vcpu.run()? {
                 // EINTR (e.g. SIGWINCH): just re-enter the guest.
                 KvmExit::Unknown(code) if code == u32::MAX => continue,
                 exit => self.handle_kvm_exit(exit)?,
             }
 
-            // Drain guest console TX → host stdout (intercepting protocol
-            // markers).
+            // Drain guest console TX → host stdout. On Linux the drained
+            // bytes go through the SHARED ConsoleTxFilter — the same one the
+            // net-kick thread uses. Two independent escape-sequence trackers
+            // would tear sequences apart at drain boundaries (one drainer
+            // sees `ESC [`, the other the rest), mangle query replies and
+            // corrupt the protocol-marker state, so the filter state must be
+            // singular.
             let tx = self
                 .console
                 .lock()
                 .unwrap()
                 .process_tx(self.memory.as_shared_slice(), RAM_BASE);
             if !tx.is_empty() {
-                self.process_console_tx(&tx);
+                let mut out = Vec::new();
+                let (replied, exit_code, export_path) = {
+                    let mut f = self.console_tx_filter.lock().unwrap();
+                    f.feed(&tx, &self.console, &self.memory, RAM_BASE, &mut out);
+                    let replied = f.replied;
+                    f.replied = false;
+                    (replied, f.exit_code.take(), f.export_path.take())
+                };
+                if !out.is_empty() {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&out);
+                    let _ = std::io::stdout().flush();
+                }
+                if let Some(code) = exit_code {
+                    self.guest_exit_code = Some(code);
+                    self.guest_shutdown = true;
+                }
+                if let Some(path) = export_path {
+                    self.export_save_path = Some(path);
+                }
+                if replied {
+                    // The filter answered a terminal query: the reply went
+                    // into the console RX. Raise the line under the lock.
+                    let _guard = self.host.irq_lock.lock();
+                    irq_pulse(
+                        &self.host.irq_levels,
+                        (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
+                        &self.vm,
+                        self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
+                    );
+                }
             }
 
             // Drain host input and network data into the guest, then mirror
-            // the device state onto the SPI lines.
+            // the device state onto the SPI lines. Under the irq_lock, per
+            // the locking contract: poller threads inject + raise under the
+            // same lock, so a raise can never be reordered after this
+            // loop's lowering decision (a lost interrupt).
             {
+                let irq_lock = self.host.irq_lock.clone();
+                let _guard = irq_lock.lock();
                 if let Some(net) = self.net.lock().unwrap().as_mut() {
                     net.poll_backend();
                     net.process_rx(self.memory.as_shared_slice(), RAM_BASE);
@@ -133,20 +244,7 @@ impl Vmm {
             let level = self.device_irq_level(spi);
             let idx = (spi - SPI_NET) as usize;
             let line = self.irq_line_for_spi(spi);
-            if self.host.irq_levels[idx] != level {
-                if self.vm.irq_line(line, level).is_ok() {
-                    self.host.irq_levels[idx] = level;
-                }
-            } else if level {
-                // The line is already high and the device re-pended. The
-                // VGIC (arm64) re-delivers level lines automatically, but the
-                // x86 PIC latches edges — pulse the line to create one.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = self.vm.irq_line(line, false);
-                    let _ = self.vm.irq_line(line, true);
-                }
-            }
+            irq_set_level(&self.host.irq_levels, idx, &self.vm, line, level);
         }
     }
 }
@@ -171,26 +269,32 @@ impl Vmm {
 pub(super) fn spawn_net_kicker(
     vm: Vm,
     net: Arc<Mutex<Option<VirtioNetDevice>>>,
+    console: Arc<Mutex<VirtioConsoleDevice>>,
     memory: Arc<GuestRam>,
+    filter: Arc<Mutex<super::ConsoleTxFilter>>,
     irq_lock: Arc<Mutex<()>>,
+    irq_levels: IrqLevels,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    #![allow(clippy::too_many_arguments)] // thread bootstrap; each arg is a distinct handle
     use std::collections::HashSet;
 
     std::thread::spawn(move || {
         let line = super::x86_64::x86_irq_for_slot(0); // net = ISA pool slot 0
-        let pulse = |line: u32| {
-            let _ = vm.irq_line(line, true);
-            // The PIC latches edges: pulse high->low->high.
-            let _ = vm.irq_line(line, false);
-            let _ = vm.irq_line(line, true);
-        };
+        let console_line = console_irq_line();
+        let console_idx = (SPI_CONSOLE - SPI_NET) as usize;
 
         let epfd = unsafe { libc::epoll_create1(0) };
         if epfd < 0 {
             return; // no net pump this boot; the run loop still polls per exit
         }
         let mut registered: HashSet<RawFd> = HashSet::new();
+        let mut wedged_empty_drains: u32 = 0;
+        // Only start counting empty drains after the guest produced console
+        // output once: the first TX proves the queue is live, so a subsequent
+        // silence is meaningful (apk/curl phases are quiet for many seconds
+        // without anything being wedged).
+        let mut saw_tx = false;
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -199,7 +303,78 @@ pub(super) fn spawn_net_kicker(
 
             // Pump: deliver anything pending, then sync + wait on the fds.
             {
+                // Drain the console TX: a guest writer blocked on a full TX
+                // virtqueue (full-screen apps like tmux) cannot generate
+                // exits, so the main loop alone would never drain it. Feed
+                // the raw bytes through the marker filter and pulse the
+                // console IRQ so the guest's blocked tty write resumes.
+                let console_tx = console
+                    .lock()
+                    .unwrap()
+                    .process_tx(memory.as_shared_slice(), RAM_BASE);
+                if console_tx.is_empty() {
+                    // Console TX wedge detection: the queue looks idle but a
+                    // guest console writer may be stuck (e.g. tmux's draw).
+                    // Once output has been seen this boot, dump the vring
+                    // state parsed straight from guest RAM (the only
+                    // guest-side view available when the vCPU is wedged in
+                    // the put_chars completion spin), plus any BAD_RING
+                    // (`id is not a head`) prints left in the kernel log ring.
+                    if saw_tx {
+                        wedged_empty_drains += 1;
+                    }
+                    if wedged_empty_drains >= 50 && (wedged_empty_drains - 50).is_multiple_of(100) {
+                        // Re-dump periodically: a later snapshot can catch
+                        // drift (e.g. a broken queue after a phantom
+                        // completion) that the first one missed.
+                        console
+                            .lock()
+                            .unwrap()
+                            .dump_vrings(memory.as_shared_slice(), RAM_BASE);
+                        crate::vmm_trace::dump_guest_ram_lines(
+                            memory.as_shared_slice(),
+                            "is not a head",
+                            "BAD_RING",
+                            8,
+                            120,
+                        );
+                    }
+                } else {
+                    saw_tx = true;
+                    wedged_empty_drains = 0;
+                }
+                let mut console_irq_pending = !console_tx.is_empty();
+                if !console_tx.is_empty() {
+                    let mut out = Vec::new();
+                    filter
+                        .lock()
+                        .unwrap()
+                        .feed(&console_tx, &console, &memory, RAM_BASE, &mut out);
+                    if !out.is_empty() {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&out);
+                        let _ = std::io::stdout().flush();
+                    }
+                    // The guest's terminal queries were answered: the reply
+                    // went into the console RX, so the console IRQ is
+                    // pending too.
+                    if filter.lock().unwrap().replied {
+                        filter.lock().unwrap().replied = false;
+                        console_irq_pending = true;
+                    }
+                }
                 let _guard = irq_lock.lock();
+                // The console completions (TX drained above) and any query
+                // replies pended the console vring interrupt: raise the line
+                // here. The main loop is blocked in KVM_RUN when the guest
+                // is halted and would never learn of them otherwise — its
+                // update_irq_lines only runs after an exit. Without this
+                // pulse the guest's vring_interrupt handler (hvc_kick →
+                // tty_wakeup) never runs and sleeping tty writers wedge
+                // forever (the tmux attached-client hang).
+                if console_irq_pending {
+                    irq_pulse(&irq_levels, console_idx, &vm, console_line);
+                }
                 let mut guard = net.lock().unwrap();
                 let delivered = match guard.as_mut() {
                     Some(net) => {
@@ -211,7 +386,7 @@ pub(super) fn spawn_net_kicker(
                     None => false,
                 };
                 if delivered {
-                    pulse(line);
+                    irq_pulse(&irq_levels, 0, &vm, line); // net = tracked idx 0
                 }
                 // Sync the epoll watch set with the netstack's current fds:
                 // add new ones (per connection), drop entries for fds that
@@ -298,6 +473,7 @@ pub(super) fn spawn_stdin_poller(
     console: Arc<Mutex<VirtioConsoleDevice>>,
     memory: Arc<GuestRam>,
     irq_lock: Arc<Mutex<()>>,
+    irq_levels: IrqLevels,
 ) -> Result<(JoinHandle<()>, RawFd)> {
     let mut pipe_fds = [0 as libc::c_int; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -353,12 +529,8 @@ pub(super) fn spawn_stdin_poller(
                     // x86_64 PIC latches edges, so pulse high→low→high; on
                     // arm64 the VGIC re-delivers the level line.
                     let line = console_irq_line();
-                    let _ = vm.irq_line(line, true);
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        let _ = vm.irq_line(line, false);
-                        let _ = vm.irq_line(line, true);
-                    }
+                    let idx = (SPI_CONSOLE - SPI_NET) as usize;
+                    irq_pulse(&irq_levels, idx, &vm, line);
                 }
                 continue;
             }

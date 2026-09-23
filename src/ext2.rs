@@ -2295,6 +2295,27 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
     // hvc0: virtio-console device (major 229, minor 0)
     inject_chardev(image, &sb, &bgdt, "dev/hvc0", 0o666, 229, 0)?;
 
+    // Terminal database: the guest console runs with TERM=linux, and the
+    // python REPL's readline (ncurses) needs the matching terminfo entry —
+    // without it the REPL falls back to dumb settings (no line editing).
+    // The terminfo format is arch-independent, so the host's entry works.
+    ensure_dir_path(image, &sb, &bgdt, "usr/share/terminfo/l")?;
+    for host_terminfo in ["/lib/terminfo/l/linux", "/usr/share/terminfo/l/linux"] {
+        if let Ok(data) = std::fs::read(host_terminfo) {
+            if !data.is_empty() {
+                inject_file(
+                    image,
+                    &sb,
+                    &bgdt,
+                    "usr/share/terminfo/l/linux",
+                    &data,
+                    0o644,
+                )?;
+                break;
+            }
+        }
+    }
+
     // CA certificates (TLS for apk/curl inside the guest). The directory
     // must exist: OpenSSL stats /etc/ssl/certs even when SSL_CERT_FILE
     // points at the bundle file.

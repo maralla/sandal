@@ -98,6 +98,9 @@ endif
 #   - interactive console input: echo latency, backspace erase, line edit
 #     (tests/test_console_input.py)
 #   - guest package management over TLS (tests/test_packages.py)
+#   - uv + CPython install and the interactive python REPL
+#     (tests/test_python_repl.py)
+#   - tmux in the guest (devpts / PTY support) (tests/test_tmux.py)
 #   - user-space network/curl test (tests/test_curl_hang.sh)
 #   - interactive console hang gate (tests/test_interactive_gate.sh)
 #
@@ -113,6 +116,8 @@ test: build $(KERNEL_DEP)
 	$(PYTHON) tests/test_share.py
 	$(PYTHON) tests/test_console_input.py
 	$(PYTHON) tests/test_packages.py
+	$(PYTHON) tests/test_python_repl.py
+	$(PYTHON) tests/test_tmux.py
 	tests/test_curl_hang.sh 1 128
 	$(TIMEOUT) $(if $(TIMEOUT),60,) env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_interactive_gate.sh --fail-fast --exit-cycle
 

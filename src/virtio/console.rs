@@ -117,6 +117,21 @@ impl VirtioConsoleDevice {
         cfg
     }
 
+    /// Resize the advertised console geometry (the host window changed).
+    /// Returns whether the config changed (the caller must raise the
+    /// config-change interrupt so the guest re-reads it — the virtio
+    /// console driver feeds this to hvc_resize).
+    pub fn set_size(&mut self, cols: u16, rows: u16) -> bool {
+        if self.cols == cols && self.rows == rows {
+            return false;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
+        self.work_gen += 1;
+        true
+    }
+
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     ///
     /// `sas` is the ARM64 Data Abort ISS access size (`0` byte … `3` doubleword). Required for
@@ -194,7 +209,21 @@ impl VirtioConsoleDevice {
             }
             REG_QUEUE_READY => {
                 if (self.queue_sel as usize) < NUM_QUEUES {
-                    self.queues[self.queue_sel as usize].ready = value != 0;
+                    let sel = self.queue_sel as usize;
+                    let was_ready = self.queues[sel].ready;
+                    self.queues[sel].ready = value != 0;
+                    // A queue re-setup (ready 0→1 with new addresses) without a
+                    // device reset: the driver allocated a fresh vring and its
+                    // counters start over — ours must too, or we drain phantoms.
+                    if value != 0 && !was_ready {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "TX_QUEUE_SETUP sel={sel} avail={:#x} used={:#x} num={} last_avail={}",
+                            self.queues[sel].avail_addr,
+                            self.queues[sel].used_addr,
+                            self.queues[sel].num,
+                            self.queues[sel].last_avail_idx
+                        ));
+                    }
                 }
             }
             REG_QUEUE_NOTIFY => {
@@ -211,6 +240,10 @@ impl VirtioConsoleDevice {
             REG_STATUS => {
                 self.status = value;
                 if value == 0 {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "TX_RESET last_avail={}",
+                        self.queues[TX_QUEUE].last_avail_idx
+                    ));
                     self.reset();
                 }
             }
@@ -303,15 +336,51 @@ impl VirtioConsoleDevice {
     pub fn process_tx(&mut self, memory: &mut [u8], ram_base: u64) -> Vec<u8> {
         let q = self.queues[TX_QUEUE].clone();
         if !q.ready || q.num == 0 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "TX_SKIP reason=queue_not_ready ready={} num={}",
+                q.ready, q.num
+            ));
             return Vec::new();
         }
 
         let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
             Some(idx) => idx,
-            None => return Vec::new(),
+            None => {
+                crate::vmm_trace::write_console_io(format_args!("TX_SKIP reason=bad_avail_ring"));
+                return Vec::new();
+            }
         };
 
         let mut last_avail = self.queues[TX_QUEUE].last_avail_idx;
+        // Overtake guard (guest lapping the avail ring): the avail ring has
+        // only `num` slots: once the driver is a full ring ahead of
+        // `last_avail`, the slot for every older submission has been
+        // overwritten with a newer head. Draining the older window would
+        // complete a *phantom* head — the same descriptor id twice — and the
+        // guest's second `virtqueue_get_buf` then hits `desc_state[id].data
+        // == NULL`, trips BAD_RING ("is not a head"), marks the queue
+        // broken, and the console TX dies permanently (every later
+        // `virtqueue_add_outbuf` is -ENOENT, so a nonblocking writer like
+        // tmux gets EAGAIN once and its write event is never re-armed).
+        // Only the last `num` submissions have trustworthy slots: drop the
+        // contaminated prefix and drain that window.
+        let num16 = q.num as u16;
+        if num16 != 0 && avail_idx.wrapping_sub(last_avail) > num16 {
+            let target = avail_idx.wrapping_sub(num16);
+            crate::vmm_trace::write_console_io(format_args!(
+                "TX_OVERTAKE last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
+                target
+            ));
+            last_avail = target;
+        }
+
+        if last_avail == avail_idx {
+            let used_idx = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+            crate::vmm_trace::write_console_io(format_args!(
+                "TX_SKIP reason=no_new_heads last_avail={last_avail} avail_idx={avail_idx} used_idx={used_idx} avail_addr={:#x} used_addr={:#x} num={} ready={}",
+                q.avail_addr, q.used_addr, q.num, q.ready
+            ));
+        }
         let mut used_count = 0u16;
         let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
         let mut output = Vec::new();
@@ -324,7 +393,12 @@ impl VirtioConsoleDevice {
             let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
             {
                 Some(d) => d,
-                None => break,
+                None => {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "TX_SKIP reason=bad_avail_ring_entry last_avail={last_avail} avail_idx={avail_idx}"
+                    ));
+                    break;
+                }
             };
 
             // Walk the descriptor chain, collecting readable (guest→host) bytes
@@ -362,6 +436,9 @@ impl VirtioConsoleDevice {
             )
             .is_none()
             {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "TX_SKIP reason=bad_used_ring used_count={used_count}"
+                ));
                 break;
             }
             used_count += 1;
@@ -380,9 +457,10 @@ impl VirtioConsoleDevice {
             self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
             self.work_gen += 1;
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_SET_IRQ used_count={used_count} out_bytes={} irq_status={}",
+                "TX_SET_IRQ used_count={used_count} out_bytes={} irq_status={} last_avail={}",
                 output.len(),
                 self.interrupt_status,
+                last_avail
             ));
         }
 
@@ -396,6 +474,80 @@ impl VirtioConsoleDevice {
         }
 
         output
+    }
+
+    /// Dump the raw vring state of both queues from guest RAM (wedge
+    /// diagnostics): the device's `last_avail_idx` beside the rings' own
+    /// indices, the full avail-ring head-id window, the full used-ring
+    /// (id, len) window, and the descriptor table entries for every id the
+    /// used ring references. From these three arrays the entire recent
+    /// submit/complete history can be reconstructed off-guest, which is the
+    /// only way to see the driver↔device desync when the guest console
+    /// writer is wedged in `__send_to_port`'s completion spin.
+    pub fn dump_vrings(&self, memory: &[u8], ram_base: u64) {
+        for (name, q) in [
+            ("RX", &self.queues[RX_QUEUE]),
+            ("TX", &self.queues[TX_QUEUE]),
+        ] {
+            if !q.ready || q.num == 0 {
+                crate::vmm_trace::write_console_io(format_args!(
+                    "VRING {name} not-ready num={} ready={}",
+                    q.num, q.ready
+                ));
+                continue;
+            }
+            let avail_idx = read_avail_idx(memory, ram_base, q.avail_addr).unwrap_or(0);
+            let used_idx = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+            crate::vmm_trace::write_console_io(format_args!(
+                "VRING {name} num={} last_avail(dev)={} avail_idx(ring)={avail_idx} used_idx(ring)={used_idx} desc={:#x} avail={:#x} used={:#x}",
+                q.num, q.last_avail_idx, q.desc_addr, q.avail_addr, q.used_addr,
+            ));
+
+            // Avail ring: the head id in each of the `num` slots.
+            let mut slots = String::new();
+            for s in 0..q.num as u16 {
+                let id =
+                    read_avail_ring(memory, ram_base, q.avail_addr, s, q.num).unwrap_or(0xffff);
+                slots.push_str(&format!("{id},"));
+            }
+            crate::vmm_trace::write_console_io(format_args!(
+                "VRING {name} AVAIL_SLOTS(id per slot 0..num): {slots}"
+            ));
+
+            // Used ring: every (id, len) entry in the window.
+            let mut entries = String::new();
+            let mut used_ids: Vec<u16> = Vec::new();
+            for s in 0..q.num as u16 {
+                match read_used_ring_entry(memory, ram_base, q.used_addr, s, q.num) {
+                    Some((id, len)) => {
+                        entries.push_str(&format!("{id}:{len},"));
+                        used_ids.push(id as u16);
+                    }
+                    None => entries.push_str("?,"),
+                }
+            }
+            crate::vmm_trace::write_console_io(format_args!(
+                "VRING {name} USED_ENTRIES(id:len per slot 0..num): {entries}"
+            ));
+
+            // Descriptor table entries for the ids the used ring references.
+            used_ids.sort_unstable();
+            used_ids.dedup();
+            for id in used_ids.iter() {
+                match read_descriptor(memory, ram_base, q.desc_addr, *id) {
+                    Some((addr, len, flags, next)) => {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "VRING {name} DESC[{id}] addr={addr:#x} len={len} flags={flags:#x} next={next}"
+                        ));
+                    }
+                    None => {
+                        crate::vmm_trace::write_console_io(format_args!(
+                            "VRING {name} DESC[{id}] unreadable"
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Inject a prefix of `data` into the RX queue. Returns **how many bytes** from the start of
@@ -429,6 +581,21 @@ impl VirtioConsoleDevice {
         };
 
         let mut last_avail = self.queues[RX_QUEUE].last_avail_idx;
+
+        // Overtake guard, mirroring `process_tx`: if the driver posted a full
+        // ring of RX buffers past `last_avail`, the older slots now hold
+        // newer heads and draining them would complete phantom descriptors
+        // (BAD_RING in the guest kills the queue permanently). Only trust
+        // the last `num` posts.
+        let num16 = q.num as u16;
+        if num16 != 0 && avail_idx.wrapping_sub(last_avail) > num16 {
+            crate::vmm_trace::write_console_io(format_args!(
+                "RX_OVERTAKE last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
+                avail_idx.wrapping_sub(num16)
+            ));
+            last_avail = avail_idx.wrapping_sub(num16);
+        }
+
         if last_avail == avail_idx {
             crate::vmm_trace::write_console_io(format_args!(
                 "INJECT_RX_SKIP in_len={} reason=no_avail_buffers avail_idx={last_avail}",

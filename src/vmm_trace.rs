@@ -43,6 +43,61 @@ pub fn console_io_enabled() -> bool {
     })
 }
 
+/// Scan guest RAM for occurrences of a kernel-log needle and dump the
+/// matching lines to the trace sink, keeping `context` bytes of pre-needle
+/// prefix (trimmed to the enclosing log line) so printk timestamps and the
+/// device/queue name preceding the needle survive in the dump. The guest
+/// kernel log ring (`__log_buf`) holds printk output even when the guest
+/// vCPU is wedged in a busy-wait, so this is the only way to observe
+/// guest-side state during a console wedge.
+pub fn dump_guest_ram_lines(memory: &[u8], needle: &str, label: &str, max: usize, context: usize) {
+    let needle = needle.as_bytes();
+    let mut found: Vec<&[u8]> = Vec::new();
+    let mut i = 0;
+    // The guest kernel log ring lives in the kernel image, loaded at the
+    // bottom of RAM; capping the scan keeps this diagnostic (which runs on
+    // the net-kick thread — the console TX drainer!) bounded to a few
+    // milliseconds instead of a full-RAM sweep.
+    let scan_end = memory.len().min(64 << 20);
+    while i < scan_end {
+        let Some(o) = memory[i..scan_end]
+            .windows(needle.len())
+            .position(|w| w == needle)
+        else {
+            break;
+        };
+        let p = o + i;
+        // Include a bounded prefix (still cut at the previous newline so we
+        // never bleed into the prior log record) and up to the next newline
+        // after the match.
+        let line_start = memory[..p]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|s| s + 1)
+            .unwrap_or(0);
+        let start = line_start.max(p.saturating_sub(context));
+        let end = memory[p..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|e| (p + e).min(p + 200))
+            .unwrap_or(p + 200)
+            .min(memory.len());
+        found.push(&memory[start..end]);
+        i = p + needle.len();
+        // No early break: the printk ring is circular, so "last by address"
+        // is not "last by time" — collect everything and let the caller
+        // keep the tail.
+    }
+    let skip = found.len().saturating_sub(max);
+    for line in found.iter().skip(skip) {
+        let s = String::from_utf8_lossy(line);
+        let line = format!("RAMLOG {label}: {s}");
+        if let Ok(mut g) = sink().lock() {
+            g.write_line(&line);
+        }
+    }
+}
+
 /// Escape a byte slice for one log field (length capped).
 pub fn bytes_preview(data: &[u8], max: usize) -> String {
     let mut s = String::new();
