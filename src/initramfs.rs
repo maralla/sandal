@@ -259,7 +259,7 @@ pub fn export_done_helper() -> &'static [u8] {
 /// word at the page offset (an MMIO write), then exit. MMIO works from
 /// userspace without I/O-port privileges (which nested KVM denies).
 #[cfg(target_arch = "x86_64")]
-fn build_hypercall_elf(signal: u32) -> Vec<u8> {
+fn build_hypercall_elf(signal: u32, mmio_base: u64) -> Vec<u8> {
     use crate::elf::x86_64::{lea, mov_i, mov_m_imm32, sys, syscall_ins, zero, X86ElfBuilder, RSI};
 
     let mut e = X86ElfBuilder::new();
@@ -280,7 +280,7 @@ fn build_hypercall_elf(signal: u32) -> Vec<u8> {
         crate::elf::x86_64::R8,
         crate::elf::x86_64::RAX,
     )); // fd
-    let (page, off) = crate::vm::x86_hypercall_page_off();
+    let (page, off) = crate::vm::x86_hypercall_page_off(mmio_base);
     e.emit(&crate::elf::x86_64::mov_r_imm64(
         crate::elf::x86_64::R9,
         page,
@@ -314,8 +314,8 @@ fn build_hypercall_elf(signal: u32) -> Vec<u8> {
     e.build()
 }
 #[cfg(target_arch = "x86_64")]
-fn hypercall_elf(cache: &'static OnceLock<Vec<u8>>, signal: u32) -> &'static [u8] {
-    cache.get_or_init(|| build_hypercall_elf(signal))
+fn hypercall_elf(cache: &'static OnceLock<Vec<u8>>, signal: u32, mmio_base: u64) -> &'static [u8] {
+    cache.get_or_init(|| build_hypercall_elf(signal, mmio_base))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -324,19 +324,23 @@ static EXPORT_RESIZE_HELPER: OnceLock<Vec<u8>> = OnceLock::new();
 static EXPORT_DONE_HELPER: OnceLock<Vec<u8>> = OnceLock::new();
 
 #[cfg(target_arch = "x86_64")]
-pub fn export_resize_helper() -> &'static [u8] {
+pub fn export_resize_helper(mmio_base: u64) -> Vec<u8> {
     hypercall_elf(
         &EXPORT_RESIZE_HELPER,
         crate::elf::x86_64_linux::EXPORT_RESIZE_PORT as u32,
+        mmio_base,
     )
+    .to_vec()
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn export_done_helper() -> &'static [u8] {
+pub fn export_done_helper(mmio_base: u64) -> Vec<u8> {
     hypercall_elf(
         &EXPORT_DONE_HELPER,
         crate::elf::x86_64_linux::EXPORT_DONE_PORT as u32,
+        mmio_base,
     )
+    .to_vec()
 }
 
 /// Generate the `sandal-export` shell script for the guest.
@@ -365,8 +369,9 @@ mod helper_tests {
     #[test]
     fn dump_helpers() {
         if std::env::var_os("SANDAL_DUMP_HELPERS").is_some() {
-            std::fs::write("/tmp/helper-done", super::export_done_helper()).unwrap();
-            std::fs::write("/tmp/helper-resize", super::export_resize_helper()).unwrap();
+            let page = 0x4000_0000u64; // the dump helper only checks that it builds
+            std::fs::write("/tmp/helper-done", super::export_done_helper(page)).unwrap();
+            std::fs::write("/tmp/helper-resize", super::export_resize_helper(page)).unwrap();
             #[cfg(target_arch = "x86_64")]
             std::fs::write("/tmp/helper-ctty", super::ctty_helper()).unwrap();
         }

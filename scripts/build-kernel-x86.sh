@@ -30,7 +30,12 @@ if [ ! -d "$KSRC" ]; then
 fi
 
 cd "$KSRC"
-make O=build x86_64_defconfig 2>&1 | tail -1
+# Minimal base: allnoconfig instead of x86_64_defconfig. The defconfig
+# kernel (hundreds of drivers, ~43MB vmlinux) spends ~800ms booting; the
+# fragment below enables only what the sandal guest needs and boots in
+# tens of milliseconds. The fragment must therefore be a COMPLETE config
+# (architecture basics included), not a delta.
+make O=build allnoconfig 2>&1 | tail -1
 
 # Apply the fragment with scripts/config (never touches the source root; a
 # stray .config there makes O= builds refuse to run).

@@ -1,6 +1,6 @@
 BINARY := target/release/sandal
 ENTITLEMENTS := sandal.entitlements
-BUILTIN_ROOTFS := src/rootfs.ext2.gz
+BUILTIN_ROOTFS := src/rootfs.ext2.zst
 
 # Alpine minirootfs settings (source for the embedded rootfs). The guest
 # architecture matches the host (KVM/HVF are same-arch), so the rootfs is

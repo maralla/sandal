@@ -72,8 +72,9 @@ for dir in bin sbin usr/bin usr/sbin; do
     done
 done
 
-# Pack into ext2 and compress
+# Pack into ext2 and compress (zstd: ~3x faster to decode than gzip at
+# a similar ratio — the VMM decompresses this on every VM start).
 "$PACK_BIN" pack "$_R" -o "$_R/minimal.ext2"
-gzip -9 -c "$_R/minimal.ext2" > "$OUTPUT"
+zstd -19 -c "$_R/minimal.ext2" > "$OUTPUT"
 
 echo "Built $OUTPUT ($(wc -c < "$OUTPUT" | tr -d ' ') bytes)"

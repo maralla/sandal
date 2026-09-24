@@ -6,8 +6,6 @@
 /// Only handles regular files, directories, and symlinks — sufficient for
 /// the `.layer` format used by `sandal-export`.
 use anyhow::{Context, Result};
-use flate2::read::GzDecoder;
-use std::io::Read;
 
 /// Tar entry types we support.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -27,17 +25,13 @@ pub struct TarEntry {
     pub data: Vec<u8>,
 }
 
-/// Read a gzip-compressed tar archive (.layer file) and return parsed entries.
+/// Read a zstd-compressed tar archive (.layer file) and return parsed entries.
 ///
-/// Decompresses the gzip layer, then parses each tar header to extract
+/// Decompresses the zstd layer, then parses each tar header to extract
 /// files, directories, and symlinks.  Used by the host to inject layer
 /// contents into an ext2 disk image.
-pub fn read_tar_gz(gz_data: &[u8]) -> Result<Vec<TarEntry>> {
-    let mut decoder = GzDecoder::new(gz_data);
-    let mut tar_data = Vec::new();
-    decoder
-        .read_to_end(&mut tar_data)
-        .context("Failed to decompress .layer gzip data")?;
+pub fn read_tar_zst(zst_data: &[u8]) -> Result<Vec<TarEntry>> {
+    let tar_data = zstd::decode_all(zst_data).context("Failed to decompress .layer zstd data")?;
 
     parse_tar(&tar_data)
 }
@@ -407,20 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn gzip_layer_roundtrip() {
-        // `read_tar_gz` (host layer loader) must accept what `write_tar`
-        // produces after gzip compression.
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
+    fn zstd_layer_roundtrip() {
+        // `read_tar_zst` (host layer loader) must accept what `write_tar`
+        // produces after zstd compression.
         use std::io::Write;
 
         let entries = vec![dir("bin"), file("bin/tool", b"#!/bin/sh\n", 0o755)];
         let tar = write_tar(&entries);
-        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut enc = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
         enc.write_all(&tar).unwrap();
-        let gz = enc.finish().unwrap();
+        let zst = enc.finish().unwrap();
 
-        let parsed = read_tar_gz(&gz).expect("read generated .layer");
+        let parsed = read_tar_zst(&zst).expect("read generated .layer");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].path, "bin");
         assert_eq!(parsed[1].path, "bin/tool");

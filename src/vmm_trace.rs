@@ -51,6 +51,14 @@ pub fn console_io_enabled() -> bool {
 /// vCPU is wedged in a busy-wait, so this is the only way to observe
 /// guest-side state during a console wedge.
 pub fn dump_guest_ram_lines(memory: &[u8], needle: &str, label: &str, max: usize, context: usize) {
+    // Only when tracing to a FILE: without one the sink would eprintln! to
+    // the console, and the host tty has OPOST disabled — a bare-\n line
+    // there indents the guest's next output by this line's width, corrupting
+    // the guest's own rendering (the artifact this diagnostic exists to
+    // investigate).
+    if sink().lock().map(|s| s.file.is_none()).unwrap_or(true) {
+        return;
+    }
     let needle = needle.as_bytes();
     let mut found: Vec<&[u8]> = Vec::new();
     let mut i = 0;
@@ -82,7 +90,15 @@ pub fn dump_guest_ram_lines(memory: &[u8], needle: &str, label: &str, max: usize
             .map(|e| (p + e).min(p + 200))
             .unwrap_or(p + 200)
             .min(memory.len());
-        found.push(&memory[start..end]);
+        // Skip printk FORMAT strings living in .rodata (e.g. `%s:id %u is
+        // not a head!`): they match needles baked into them but are not
+        // runtime log records. Real records carry rendered values.
+        let candidate = &memory[start..end];
+        if candidate.windows(2).any(|w| w == b"%s") || candidate.windows(2).any(|w| w == b"%u") {
+            i = p + needle.len();
+            continue;
+        }
+        found.push(candidate);
         i = p + needle.len();
         // No early break: the printk ring is circular, so "last by address"
         // is not "last by time" — collect everything and let the caller

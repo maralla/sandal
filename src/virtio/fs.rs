@@ -68,6 +68,7 @@ const FUSE_FSYNCDIR: u32 = 30;
 const FUSE_ACCESS: u32 = 34;
 const FUSE_CREATE: u32 = 35;
 const FUSE_DESTROY: u32 = 38;
+const FUSE_POLL: u32 = 40;
 const FUSE_BATCH_FORGET: u32 = 42;
 const FUSE_READDIRPLUS: u32 = 44;
 const FUSE_RENAME2: u32 = 45;
@@ -775,8 +776,19 @@ impl VirtioFsDevice {
             // Extended attributes: return ENODATA (not supported on this filesystem)
             FUSE_GETXATTR | FUSE_LISTXATTR => make_error(unique, ENODATA),
             FUSE_SETXATTR | FUSE_REMOVEXATTR => make_error(unique, ENOSYS),
+            // FUSE_POLL: applications polling files on the share. The reply
+            // (ENOSYS) makes the guest's fuse client latch `no_poll` and fall
+            // back to kernel-side polling for the rest of the mount — it must
+            // NOT be logged at warn level: a parallel build fires a burst of
+            // these, and every console-print interleaves with the guest's
+            // output, mangling its screen layout.
+            FUSE_POLL => make_error(unique, ENOSYS),
             _ => {
-                warn!("virtiofs: unsupported opcode {opcode}");
+                // Genuinely unknown opcodes are handled with ENOSYS too; the
+                // reply is what matters — the guest keeps working. Only log
+                // at debug level: warn-level output here would interleave
+                // with guest console output and corrupt its rendering.
+                debug!("virtiofs: unsupported opcode {opcode}");
                 make_error(unique, ENOSYS)
             }
         }

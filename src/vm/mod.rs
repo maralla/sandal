@@ -25,12 +25,9 @@ use crate::virtio::fs::VirtioFsDevice;
 use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 use anyhow::{anyhow, Result};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -55,20 +52,34 @@ pub(crate) use x86_64::{MAX_FS_DEVICES, RAM_BASE};
 
 // ── Virtio-MMIO device addresses (both architectures) ──────────────────
 // The x86_64 device window sits at 1 GB, ABOVE the guest RAM: the flat
-// physical address space starts at 0, and a device region inside "System
-// RAM" would make the kernel's request_mem_region fail with -EBUSY (and
-// capping RAM below the devices would shrink tmpfs /tmp, breaking larger
-// installs like uv). RAM is capped at MMIO_BASE.
-#[cfg(target_arch = "x86_64")]
-pub(crate) const MMIO_BASE: u64 = 0x4000_0000;
+// aarch64: a fixed device window at 160 MB (guest RAM starts at 1 GB,
+// above it — the devices never overlap "System RAM").
 #[cfg(target_arch = "aarch64")]
 pub(crate) const MMIO_BASE: u64 = 0x0a00_0000;
-pub(crate) const VIRTIO_NET_BASE: u64 = MMIO_BASE;
-pub(crate) const VIRTIO_CONSOLE_BASE: u64 = MMIO_BASE + 0x200;
-pub(crate) const VIRTIO_BLK_BASE: u64 = MMIO_BASE + 0x400;
-pub(crate) const DATA_BLK_BASE: u64 = MMIO_BASE + 0x600;
-pub(crate) const VIRTIO_RNG_BASE: u64 = MMIO_BASE + 0x800;
-pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + 0x1000;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIO_NET_BASE: u64 = MMIO_BASE + MMIO_OFF_NET;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIO_CONSOLE_BASE: u64 = MMIO_BASE + MMIO_OFF_CONSOLE;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIO_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_BLK;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const DATA_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_DATA_BLK;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIO_RNG_BASE: u64 = MMIO_BASE + MMIO_OFF_RNG;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + MMIO_OFF_FS;
+
+// Per-device offsets inside the MMIO window (shared by both architectures).
+// x86_64 places the window ABOVE the guest RAM (see `x86_64::mmio_base`) so
+// the guest gets the full requested memory: capping RAM below a fixed device
+// region silently shrank `-m` to 1 GB and OOM-killed large builds.
+pub(crate) const MMIO_OFF_NET: u64 = 0x000;
+pub(crate) const MMIO_OFF_CONSOLE: u64 = 0x200;
+pub(crate) const MMIO_OFF_BLK: u64 = 0x400;
+pub(crate) const MMIO_OFF_DATA_BLK: u64 = 0x600;
+pub(crate) const MMIO_OFF_RNG: u64 = 0x800;
+pub(crate) const MMIO_OFF_HYPERCALL: u64 = 0xe00;
+pub(crate) const MMIO_OFF_FS: u64 = 0x1000;
 pub(crate) const VIRTIOFS_SIZE: u64 = 0x200;
 
 // ── Host terminal helpers ────────────────────────────────────────────────
@@ -144,7 +155,8 @@ impl GuestRam {
             panic!("failed to mmap {len} bytes of guest RAM");
         }
         let ptr = ptr as *mut u8;
-        unsafe { std::ptr::write_bytes(ptr, 0, len) };
+        // MAP_ANONYMOUS memory is already zero-filled by the kernel (lazy
+        // zero pages until first write) — no explicit memset needed.
         GuestRam { ptr, len }
     }
 
@@ -507,6 +519,9 @@ struct Vmm {
     /// sequences tear apart at drain boundaries.
     #[cfg(target_os = "linux")]
     console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
+    /// x86_64: base of the MMIO device window (above the guest RAM).
+    #[cfg(target_arch = "x86_64")]
+    mmio_base: u64,
     /// Terminal-query reply dedup for the macOS path (no shared filter —
     /// the run loop's own tracker does the answering).
     #[cfg(target_os = "macos")]
@@ -671,21 +686,59 @@ fn bail_shares_dir(host: &str) -> Result<()> {
     anyhow::bail!("shared path is not a directory: {host}");
 }
 
-/// Map a guest physical address to a virtiofs device index, if in range.
-fn virtiofs_index(addr: u64) -> Option<usize> {
-    let end = VIRTIOFS_BASE_START + MAX_FS_DEVICES as u64 * VIRTIOFS_SIZE;
-    if (VIRTIOFS_BASE_START..end).contains(&addr) {
-        Some(((addr - VIRTIOFS_BASE_START) / VIRTIOFS_SIZE) as usize)
-    } else {
-        None
+impl Vmm {
+    /// Base of this platform's MMIO device window: on x86_64 it sits just
+    /// above the guest RAM (the window position depends on `-m`); on
+    /// aarch64 it is a fixed low region below RAM.
+    #[cfg(target_arch = "x86_64")]
+    fn mmio_window(&self) -> u64 {
+        self.mmio_base
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn mmio_window(&self) -> u64 {
+        MMIO_BASE
+    }
+
+    /// Map a guest physical address to a virtiofs device index, if in range.
+    fn virtiofs_index(&self, addr: u64) -> Option<usize> {
+        let start = self.mmio_window() + MMIO_OFF_FS;
+        let end = start + MAX_FS_DEVICES as u64 * VIRTIOFS_SIZE;
+        if (start..end).contains(&addr) {
+            Some(((addr - start) / VIRTIOFS_SIZE) as usize)
+        } else {
+            None
+        }
     }
 }
 
 /// Run a VM to execute the requested command, returning the guest's exit
 /// status when it exits.
+/// Print a diagnostic line to the host console (stderr). The host tty runs
+/// with OPOST disabled (the guest's raw output requires it, and termios is
+/// per-tty, so stderr shares the setting): a bare `\n` moves the cursor
+/// down WITHOUT returning to column 0, so the guest's next output would
+/// appear indented by this line's width. Emit CRLF explicitly — harmless
+/// on a normal tty (an extra CR renders as nothing).
+pub(crate) fn console_eprintln(msg: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{msg}\r");
+}
+
+/// Process-start timestamp for BOOT_TIMING diagnostics.
+pub static BOOT_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 pub fn run(args: Args) -> Result<i32> {
+    let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+    let t0 = BOOT_T0.get_or_init(std::time::Instant::now);
     let mut vmm = Vmm::new(&args)?;
+    if timing {
+        eprintln!("BOOT_TIMING vmm_new: {:?}", t0.elapsed());
+    }
     vmm.boot(&args)?;
+    if timing {
+        eprintln!("BOOT_TIMING boot (disks+rootfs+kernel): {:?}", t0.elapsed());
+    }
     #[cfg(target_os = "linux")]
     {
         vmm.run_loop_kvm(&args)
@@ -709,9 +762,9 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
     }
     let mut all_entries = Vec::new();
     for layer in &args.layers {
-        let gz = fs::read(layer)
+        let layer_data = fs::read(layer)
             .map_err(|e| anyhow!("failed to read layer {}: {e}", layer.display()))?;
-        let entries = crate::tar::read_tar_gz(&gz)?;
+        let entries = crate::tar::read_tar_zst(&layer_data)?;
         all_entries.extend(entries);
     }
     let layer_data = crate::tar::total_data_size(&all_entries);
@@ -728,12 +781,25 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
 // ─────────────────────────────────────────────────────────────────────────────
 impl Vmm {
     fn new(args: &Args) -> Result<Self> {
+        let tt = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+        let mut tp = std::time::Instant::now();
         let vm = Vm::new()?;
+        if tt {
+            eprintln!("BOOT_TIMING   vm_create: {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
 
         // In-kernel interrupt controllers must exist before the first vCPU:
         // x86_64 gets the PIC+PIT (the guest timer), arm64 the GICv3.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        vm.create_irqchip()?;
+        {
+            let t = std::time::Instant::now();
+            vm.create_irqchip()?;
+            if tt {
+                eprintln!("BOOT_TIMING   irqchip: {:?}", t.elapsed());
+                tp = std::time::Instant::now();
+            }
+        }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         vm.create_vgic(
             aarch64::GICD_BASE,
@@ -753,10 +819,19 @@ impl Vmm {
         // device would otherwise collide with "System RAM" (-EBUSY) and no
         // device would ever probe.
         #[cfg(target_arch = "x86_64")]
-        let ram_bytes = (args.memory.max(64) * 1024 * 1024).min(MMIO_BASE as usize);
+        // No RAM cap: the MMIO device window is placed above the guest RAM
+        // (see `x86_64::mmio_base`), so `-m` is honored in full. The 1 TB
+        // ceiling only guards against absurd values; the mmap is lazy.
+        let ram_bytes = (args.memory.max(64) * 1024 * 1024).min(1 << 40);
         #[cfg(target_arch = "aarch64")]
         let ram_bytes = args.memory.max(64) * 1024 * 1024;
         let memory = Arc::new(GuestRam::new(ram_bytes));
+        #[cfg(target_arch = "x86_64")]
+        let mmio_base = x86_64::mmio_base(ram_bytes as u64);
+        if tt {
+            eprintln!("BOOT_TIMING   guest_ram: {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
         vm.map_memory(
             memory.as_shared_slice().as_ptr() as *mut _,
             RAM_BASE,
@@ -816,6 +891,10 @@ impl Vmm {
         // poll the backend after every guest exit and the Linux net-kick
         // thread pumps it independently, so an idle guest never waits for
         // its own delayed-ACK timer before more host data is delivered.
+        if tt {
+            eprintln!("BOOT_TIMING   console+winch: {:?}", tp.elapsed());
+            tp = std::time::Instant::now();
+        }
         let net = if args.no_network {
             Arc::new(Mutex::new(None))
         } else {
@@ -831,6 +910,9 @@ impl Vmm {
 
             Arc::new(Mutex::new(Some(VirtioNetDevice::new(backend, filter))))
         };
+        if tt {
+            eprintln!("BOOT_TIMING   net: {:?}", tp.elapsed());
+        }
 
         // Per-boot exit-protocol token (x86_64): the init script echoes
         // `<token><status>`; the VMM only treats that as the protocol, so
@@ -907,6 +989,8 @@ impl Vmm {
             console,
             #[cfg(target_os = "linux")]
             console_tx_filter,
+            #[cfg(target_arch = "x86_64")]
+            mmio_base,
             #[cfg(target_os = "macos")]
             da1_answered: false,
             #[cfg(target_os = "macos")]
@@ -965,11 +1049,16 @@ impl Vmm {
     }
 
     fn boot(&mut self, args: &Args) -> Result<()> {
+        let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         // ── Writable data disk (vdb): --disk-size / --layer ────────────
         // Created first: DISK_MODE in the init config selects the overlay
         // upperdir (disk vs tmpfs), so `data_blk` must be known by then.
         if args.disk_size.is_some() || !args.layers.is_empty() {
             self.data_blk = Some(VirtioBlkDevice::new(build_data_disk(args)?));
+        }
+        if timing {
+            eprintln!("BOOT_TIMING data_disk: {:?}", t0.elapsed());
         }
 
         // ── Init config blob ───────────────────────────────────────────
@@ -1020,10 +1109,17 @@ impl Vmm {
         let mut rootfs_img = match &args.rootfs {
             Some(path) => fs::read(path)
                 .map_err(|e| anyhow!("failed to read rootfs {}: {e}", path.display()))?,
-            None => crate::rootfs::load(),
+            None => {
+                let t = std::time::Instant::now();
+                let img = crate::rootfs::load();
+                if timing {
+                    eprintln!("BOOT_TIMING rootfs_gunzip: {:?}", t.elapsed());
+                }
+                img
+            }
         };
 
-        crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network)?;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network, self.mmio_base)?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1045,6 +1141,9 @@ impl Vmm {
         // ── Load the kernel ─────────────────────────────────────────────
         #[cfg(target_arch = "x86_64")]
         self.boot_kernel_x86(args)?;
+        if timing {
+            eprintln!("BOOT_TIMING kernel_load: {:?}", t0.elapsed());
+        }
 
         #[cfg(target_arch = "aarch64")]
         self.boot_kernel_arm64(args)?;
@@ -1074,6 +1173,7 @@ impl Drop for Vmm {
 // ─────────────────────────────────────────────────────────────────────────────
 impl Vmm {
     fn mmio_read(&mut self, addr: u64, len: usize, sas: u8) -> u64 {
+        let mw = self.mmio_window();
         #[cfg(target_os = "macos")]
         {
             if (aarch64::GICD_BASE..aarch64::GICD_BASE + aarch64::GICD_SIZE).contains(&addr) {
@@ -1085,42 +1185,41 @@ impl Vmm {
             }
         }
 
-        if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + 0x200).contains(&addr) {
+        if (mw + MMIO_OFF_CONSOLE..mw + MMIO_OFF_CONSOLE + 0x200).contains(&addr) {
             return self
                 .console
                 .lock()
                 .unwrap()
-                .mmio_read(addr - VIRTIO_CONSOLE_BASE, sas);
+                .mmio_read(addr - mw - MMIO_OFF_CONSOLE, sas);
         }
 
         if let Some(net) = self.net.lock().unwrap().as_mut() {
-            if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + 0x200).contains(&addr) {
-                return net.mmio_read(addr - VIRTIO_NET_BASE) as u64;
+            if (mw + MMIO_OFF_NET..mw + MMIO_OFF_NET + 0x200).contains(&addr) {
+                return net.mmio_read(addr - mw - MMIO_OFF_NET) as u64;
             }
         }
 
         if let Some(b) = self.blk.as_mut() {
-            if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + 0x200).contains(&addr) {
-                return b.mmio_read(addr - VIRTIO_BLK_BASE) as u64;
+            if (mw + MMIO_OFF_BLK..mw + MMIO_OFF_BLK + 0x200).contains(&addr) {
+                return b.mmio_read(addr - mw - MMIO_OFF_BLK) as u64;
             }
         }
 
         if let Some(b) = self.data_blk.as_mut() {
-            if (DATA_BLK_BASE..DATA_BLK_BASE + 0x200).contains(&addr) {
-                return b.mmio_read(addr - DATA_BLK_BASE) as u64;
+            if (mw + MMIO_OFF_DATA_BLK..mw + MMIO_OFF_DATA_BLK + 0x200).contains(&addr) {
+                return b.mmio_read(addr - mw - MMIO_OFF_DATA_BLK) as u64;
             }
         }
 
         if let Some(rng) = self.rng.as_ref() {
-            if (VIRTIO_RNG_BASE..VIRTIO_RNG_BASE + 0x200).contains(&addr) {
-                return rng.mmio_read(addr - VIRTIO_RNG_BASE) as u64;
+            if (mw + MMIO_OFF_RNG..mw + MMIO_OFF_RNG + 0x200).contains(&addr) {
+                return rng.mmio_read(addr - mw - MMIO_OFF_RNG) as u64;
             }
         }
 
-        if let Some(idx) = virtiofs_index(addr) {
+        if let Some(idx) = self.virtiofs_index(addr) {
             if let Some(dev) = self.virtiofs.get_mut(idx) {
-                return dev.mmio_read(addr - VIRTIOFS_BASE_START - idx as u64 * VIRTIOFS_SIZE)
-                    as u64;
+                return dev.mmio_read(addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE) as u64;
             }
         }
 
@@ -1135,6 +1234,7 @@ impl Vmm {
     }
 
     fn mmio_write(&mut self, addr: u64, _len: usize, val: u64) {
+        let mw = self.mmio_window();
         #[cfg(target_os = "macos")]
         {
             if (aarch64::GICD_BASE..aarch64::GICD_BASE + aarch64::GICD_SIZE).contains(&addr) {
@@ -1147,9 +1247,9 @@ impl Vmm {
             }
         }
 
-        if (VIRTIO_CONSOLE_BASE..VIRTIO_CONSOLE_BASE + 0x200).contains(&addr) {
+        if (mw + MMIO_OFF_CONSOLE..mw + MMIO_OFF_CONSOLE + 0x200).contains(&addr) {
             let mut console = self.console.lock().unwrap();
-            let notify = console.mmio_write(addr - VIRTIO_CONSOLE_BASE, val as u32);
+            let notify = console.mmio_write(addr - mw - MMIO_OFF_CONSOLE, val as u32);
             if let Some(qidx) = notify {
                 if qidx == 0 {
                     // RX queue: the guest posted buffers; drain any pending
@@ -1162,24 +1262,24 @@ impl Vmm {
         }
 
         if let Some(b) = self.blk.as_mut() {
-            if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + 0x200).contains(&addr) {
-                let _ = b.mmio_write(addr - VIRTIO_BLK_BASE, val as u32);
+            if (mw + MMIO_OFF_BLK..mw + MMIO_OFF_BLK + 0x200).contains(&addr) {
+                let _ = b.mmio_write(addr - mw - MMIO_OFF_BLK, val as u32);
                 let _ = b.process_queue(self.memory.as_shared_slice(), RAM_BASE);
                 return;
             }
         }
 
         if let Some(b) = self.data_blk.as_mut() {
-            if (DATA_BLK_BASE..DATA_BLK_BASE + 0x200).contains(&addr) {
-                let _ = b.mmio_write(addr - DATA_BLK_BASE, val as u32);
+            if (mw + MMIO_OFF_DATA_BLK..mw + MMIO_OFF_DATA_BLK + 0x200).contains(&addr) {
+                let _ = b.mmio_write(addr - mw - MMIO_OFF_DATA_BLK, val as u32);
                 let _ = b.process_queue(self.memory.as_shared_slice(), RAM_BASE);
                 return;
             }
         }
 
         if let Some(net) = self.net.lock().unwrap().as_mut() {
-            if (VIRTIO_NET_BASE..VIRTIO_NET_BASE + 0x200).contains(&addr) {
-                if let Some(qidx) = net.mmio_write(addr - VIRTIO_NET_BASE, val as u32) {
+            if (mw + MMIO_OFF_NET..mw + MMIO_OFF_NET + 0x200).contains(&addr) {
+                if let Some(qidx) = net.mmio_write(addr - mw - MMIO_OFF_NET, val as u32) {
                     match qidx {
                         1 => {
                             net.process_tx(self.memory.as_shared_slice(), RAM_BASE);
@@ -1196,17 +1296,20 @@ impl Vmm {
         }
 
         if let Some(rng) = self.rng.as_mut() {
-            if (VIRTIO_RNG_BASE..VIRTIO_RNG_BASE + 0x200).contains(&addr) {
-                if rng.mmio_write(addr - VIRTIO_RNG_BASE, val as u32).is_some() {
+            if (mw + MMIO_OFF_RNG..mw + MMIO_OFF_RNG + 0x200).contains(&addr) {
+                if rng
+                    .mmio_write(addr - mw - MMIO_OFF_RNG, val as u32)
+                    .is_some()
+                {
                     rng.process_queue(self.memory.as_shared_slice(), RAM_BASE);
                 }
                 return;
             }
         }
 
-        if let Some(idx) = virtiofs_index(addr) {
+        if let Some(idx) = self.virtiofs_index(addr) {
             if let Some(dev) = self.virtiofs.get_mut(idx) {
-                let off = addr - VIRTIOFS_BASE_START - idx as u64 * VIRTIOFS_SIZE;
+                let off = addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE;
                 if let Some(qidx) = dev.mmio_write(off, val as u32) {
                     dev.process_queue(qidx, self.memory.as_shared_slice(), RAM_BASE);
                 }
@@ -1221,7 +1324,8 @@ impl Vmm {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if (x86_64::HYPERCALL_PAGE..x86_64::HYPERCALL_PAGE + 0x200).contains(&addr) {
+        let hyper = mw + MMIO_OFF_HYPERCALL;
+        if (hyper..hyper + 0x200).contains(&addr) {
             // Hypercall page: a u32 write of the port number signals the VMM
             // (the x86 analog of the ARM64 BRK immediates).
             match val as u16 {
@@ -1257,7 +1361,7 @@ impl Vmm {
     }
 
     /// `export done`: turn the guest's overlay upper tree into a
-    /// gzip-compressed `.layer` file on the host.
+    /// zstd-compressed `.layer` file on the host.
     ///
     /// Disk mode: the data disk is an ext2 image; its `upper/` subtree is
     /// extracted and serialized as a ustar archive.
@@ -1272,30 +1376,32 @@ impl Vmm {
             return;
         };
 
-        let tar_data = match crate::ext2::read_upper_tar_entries(&dev.disk_image) {
+        let tar_data = match crate::ext2::read_upper_tar_entries(&dev.disk_image).map(|entries| {
+            // Shell history is session state, not guest data: the
+            // export deliberately skips it so it never round-trips
+            // through layers. History still lives in the data disk for
+            // the running VM.
+            let mut entries: Vec<_> = entries;
+            entries.retain(|e| !e.path.ends_with("/.ash_history"));
+            entries
+        }) {
             Ok(entries) if !entries.is_empty() => crate::tar::write_tar(&entries),
             _ => {
                 // Fall back to a raw tar the guest wrote to the device.
                 let end = crate::tar::find_tar_end(&dev.disk_image);
                 if end == 0 {
                     log::warn!("export done: no exportable data found");
-                    eprintln!("sandal: export failed: no exportable data found");
+                    console_eprintln("sandal: export failed: no exportable data found");
                     return;
                 }
                 dev.disk_image[..end].to_vec()
             }
         };
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        if let Err(e) = encoder.write_all(&tar_data) {
-            eprintln!("sandal: export failed to gzip layer: {e}");
-            return;
-        }
-
-        let gz_data = match encoder.finish() {
+        let layer_data = match zstd::bulk::compress(&tar_data, 3) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("sandal: export failed to finish gzip: {e}");
+                console_eprintln(&format!("sandal: export failed to compress layer: {e}"));
                 return;
             }
         };
@@ -1304,14 +1410,14 @@ impl Vmm {
             Some(path) if !path.is_empty() => PathBuf::from(path),
             _ => {
                 let mut hasher = DefaultHasher::new();
-                gz_data.hash(&mut hasher);
+                layer_data.hash(&mut hasher);
                 PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()))
             }
         };
 
-        match fs::write(&save_path, &gz_data) {
-            Ok(()) => eprintln!("Layer saved to: {}", save_path.display()),
-            Err(e) => eprintln!("sandal: failed to save layer: {e}"),
+        match fs::write(&save_path, &layer_data) {
+            Ok(()) => console_eprintln(&format!("Layer saved to: {}", save_path.display())),
+            Err(e) => console_eprintln(&format!("sandal: failed to save layer: {e}")),
         }
     }
 
@@ -1448,7 +1554,7 @@ impl Vmm {
     fn end_vt_sequence(&mut self, replies: &mut Vec<Vec<u8>>) {
         let seq = std::mem::take(&mut self.vt_seq);
         if std::env::var_os("SANDAL_DEBUG_KVM").is_some() {
-            eprintln!("DBG-SEQ param={} seq={seq:02x?}", self.vt_param);
+            console_eprintln(&format!("DBG-SEQ param={} seq={seq:02x?}", self.vt_param));
         }
 
         self.vt_esc = false;

@@ -1,25 +1,53 @@
-# sandal x86_64 guest kernel fragment (applied over x86_64_defconfig).
+# sandal x86_64 guest kernel fragment — a COMPLETE minimal config applied
+# over allnoconfig (see build-kernel-x86.sh).
 #
 # The VMM is a KVM userspace VMM with:
-#   - PVH direct boot (ELF vmlinux, hvm_start_info) — no firmware
+#   - PVH direct boot (ELF vmlinux, hvm_start_info) — no firmware, no ACPI
 #   - virtio-mmio devices registered via the `virtio_mmio.device=` cmdline
 #     parameter (no PCI bus emulation), IRQs from the legacy ISA range
-#     (delivered through the in-kernel i8259 PIC / IOAPIC GSI 0-15)
+#     (delivered through the in-kernel i8259 PIC)
 #   - virtio-console (hvc0) as the interactive console, 8250 for earlycon
-#   - ext2 (via ext4 driver) root on /dev/vda, overlayfs upper on /dev/vdb
+#   - ext2 (via the ext4 driver) root on /dev/vda, overlayfs upper on /dev/vdb
 #   - virtiofs (FUSE) for --share directories, virtio-rng for entropy
+#
+# Everything not listed here stays at allnoconfig (=n). Hidden symbols keep
+# their Kconfig defaults (allnoconfig can only touch visible ones), which
+# covers the quietly-required plumbing (futexes, epoll, CRC helpers, ...).
 
-# ── PVH direct boot ─────────────────────────────────────────────────────
+# ── base architecture (allnoconfig needs these spelled out) ────────────
+CONFIG_64BIT=y
+CONFIG_X86_64=y
+CONFIG_EXPERT=y
+# The local APIC: KVM creates a vLAPIC per vCPU; using its timer beats PIT
+# polling and gives proper time handling. Without it the kernel disables
+# the apic facility entirely ("APIC: Switched APIC routing to: noop").
+CONFIG_X86_LOCAL_APIC=y
+CONFIG_PRINTK_TIME=y
+
+# ── PVH direct boot + KVM paravirt time ────────────────────────────────
 CONFIG_PVH=y
 CONFIG_HYPERVISOR_GUEST=y
 CONFIG_PARAVIRT=y
 CONFIG_KVM_GUEST=y
+CONFIG_PARAVIRT_CLOCK=y
 # Deterministic boot: the ELF entry point is the load address.
 CONFIG_RANDOMIZE_BASE=n
 
+# ── single vCPU, flat memory: skips SMP/NUMA/highmem bring-up ──────────
+CONFIG_SMP=n
+CONFIG_NUMA=n
+CONFIG_X86_IO_APIC=n
+CONFIG_X86_MCE=n
+CONFIG_HIGHMEM=n
+
 # ── virtio (mmio transport only, no PCI) ────────────────────────────────
+# BLK_DEV/NETDEVICES are menu gates: without them VIRTIO_BLK/VIRTIO_NET are
+# silently dropped by olddefconfig (allnoconfig turns the menus off).
 CONFIG_PCI=n
+CONFIG_BLK_DEV=y
+CONFIG_NETDEVICES=y
 CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
 CONFIG_VIRTIO_MMIO=y
 CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
 CONFIG_VIRTIO_BLK=y
@@ -32,10 +60,16 @@ CONFIG_VIRTIO_FS=y
 CONFIG_FUSE_FS=y
 
 # ── networking (user-space NAT behind virtio-net) ───────────────────────
+# IPv4 only: the VMM's user-space netstack hands out an IPv4 address and
+# DNS resolver; dropping IPv6 skips the v6 init (sit/seg6/IOAM/icmp6
+# sockets) which costs several ms of guest boot.
 CONFIG_NET=y
 CONFIG_INET=y
+CONFIG_IPV6=n
 CONFIG_UNIX=y
-CONFIG_IPV6=y
+CONFIG_PACKET=y
+# perf/PMU init is pure startup cost for a guest that never profiles.
+CONFIG_PERF_EVENTS=n
 
 # ── filesystems ─────────────────────────────────────────────────────────
 CONFIG_EXT4_FS=y
@@ -46,6 +80,13 @@ CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_UNIX98_PTYS=y
+
+# ── process/exec plumbing ───────────────────────────────────────────────
+CONFIG_MULTIUSER=y
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_EPOLL=y
 
 # ── console ─────────────────────────────────────────────────────────────
 CONFIG_TTY=y
@@ -53,8 +94,11 @@ CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_VT=n
 
-# ── keep it small ───────────────────────────────────────────────────────
+# ── keep it small and quiet ─────────────────────────────────────────────
 CONFIG_MODULES=n
 CONFIG_DEBUG_INFO_NONE=y
-# No firmware / ACPI on the PVH path; avoid probing noise.
 CONFIG_ACPI=n
+CONFIG_ELF_CORE=n
+# /dev/mem: the crafted export/resize helpers mmap the hypercall page
+# through it (userspace MMIO write → KVM exit → VMM handler).
+CONFIG_DEVMEM=y

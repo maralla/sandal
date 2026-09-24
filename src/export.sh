@@ -47,7 +47,7 @@ while [ "$N" -lt 10 ]; do
     N=$((N + 1))
 done
 
-# Write tar archive to {DATA_DEV} (uncompressed — VMM will gzip it).
+# Write tar archive to {DATA_DEV} (uncompressed — VMM will zstd-compress it).
 tar cf - -C "$UPPER" . > {DATA_DEV} 2>/dev/null
 
 # Signal VMM that tar data is ready.

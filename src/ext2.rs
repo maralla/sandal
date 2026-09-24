@@ -2278,7 +2278,11 @@ fn remove_dir_entry(
 
 /// Inject all runtime files into a pre-built ext2 image.
 /// This adds /init, device nodes, CA certificates and the sandal-export helpers.
-pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
+pub fn inject_runtime_files(
+    image: &mut [u8],
+    network: bool,
+    mmio_base: u64,
+) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
 
@@ -2354,7 +2358,7 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
         &sb,
         &bgdt,
         "usr/sbin/sandal-export-resize",
-        initramfs::export_resize_helper(),
+        &initramfs::export_resize_helper(mmio_base),
         0o755,
     )?;
     inject_file(
@@ -2362,7 +2366,7 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool) -> Result<()> {
         &sb,
         &bgdt,
         "usr/sbin/sandal-export-done",
-        initramfs::export_done_helper(),
+        &initramfs::export_done_helper(mmio_base),
         0o755,
     )?;
     let export_script = initramfs::generate_export_script();

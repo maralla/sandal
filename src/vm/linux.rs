@@ -126,7 +126,18 @@ impl Vmm {
             match self.vcpu.run()? {
                 // EINTR (e.g. SIGWINCH): just re-enter the guest.
                 KvmExit::Unknown(code) if code == u32::MAX => continue,
-                exit => self.handle_kvm_exit(exit)?,
+                exit => {
+                    static REPORTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if std::env::var_os("SANDAL_DEBUG_TIMING").is_some()
+                        && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(t0) = super::BOOT_T0.get() {
+                            eprintln!("BOOT_TIMING first_vcpu_exit: {:?}", t0.elapsed());
+                        }
+                    }
+                    self.handle_kvm_exit(exit)?
+                }
             }
 
             // Drain guest console TX → host stdout. On Linux the drained

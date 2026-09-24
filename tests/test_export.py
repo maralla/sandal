@@ -5,7 +5,7 @@ Boots the sandal VM twice with a pty:
 
   1. Cold boot with a writable overlay disk, create a file in the guest,
      run the guest `sandal-export <path>` command, and verify the host
-     receives a valid gzip-compressed `.layer` archive containing the file.
+     receives a valid zstd-compressed `.layer` archive containing the file.
   2. Fresh boot with `--layer <that file>` and verify the file is back in
      the guest filesystem.
 
@@ -17,6 +17,7 @@ Usage (from the repo root, after `make`):
 
 import pathlib
 import sys
+import subprocess
 import tarfile
 import tempfile
 
@@ -62,7 +63,12 @@ def main() -> None:
         layer = phase_export(tmp)
 
         print(f"export: validating {layer} ...")
-        with tarfile.open(layer, "r:gz") as tf:
+        # The layer is zstd-compressed; decompress it for tarfile.
+        raw = tmp / "roundtrip.tar"
+        subprocess.run(
+            ["zstd", "-d", "-f", str(layer), "-o", str(raw)], check=True
+        )
+        with tarfile.open(raw, "r:") as tf:
             try:
                 member = tf.getmember("root/roundtrip.txt")
             except KeyError:

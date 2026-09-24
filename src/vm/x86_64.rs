@@ -3,11 +3,12 @@
 //! the legacy ISA IRQ pool.
 
 use super::{
-    resolve_data_path, Args, Vmm, DATA_BLK_BASE, MMIO_BASE, VIRTIOFS_BASE_START, VIRTIOFS_SIZE,
-    VIRTIO_BLK_BASE, VIRTIO_CONSOLE_BASE, VIRTIO_NET_BASE, VIRTIO_RNG_BASE,
+    resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_CONSOLE, MMIO_OFF_DATA_BLK, MMIO_OFF_FS,
+    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG, VIRTIOFS_SIZE,
 };
 use anyhow::{anyhow, Result};
 use std::fs;
+use std::os::fd::AsRawFd;
 
 // ── Guest physical memory map ───────────────────────────────────────────
 pub(crate) const RAM_BASE: u64 = 0x0;
@@ -28,15 +29,20 @@ const PVH_CMDLINE_ADDR: u64 = 0x20000;
 const PVH_START_INFO_ADDR: u64 = 0x30000;
 const PVH_MEMMAP_ADDR: u64 = 0x31000;
 
-/// Hypercall page: the guest maps this physical page via /dev/mem and
-/// performs MMIO writes to signal the VMM (export resize/done). MMIO works
-/// from userspace without I/O-port privileges (which nested KVM denies).
-pub(super) const HYPERCALL_PAGE: u64 = MMIO_BASE + 0xe00;
+/// Base of the MMIO device window: placed just above the guest RAM.
+/// virtio-mmio device regions must not sit inside "System RAM" (the
+/// kernel's request_mem_region would collide with -EBUSY and no device
+/// would ever probe) — with the window above RAM, the guest gets the full
+/// requested `-m` memory instead of being silently capped.
+pub(super) fn mmio_base(ram_bytes: u64) -> u64 {
+    (ram_bytes + 0x1f_ffff) & !0x1f_ffff
+}
 
 /// (page-aligned base, in-page offset) of the hypercall page — used by the
 /// guest helpers that mmap /dev/mem.
-pub fn x86_hypercall_page_off() -> (u64, u64) {
-    (HYPERCALL_PAGE & !0xfff, HYPERCALL_PAGE & 0xfff)
+pub fn x86_hypercall_page_off(mmio_base: u64) -> (u64, u64) {
+    let hyper = mmio_base + MMIO_OFF_HYPERCALL;
+    (hyper & !0xfff, hyper & 0xfff)
 }
 
 /// Page-aligned base for /dev/mem mmap guests.
@@ -58,7 +64,22 @@ impl Vmm {
             .clone()
             .or_else(|| resolve_data_path(KERNEL_ARTIFACT))
             .ok_or_else(|| anyhow!("kernel image not found"))?;
-        let elf = fs::read(&kernel_path)?;
+        let kernel_len = fs::metadata(&kernel_path)?.len() as usize;
+        let kernel_file = fs::File::open(&kernel_path)?;
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                kernel_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                kernel_file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            anyhow::bail!("failed to mmap kernel image");
+        }
+        let elf: &[u8] = unsafe { std::slice::from_raw_parts(mapped as *const u8, kernel_len) };
         if elf.len() < 64 || &elf[..4] != b"\x7fELF" {
             anyhow::bail!("kernel is not an ELF image");
         }
@@ -110,18 +131,19 @@ impl Vmm {
         let entry = pvh_entry.ok_or_else(|| anyhow!("kernel has no PVH entry note"))?;
 
         // ── Kernel command line: console + virtio-mmio devices ─────────
-        // loglevel=3: the pane is the user's console, not a kernel log —
+        // loglevel=7: the pane is the user's console, not a kernel log —
         // probe noise (i8042, WMI, ...) stays in dmesg, not on screen.
         // (err-level and below are hidden; emerg/alert/crit still show.)
         let mut cmdline = String::from(
-            "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on nohz=off highres=off nokaslr",
+            "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on",
         );
+        let mb = self.mmio_base;
         let mut devices: Vec<(u64, u32)> = vec![
-            (VIRTIO_NET_BASE, ISA_IRQ_POOL[0]),
-            (VIRTIO_CONSOLE_BASE, ISA_IRQ_POOL[1]),
-            (VIRTIO_BLK_BASE, ISA_IRQ_POOL[2]),
-            (DATA_BLK_BASE, ISA_IRQ_POOL[3]),
-            (VIRTIO_RNG_BASE, ISA_IRQ_POOL[4]),
+            (mb + MMIO_OFF_NET, ISA_IRQ_POOL[0]),
+            (mb + MMIO_OFF_CONSOLE, ISA_IRQ_POOL[1]),
+            (mb + MMIO_OFF_BLK, ISA_IRQ_POOL[2]),
+            (mb + MMIO_OFF_DATA_BLK, ISA_IRQ_POOL[3]),
+            (mb + MMIO_OFF_RNG, ISA_IRQ_POOL[4]),
         ];
         if self.net.lock().unwrap().is_none() {
             // Keep the mmio layout (and thus the cmdline) stable whether or
@@ -136,7 +158,7 @@ impl Vmm {
                     MAX_FS_DEVICES
                 )
             })?;
-            devices.push((VIRTIOFS_BASE_START + i as u64 * VIRTIOFS_SIZE, irq));
+            devices.push((mb + MMIO_OFF_FS + i as u64 * VIRTIOFS_SIZE, irq));
         }
         // When networking is disabled the net region is still first in the
         // mmio table — describe only real devices, keeping index order.
@@ -222,8 +244,19 @@ impl Vmm {
         )?;
 
         // ── Initial vCPU state ─────────────────────────────────────────
+        let t_setup = if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.vcpu.set_supported_cpuid()?;
+        if let Some(t) = t_setup {
+            eprintln!("BOOT_TIMING   cpuid: {:?}", t.elapsed());
+        }
         self.vcpu.init_pvh(entry, PVH_START_INFO_ADDR)?;
+        if let Some(t) = t_setup {
+            eprintln!("BOOT_TIMING   init_pvh: {:?}", t.elapsed());
+        }
         if std::env::var_os("SANDAL_X86_TRACE").is_some() {
             self.vcpu.set_guest_debug_singlestep()?;
         }
