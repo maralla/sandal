@@ -4,12 +4,13 @@
 //! complete HVF contract.
 
 use super::{
-    Args, Vmm, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET,
-    SPI_RNG,
+    host_tty_size, Args, Vmm, HOST_WINCH, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE,
+    SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG,
 };
 use crate::hypervisor::{HvSysReg, Reg, Vcpu};
 use crate::irqs::IRQ_VTIMER;
 use anyhow::Result;
+use std::sync::atomic::Ordering;
 
 pub(super) const CNTFRQ: u64 = 24_000_000; // Apple Silicon host timer frequency (Hz)
 
@@ -94,6 +95,15 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub(super) fn run_loop_hvf(&mut self, _args: &Args) -> Result<i32> {
         loop {
+            // Host terminal resized: re-apply the geometry to the guest
+            // console. The console's config-change interrupt is
+            // level-triggered and re-pended from `interrupt_status` below,
+            // so `set_size` is enough — no manual IRQ pulse is needed.
+            if HOST_WINCH.swap(false, Ordering::Relaxed) {
+                let (cols, rows) = host_tty_size();
+                let _ = self.console.lock().unwrap().set_size(cols, rows);
+            }
+
             // Poll the user-space network backend and deliver any incoming
             // packets to the guest's RX queue.
             if let Some(net) = self.net.lock().unwrap().as_mut() {

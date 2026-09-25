@@ -484,6 +484,7 @@ impl VirtioConsoleDevice {
     /// submit/complete history can be reconstructed off-guest, which is the
     /// only way to see the driver↔device desync when the guest console
     /// writer is wedged in `__send_to_port`'s completion spin.
+    #[cfg(target_os = "linux")]
     pub fn dump_vrings(&self, memory: &[u8], ram_base: u64) {
         for (name, q) in [
             ("RX", &self.queues[RX_QUEUE]),

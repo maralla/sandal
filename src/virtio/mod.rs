@@ -205,6 +205,7 @@ pub fn write_used_ring(
 }
 
 /// Read one entry from the used ring (descriptor id, written length).
+#[cfg(target_os = "linux")]
 pub fn read_used_ring_entry(
     memory: &[u8],
     ram_base: u64,

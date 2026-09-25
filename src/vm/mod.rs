@@ -12,7 +12,6 @@
 
 #[cfg(target_os = "macos")]
 use crate::hypervisor::Gic;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::sync::atomic::Ordering;
 
 use crate::hypervisor::{Vcpu, Vm};
@@ -28,6 +27,7 @@ use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -78,6 +78,7 @@ pub(crate) const MMIO_OFF_CONSOLE: u64 = 0x200;
 pub(crate) const MMIO_OFF_BLK: u64 = 0x400;
 pub(crate) const MMIO_OFF_DATA_BLK: u64 = 0x600;
 pub(crate) const MMIO_OFF_RNG: u64 = 0x800;
+#[cfg(target_arch = "x86_64")]
 pub(crate) const MMIO_OFF_HYPERCALL: u64 = 0xe00;
 pub(crate) const MMIO_OFF_FS: u64 = 0x1000;
 pub(crate) const VIRTIOFS_SIZE: u64 = 0x200;
@@ -189,9 +190,9 @@ impl Drop for GuestRam {
 }
 
 /// The console TX pipeline: escape-sequence tracking (DSR/DA query replies),
-/// protocol-marker filtering, and the line/cursor state. Owned by whichever
-/// thread drains the console TX virtqueue (the net-kick thread on Linux,
-/// the run loop on macOS).
+/// protocol-marker filtering, and the line/cursor state. Owned by the
+/// net-kick thread that drains the console TX virtqueue (Linux).
+#[cfg(target_os = "linux")]
 pub(crate) struct ConsoleTxFilter {
     /// The per-boot exit-protocol token.
     pub exit_marker: String,
@@ -237,6 +238,7 @@ pub(crate) struct ConsoleTxFilter {
     alt_screen: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl ConsoleTxFilter {
     pub(crate) fn new(exit_marker: String) -> Self {
         ConsoleTxFilter {
@@ -878,7 +880,6 @@ impl Vmm {
         // Track host terminal resizes: the SIGWINCH handler only sets a
         // flag; the run loop applies the new geometry (and interrupts the
         // guest) on its next iteration.
-        #[cfg(target_os = "linux")]
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = winch_handler as extern "C" fn(i32) as usize;
@@ -1119,7 +1120,7 @@ impl Vmm {
             }
         };
 
-        crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network, self.mmio_base)?;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network, self.mmio_window())?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1324,16 +1325,18 @@ impl Vmm {
         }
 
         #[cfg(target_arch = "x86_64")]
-        let hyper = mw + MMIO_OFF_HYPERCALL;
-        if (hyper..hyper + 0x200).contains(&addr) {
-            // Hypercall page: a u32 write of the port number signals the VMM
-            // (the x86 analog of the ARM64 BRK immediates).
-            match val as u16 {
-                crate::elf::x86_64_linux::EXPORT_RESIZE_PORT => self.handle_export_resize(),
-                crate::elf::x86_64_linux::EXPORT_DONE_PORT => self.handle_export_done(),
-                other => log::warn!("unknown hypercall {other:#x}"),
+        {
+            let hyper = mw + MMIO_OFF_HYPERCALL;
+            if (hyper..hyper + 0x200).contains(&addr) {
+                // Hypercall page: a u32 write of the port number signals the VMM
+                // (the x86 analog of the ARM64 BRK immediates).
+                match val as u16 {
+                    crate::elf::x86_64_linux::EXPORT_RESIZE_PORT => self.handle_export_resize(),
+                    crate::elf::x86_64_linux::EXPORT_DONE_PORT => self.handle_export_done(),
+                    other => log::warn!("unknown hypercall {other:#x}"),
+                }
+                return;
             }
-            return;
         }
 
         log::debug!("mmio write 0x{addr:x} = 0x{val:x}");

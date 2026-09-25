@@ -46,6 +46,8 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         s_sys_path = "/sys",
         s_devtmpfs = "devtmpfs",
         s_dev_path = "/dev",
+        s_devpts = "devpts",
+        s_devpts_path = "/dev/pts",
         s_tmpfs = "tmpfs",
         s_tmp_path = "/tmp",
         s_slash = "/",
@@ -233,6 +235,11 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     mount!(e, s_sysfs, s_sys_path, s_sysfs);
     mount!(e, s_devtmpfs, s_dev_path, s_devtmpfs);
     mount!(e, s_tmpfs, s_tmp_path, s_tmpfs);
+
+    // PTYs: tmux/screen/shells-with-job-control need devpts mounted on
+    // /dev/pts (devtmpfs provides /dev/ptmx but not the pts filesystem).
+    mkdir!(e, s_devpts_path);
+    mount!(e, s_devpts, s_devpts_path, s_devpts);
     chdir!(e, s_slash);
 
     // ── Mount virtiofs shares from config ───────────────────────────

@@ -234,8 +234,8 @@ const EXPORT_RESIZE_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
 };
 
 #[cfg(target_arch = "aarch64")]
-pub fn export_resize_helper() -> &'static [u8] {
-    &EXPORT_RESIZE_HELPER.0[..EXPORT_RESIZE_HELPER.1]
+pub fn export_resize_helper(_mmio_base: u64) -> Vec<u8> {
+    EXPORT_RESIZE_HELPER.0[..EXPORT_RESIZE_HELPER.1].to_vec()
 }
 
 /// Minimal guest ELF that tells the VMM the export data is ready:
@@ -249,8 +249,8 @@ const EXPORT_DONE_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
 };
 
 #[cfg(target_arch = "aarch64")]
-pub fn export_done_helper() -> &'static [u8] {
-    &EXPORT_DONE_HELPER.0[..EXPORT_DONE_HELPER.1]
+pub fn export_done_helper(_mmio_base: u64) -> Vec<u8> {
+    EXPORT_DONE_HELPER.0[..EXPORT_DONE_HELPER.1].to_vec()
 }
 
 // x86_64 variants: two-instruction programs (hypercall OUT + exit) built once
