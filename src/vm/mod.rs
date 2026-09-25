@@ -1097,12 +1097,15 @@ impl Vmm {
 
         #[cfg(target_arch = "aarch64")]
         {
+            let (cols, rows) = self.console.lock().unwrap().terminal_size();
             self.config_blob = initramfs::build_init_config(
                 disk_mode,
                 &share_configs,
                 &args.command,
                 !args.no_network,
                 clock_secs,
+                cols,
+                rows,
             );
         }
 

@@ -179,7 +179,8 @@ pub fn build_init_config_text(
 /// 0x01  num_virtiofs: u8
 /// 0x02  num_argv: u8
 /// 0x03  network: u8       (0=off, 1=on)
-/// 0x04  reserved: u32
+/// 0x04  console_cols: u16
+/// 0x06  console_rows: u16
 /// 0x08  clock_secs: u64
 /// 0x10  data[]:           virtiofs (tag\0 path\0)... then argv (arg\0)...
 /// ```
@@ -190,6 +191,8 @@ pub fn build_init_config(
     command: &[String],
     network: bool,
     clock_secs: u64,
+    console_cols: u16,
+    console_rows: u16,
 ) -> Vec<u8> {
     let mut blob = Vec::new();
 
@@ -202,7 +205,8 @@ pub fn build_init_config(
     blob.push(shares.len() as u8);
     blob.push(command.len() as u8);
     blob.push(if network { 1 } else { 0 });
-    blob.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    blob.extend_from_slice(&console_cols.to_le_bytes());
+    blob.extend_from_slice(&console_rows.to_le_bytes());
     blob.extend_from_slice(&clock_secs.to_le_bytes());
 
     // Virtiofs entries: tag\0 path\0

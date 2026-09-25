@@ -398,6 +398,22 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         newfd += 1;
     }
 
+    // Give the console a real window size. The virtio console does not
+    // deliver the initial geometry to the tty (TIOCGWINSZ reads 0x0), so a
+    // fullscreen editor (vi) that sizes itself from the tty draws a
+    // degenerate one-column grid. The VMM ships the host pane geometry in
+    // the config blob (cols at 0x04, rows at 0x06, both u16 LE).
+    // x11/x12 are scratch here: x10 (envp) and x27 (command) are still
+    // needed by emit_exec_with_path below.
+    sub!(e, SP, SP, 16); // struct winsize (8 bytes, 16-byte aligned)
+    ldr_w!(e, x11, x19, 4); // x11 = rows<<16 | cols
+    strh!(e, x11, SP, 2); // ws_col = cols
+    ubfx!(e, x12, x11, 16, 16); // x12 = rows
+    strh!(e, x12, SP, 0); // ws_row = rows
+    str_w!(e, XZR, SP, 4); // ws_xpixel = ws_ypixel = 0
+    ioctl!(e, x9, TIOCSWINSZ); // set winsize on the tty
+    add!(e, SP, SP, 16);
+
     // close(fd) if fd > 2
     cmp!(e, x9, 3);
     let skip_close_ph = e.emit_placeholder();

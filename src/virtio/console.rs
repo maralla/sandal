@@ -86,9 +86,9 @@ impl VirtioConsoleDevice {
     /// VMM thread (stdin + main loop make progress between `vcpu.run()` entries).
     const TX_HEADS_PER_SLICE: u16 = 256;
 
-    /// The advertised terminal geometry (cols, rows). Used by the x86_64
-    /// init config (the guest tty needs a real window size).
-    #[cfg(target_arch = "x86_64")]
+    /// The advertised terminal geometry (cols, rows). The guest tty needs a
+    /// real window size: without it, fullscreen editors (vi) that size
+    /// themselves from TIOCGWINSZ lay out a degenerate 0x0 grid.
     pub fn terminal_size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
