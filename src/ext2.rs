@@ -255,7 +255,10 @@ pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
     let num_groups = total_blocks.div_ceil(blocks_per_group);
 
     // Distribute inodes evenly across groups (rounded to multiple of 8 for clean bitmaps).
-    let total_inodes_target = (total_blocks / 4).clamp(256, 65536);
+    // 1 inode per 4 blocks (16 KiB), matching the mke2fs default density.
+    // The per-group count stays at `blocks_per_group / 4` = 8192, within the u16 BGDT
+    // field and the 32768-bit inode bitmap.
+    let total_inodes_target = (total_blocks / 4).max(256);
     let inodes_per_group = ((total_inodes_target.div_ceil(num_groups) + 7) & !7).max(8);
     let num_inodes = inodes_per_group * num_groups;
     let inode_table_blocks = (inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE);
