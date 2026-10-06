@@ -36,6 +36,15 @@ pub fn read_tar_zst(zst_data: &[u8]) -> Result<Vec<TarEntry>> {
     parse_tar(&tar_data)
 }
 
+/// Parse an uncompressed tar archive into entries.
+///
+/// Used for the raw tar the guest writes to the data disk during a
+/// tmpfs-mode export, so the VMM can apply the same entry filtering it does
+/// for the ext2 `upper/` subtree before serializing the `.layer`.
+pub fn read_tar(tar_data: &[u8]) -> Result<Vec<TarEntry>> {
+    parse_tar(tar_data)
+}
+
 /// Return the total uncompressed data size of all file entries.
 /// Used to estimate the ext2 disk size needed to hold all layer content.
 pub fn total_data_size(entries: &[TarEntry]) -> usize {

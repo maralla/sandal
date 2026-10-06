@@ -50,6 +50,11 @@ fn run_vm(args: Args) -> Result<()> {
         })
         .format_timestamp(None)
         .format_target(false)
+        // The guest console needs OPOST disabled on the shared host tty, so a
+        // log line ending in a bare `\n` does not return the cursor to column
+        // 0 and the next line is indented by the previous line's width.
+        // Emit CRLF here; an extra CR on a normal tty renders as nothing.
+        .format_suffix("\r\n")
         .init();
 
     // Check we're running on a supported host.

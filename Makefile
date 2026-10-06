@@ -11,7 +11,7 @@ ALPINE_ARCH := aarch64
 else
 ALPINE_ARCH := $(UNAME_M)
 endif
-ALPINE_VERSION := 3.21
+ALPINE_VERSION := 3.22
 ALPINE_MIRROR := https://dl-cdn.alpinelinux.org/alpine
 ALPINE_ROOTFS_URL := $(ALPINE_MIRROR)/v$(ALPINE_VERSION)/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION).0-$(ALPINE_ARCH).tar.gz
 
@@ -23,7 +23,7 @@ ROOTFS_FILES := \
 	sbin/apk \
 	usr/bin/ldd \
 	usr/bin/ssl_client \
-	usr/lib/libapk.so.2.14.0 \
+	usr/lib/libapk.so.2.14.9 \
 	usr/lib/libcrypto.so.3 \
 	usr/lib/libssl.so.3 \
 	usr/lib/libz.so.1.3.1
@@ -125,14 +125,18 @@ lint:
 	cargo fmt --all
 	cargo clippy --all-targets --all-features -- -D warnings
 
-# Download and extract Alpine minirootfs if not present.
-# Uses bin/busybox as sentinel — all other files come from the same tarball.
-rootfs/bin/busybox:
+# Download and extract the Alpine minirootfs. The stamp filename embeds the
+# version, so bumping ALPINE_VERSION re-extracts instead of silently reusing
+# an older tree (the previous busybox sentinel never noticed version bumps).
+ROOTFS_STAMP := rootfs/.alpine-$(ALPINE_VERSION)
+$(ROOTFS_STAMP):
 	@echo "Downloading Alpine $(ALPINE_VERSION) minirootfs..."
+	@rm -rf rootfs
 	@mkdir -p rootfs
 	@curl -fSL --progress-bar "$(ALPINE_ROOTFS_URL)" | tar xz -C rootfs
-	@echo "Alpine rootfs extracted to rootfs/"
-$(filter-out rootfs/bin/busybox,$(addprefix rootfs/,$(ROOTFS_FILES))): rootfs/bin/busybox
+	@touch $@
+	@echo "Alpine rootfs extracted to rootfs/ ($(ALPINE_VERSION))"
+$(addprefix rootfs/,$(ROOTFS_FILES)): $(ROOTFS_STAMP)
 
 # Build a minimal rootfs (busybox + musl + TLS + apk) and compress for embedding.
 rootfs-minimal: $(BUILTIN_ROOTFS)

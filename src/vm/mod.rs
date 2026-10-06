@@ -762,6 +762,8 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
         let mb = args.disk_size.unwrap_or(1);
         return crate::ext2::create_empty_ext2(mb * 1024 * 1024);
     }
+    let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+    let t = std::time::Instant::now();
     let mut all_entries = Vec::new();
     for layer in &args.layers {
         let layer_data = fs::read(layer)
@@ -769,12 +771,27 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
         let entries = crate::tar::read_tar_zst(&layer_data)?;
         all_entries.extend(entries);
     }
+    if timing {
+        eprintln!("BOOT_TIMING   layer_parse: {:?}", t.elapsed());
+    }
     let layer_data = crate::tar::total_data_size(&all_entries);
     let layer_need = (layer_data * 2) + 16 * 1024 * 1024;
     let disk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
     let final_size = disk_bytes.max(layer_need);
+    let t = std::time::Instant::now();
     let mut img = crate::ext2::create_empty_ext2(final_size)?;
+    if timing {
+        eprintln!(
+            "BOOT_TIMING   ext2_create: {:?} ({} MB)",
+            t.elapsed(),
+            final_size / (1024 * 1024)
+        );
+    }
+    let t = std::time::Instant::now();
     crate::ext2::inject_tar_entries(&mut img, &all_entries)?;
+    if timing {
+        eprintln!("BOOT_TIMING   ext2_inject: {:?}", t.elapsed());
+    }
     Ok(img)
 }
 
@@ -1055,9 +1072,14 @@ impl Vmm {
         // ── Writable data disk (vdb): --disk-size / --layer ────────────
         // Created first: DISK_MODE in the init config selects the overlay
         // upperdir (disk vs tmpfs), so `data_blk` must be known by then.
-        if args.disk_size.is_some() || !args.layers.is_empty() {
-            self.data_blk = Some(VirtioBlkDevice::new(build_data_disk(args)?));
-        }
+        //
+        // The device is always present. With `--disk-size`/`--layer` it backs
+        // the overlay upperdir; without them the overlay upper stays on tmpfs
+        // but the device is still needed as the scratch target `sandal-export`
+        // writes its tar onto (the VMM reads it back). Without it, a default
+        // tmpfs-mode guest could never export a layer.
+        let disk_backed_upper = args.disk_size.is_some() || !args.layers.is_empty();
+        self.data_blk = Some(VirtioBlkDevice::new(build_data_disk(args)?));
         if timing {
             eprintln!("BOOT_TIMING data_disk: {:?}", t0.elapsed());
         }
@@ -1070,7 +1092,7 @@ impl Vmm {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let disk_mode = if self.data_blk.is_some() {
+        let disk_mode = if disk_backed_upper {
             Some("disk")
         } else {
             None
@@ -1130,10 +1152,12 @@ impl Vmm {
             // The init script reads the run configuration from this file.
             let sb = crate::ext2::Ext2Superblock::parse(&rootfs_img)?;
             let bgdt = crate::ext2::Ext2BgdTable::parse(&rootfs_img, &sb)?;
+            let mut alloc = crate::ext2::Ext2Alloc::default();
             crate::ext2::inject_file(
                 &mut rootfs_img,
                 &sb,
                 &bgdt,
+                &mut alloc,
                 crate::vm::x86_64::CONFIG_PATH,
                 &self.config_blob,
                 0o644,
@@ -1393,14 +1417,24 @@ impl Vmm {
         }) {
             Ok(entries) if !entries.is_empty() => crate::tar::write_tar(&entries),
             _ => {
-                // Fall back to a raw tar the guest wrote to the device.
+                // Fall back to a raw tar the guest wrote to the device
+                // (tmpfs-mode export). Parse and re-serialize so the shell
+                // history filter above applies to this path too; if the tar
+                // is not parseable, forward it verbatim.
                 let end = crate::tar::find_tar_end(&dev.disk_image);
                 if end == 0 {
                     log::warn!("export done: no exportable data found");
                     console_eprintln("sandal: export failed: no exportable data found");
                     return;
                 }
-                dev.disk_image[..end].to_vec()
+                let raw = &dev.disk_image[..end];
+                match crate::tar::read_tar(raw) {
+                    Ok(mut entries) => {
+                        entries.retain(|e| !e.path.ends_with("/.ash_history"));
+                        crate::tar::write_tar(&entries)
+                    }
+                    Err(_) => raw.to_vec(),
+                }
             }
         };
 
