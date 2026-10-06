@@ -71,6 +71,14 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 
+# /dev/fd and /dev/std* are not provided by devtmpfs: alias them to the
+# per-process /proc/self/fd entries. bash process substitution (`<(...)`) and
+# many install scripts open /dev/fd explicitly.
+ln -sf /proc/self/fd /dev/fd
+ln -sf /proc/self/fd/0 /dev/stdin
+ln -sf /proc/self/fd/1 /dev/stdout
+ln -sf /proc/self/fd/2 /dev/stderr
+
 # PTYs: tmux/screen/shells-with-job-control need the devpts mount for
 # /dev/pts (devtmpfs provides /dev/ptmx but not the pts filesystem).
 mkdir -p /dev/pts

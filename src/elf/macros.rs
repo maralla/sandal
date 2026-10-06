@@ -443,6 +443,16 @@ macro_rules! chdir {
     }};
 }
 
+/// `symlink target linkpath` — symlinkat(target, AT_FDCWD, linkpath).
+macro_rules! symlink {
+    ($e:expr, $target:expr, $link:expr) => {{
+        adr!($e, x0, $target);
+        movn!($e, x1, $crate::elf::aarch64_linux::AT_FDCWD_NEG);
+        adr!($e, x2, $link);
+        syscall!($e, $crate::elf::aarch64_linux::nr::SYMLINKAT);
+    }};
+}
+
 /// `pivot_root new_root put_old`.
 macro_rules! pivot_root {
     ($e:expr, $new:expr, $old:expr) => {{

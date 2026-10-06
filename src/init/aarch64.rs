@@ -48,6 +48,14 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         s_dev_path = "/dev",
         s_devpts = "devpts",
         s_devpts_path = "/dev/pts",
+        s_proc_self_fd = "/proc/self/fd",
+        s_proc_self_fd_0 = "/proc/self/fd/0",
+        s_proc_self_fd_1 = "/proc/self/fd/1",
+        s_proc_self_fd_2 = "/proc/self/fd/2",
+        s_dev_fd = "/dev/fd",
+        s_dev_stdin = "/dev/stdin",
+        s_dev_stdout = "/dev/stdout",
+        s_dev_stderr = "/dev/stderr",
         s_tmpfs = "tmpfs",
         s_tmp_path = "/tmp",
         s_slash = "/",
@@ -235,6 +243,14 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     mount!(e, s_sysfs, s_sys_path, s_sysfs);
     mount!(e, s_devtmpfs, s_dev_path, s_devtmpfs);
     mount!(e, s_tmpfs, s_tmp_path, s_tmpfs);
+
+    // /dev/fd and /dev/std* are not provided by devtmpfs: alias them to the
+    // per-process /proc/self/fd entries. bash process substitution (`<(...)`)
+    // and many install scripts open /dev/fd explicitly.
+    symlink!(e, s_proc_self_fd, s_dev_fd);
+    symlink!(e, s_proc_self_fd_0, s_dev_stdin);
+    symlink!(e, s_proc_self_fd_1, s_dev_stdout);
+    symlink!(e, s_proc_self_fd_2, s_dev_stderr);
 
     // PTYs: tmux/screen/shells-with-job-control need devpts mounted on
     // /dev/pts (devtmpfs provides /dev/ptmx but not the pts filesystem).

@@ -11,6 +11,7 @@
 #   ROOTFS_TOUCH     — space-separated empty files to create
 #   ROOTFS_APK_CONF  — space-separated apk config files to copy (relative to rootfs/)
 #   ROOTFS_APK_KEYS  — path to apk signing keys directory (relative to rootfs/)
+#   ROOTFS_BASELAYOUT — space-separated base-layout files to copy (relative to rootfs/)
 
 set -euo pipefail
 
@@ -60,6 +61,14 @@ for f in $ROOTFS_APK_CONF; do
 done
 if [ -n "${ROOTFS_APK_KEYS:-}" ] && [ -d "$SRCDIR/$ROOTFS_APK_KEYS" ]; then
     cp "$SRCDIR/$ROOTFS_APK_KEYS"/* "$_R/$ROOTFS_APK_KEYS/"
+fi
+
+# Base-layout files (passwd/group/os-release/...). -p preserves source modes
+# (e.g. /etc/shadow is 0640).
+if [ -n "${ROOTFS_BASELAYOUT:-}" ]; then
+    for f in $ROOTFS_BASELAYOUT; do
+        cp -p "$SRCDIR/$f" "$_R/$f"
+    done
 fi
 
 # Replicate all busybox symlinks from the source rootfs

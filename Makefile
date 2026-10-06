@@ -31,7 +31,8 @@ ROOTFS_FILES := \
 # Symlinks: target:link-path (inside the rootfs tmp dir)
 ROOTFS_SYMLINKS := \
 	ld-musl-$(ALPINE_ARCH).so.1:lib/libc.musl-$(ALPINE_ARCH).so.1 \
-	libz.so.1.3.1:usr/lib/libz.so.1
+	libz.so.1.3.1:usr/lib/libz.so.1 \
+	../usr/lib/os-release:etc/os-release
 
 # Directories to create (beyond what the file copies imply)
 ROOTFS_DIRS := \
@@ -45,6 +46,26 @@ ROOTFS_TOUCH := \
 # Apk config and database to copy verbatim from rootfs/ (keys/ dir is copied recursively)
 ROOTFS_APK_CONF := etc/apk/repositories etc/apk/arch etc/apk/world lib/apk/db/installed
 ROOTFS_APK_KEYS := etc/apk/keys
+
+# Base-layout files from the alpine-baselayout / alpine-baselayout-data /
+# alpine-release packages. The apk database copied above lists those packages
+# as installed, and their files are what make the guest look like a normal
+# Linux userspace: /etc/passwd + /etc/group give `id`/`login` a user database,
+# /etc/os-release + /etc/alpine-release tell installers what distro this is.
+# Without them `id`/`id -un` name lookups fail with "unknown ID 0" and scripts
+# that sniff the distro see nothing. The files are a few KiB of text
+# (~1 KiB compressed).
+ROOTFS_BASELAYOUT := \
+	etc/passwd \
+	etc/group \
+	etc/shadow \
+	etc/shells \
+	etc/hostname \
+	etc/hosts \
+	etc/issue \
+	etc/nsswitch.conf \
+	etc/alpine-release \
+	usr/lib/os-release
 
 .PHONY: build debug test lint rootfs-minimal
 
@@ -148,4 +169,5 @@ $(BUILTIN_ROOTFS): $(addprefix rootfs/,$(ROOTFS_FILES))
 	 ROOTFS_TOUCH="$(ROOTFS_TOUCH)" \
 	 ROOTFS_APK_CONF="$(ROOTFS_APK_CONF)" \
 	 ROOTFS_APK_KEYS="$(ROOTFS_APK_KEYS)" \
+	 ROOTFS_BASELAYOUT="$(ROOTFS_BASELAYOUT)" \
 	 scripts/build-rootfs.sh $(BUILTIN_ROOTFS) $(BINARY)

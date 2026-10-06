@@ -11,6 +11,7 @@ pub mod nr {
     pub const DUP3: u32 = 24;
     pub const IOCTL: u32 = 29;
     pub const MKDIRAT: u32 = 34;
+    pub const SYMLINKAT: u32 = 36;
     pub const MOUNT: u32 = 40;
     pub const PIVOT_ROOT: u32 = 41;
     pub const CHDIR: u32 = 49;
