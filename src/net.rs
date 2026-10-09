@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+#[cfg(not(target_os = "windows"))]
 use crate::unet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

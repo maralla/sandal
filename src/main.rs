@@ -8,10 +8,12 @@ mod hypervisor;
 mod init;
 mod initramfs;
 mod irqs;
+#[cfg(not(target_os = "windows"))]
 mod net;
 mod rootfs;
 mod tar;
-mod unet;
+#[cfg(not(target_os = "windows"))]
+pub mod unet;
 mod virtio;
 mod vm;
 mod vmm_trace;
@@ -58,12 +60,16 @@ fn run_vm(args: Args) -> Result<()> {
         .init();
 
     // Check we're running on a supported host.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
-        anyhow::bail!("sandal only supports macOS (Hypervisor.framework) and Linux (KVM)");
+        if !args.no_network {
+            eprintln!("sandal: networking is not yet supported on Windows hosts — running without");
+            // The run flag lives on `args`; the WHP boot path forces it off.
+            // (Handled in `Vmm::new`; nothing to do here.)
+        }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let code = vm::run(args)?;
         std::process::exit(code);

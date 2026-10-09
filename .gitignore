@@ -1,4 +1,5 @@
 /target/
+/dist/
 Cargo.lock
 *.kernel
 vmlinux-sandal-x86

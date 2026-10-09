@@ -8,6 +8,7 @@ use super::{
 };
 use anyhow::{anyhow, Result};
 use std::fs;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::AsRawFd;
 
 // ── Guest physical memory map ───────────────────────────────────────────
@@ -65,21 +66,33 @@ impl Vmm {
             .or_else(|| resolve_data_path(KERNEL_ARTIFACT))
             .ok_or_else(|| anyhow!("kernel image not found"))?;
         let kernel_len = fs::metadata(&kernel_path)?.len() as usize;
-        let kernel_file = fs::File::open(&kernel_path)?;
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                kernel_len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                kernel_file.as_raw_fd(),
-                0,
-            )
+        // Unix: mmap the kernel image. Windows: plain read (the file is
+        // ~14 MB; the read cost is negligible and avoids the MapViewOfFile
+        // FFI surface).
+        #[cfg(target_os = "windows")]
+        let elf_vec = fs::read(&kernel_path)?;
+        #[cfg(target_os = "windows")]
+        let elf: &[u8] = &elf_vec;
+        // The mapping is never munmapped for the process lifetime, so the
+        // slice outliving the local pointer is sound.
+        #[cfg(not(target_os = "windows"))]
+        let elf: &[u8] = {
+            let kernel_file = fs::File::open(&kernel_path)?;
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    kernel_len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    kernel_file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                anyhow::bail!("failed to mmap kernel image");
+            }
+            unsafe { std::slice::from_raw_parts(mapped as *const u8, kernel_len) }
         };
-        if mapped == libc::MAP_FAILED {
-            anyhow::bail!("failed to mmap kernel image");
-        }
-        let elf: &[u8] = unsafe { std::slice::from_raw_parts(mapped as *const u8, kernel_len) };
         if elf.len() < 64 || &elf[..4] != b"\x7fELF" {
             anyhow::bail!("kernel is not an ELF image");
         }
@@ -145,11 +158,13 @@ impl Vmm {
             (mb + MMIO_OFF_DATA_BLK, ISA_IRQ_POOL[3]),
             (mb + MMIO_OFF_RNG, ISA_IRQ_POOL[4]),
         ];
+        #[cfg(not(target_os = "windows"))]
         if self.net.lock().unwrap().is_none() {
             // Keep the mmio layout (and thus the cmdline) stable whether or
             // not networking is enabled: the device region stays reserved but
             // must not be described to the kernel.
         }
+        #[cfg(not(target_os = "windows"))]
         for i in 0..self.virtiofs.len() {
             let slot = 5 + i;
             let irq = *ISA_IRQ_POOL.get(slot).ok_or_else(|| {
@@ -165,12 +180,18 @@ impl Vmm {
         let mut described: Vec<(u64, u32)> = Vec::new();
         for (idx, (base, irq)) in devices.iter().enumerate() {
             let present = match idx {
+                #[cfg(not(target_os = "windows"))]
                 0 => self.net.lock().unwrap().is_some(),
-                1 => true,                          // console always present
-                2 => self.blk.is_some(),            // root blk
-                3 => self.data_blk.is_some(),       // data blk
-                4 => self.rng.is_some(),            // rng
+                #[cfg(target_os = "windows")]
+                0 => false,
+                1 => true,                    // console always present
+                2 => self.blk.is_some(),      // root blk
+                3 => self.data_blk.is_some(), // data blk
+                4 => self.rng.is_some(),      // rng
+                #[cfg(not(target_os = "windows"))]
                 _ => idx - 5 < self.virtiofs.len(), // virtiofs
+                #[cfg(target_os = "windows")]
+                _ => false,
             };
             if present {
                 described.push((*base, *irq));
@@ -264,8 +285,8 @@ impl Vmm {
     }
 }
 
-/// Handle one KVM exit on x86_64.
-#[cfg(target_os = "linux")]
+/// Handle one KVM exit on x86_64 (shared by the KVM and WHP backends).
+#[cfg(target_arch = "x86_64")]
 impl Vmm {
     pub(super) fn handle_kvm_exit(&mut self, exit: crate::hypervisor::KvmExit) -> Result<()> {
         use crate::hypervisor::KvmExit;

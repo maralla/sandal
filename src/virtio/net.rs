@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::net::NetworkFilter;
+#[cfg(not(target_os = "windows"))]
 use crate::unet::{NetPoller, UserNet};
 use log::debug;
 

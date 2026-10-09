@@ -1,10 +1,12 @@
 pub mod blk;
 pub mod console;
+#[cfg(not(target_os = "windows"))]
 pub mod fs;
 /// Virtio MMIO transport implementation (virtio v2 / modern).
 ///
 /// Implements the virtio over MMIO transport as defined in the virtio spec §4.2.
 /// Each virtio device appears as a 0x200-byte MMIO region.
+#[cfg(not(target_os = "windows"))]
 pub mod net;
 pub mod rng;
 use std::sync::atomic::{fence, Ordering};

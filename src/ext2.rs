@@ -18,7 +18,6 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::mem::size_of;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::slice;
 
@@ -242,6 +241,23 @@ pub fn pack_directory(dir: &Path) -> Result<Vec<u8>> {
 /// remaining space is free for guest use.
 ///
 /// Supports multiple block groups for disks larger than 128 MB.
+
+fn host_file_mode(metadata: &std::fs::Metadata) -> u16 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (metadata.permissions().mode() & 0o7777) as u16
+    }
+
+    #[cfg(windows)]
+    {
+        // The DOS read-only attribute clears the owner-write bits; the rest
+        // defaults to readable/executable (packed rootfs dirs are 755 anyway).
+        let readonly = metadata.permissions().readonly();
+        0o555u16 ^ if readonly { 0o222 } else { 0 }
+    }
+}
+
 pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
     let total_blocks = size_bytes / BLOCK_SIZE;
     if total_blocks < 16 {
@@ -584,14 +600,14 @@ impl Ext2Builder {
             } else if ft.is_dir() {
                 let dir_ino = self.ensure_dir(parent_ino, &name);
                 // Set permissions from host
-                let perm = (metadata.permissions().mode() & 0o7777) as u16;
+                let perm = host_file_mode(&metadata);
                 if let Some(e) = self.entries.get_mut(&dir_ino) {
                     e.mode = S_IFDIR | perm;
                 }
                 self.add_directory_recursive(base, &path, dir_ino)?;
             } else if ft.is_file() {
                 let data = fs::read(&path)?;
-                let perm = (metadata.permissions().mode() & 0o7777) as u16;
+                let perm = host_file_mode(&metadata);
                 self.add_file_data(parent_ino, &name, &data, perm);
             }
             // Skip other file types

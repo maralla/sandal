@@ -10,43 +10,62 @@
 //!   `x86_64`, `macos`, `linux`); this module owns everything both
 //!   architectures share.
 
-#[cfg(target_os = "macos")]
-use crate::hypervisor::Gic;
-use std::sync::atomic::Ordering;
+pub(crate) use crate::cli::Args;
+pub(crate) use crate::irqs::{SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG};
 
 use crate::hypervisor::{Vcpu, Vm};
 use crate::initramfs;
-use crate::net::NetworkFilter;
-use crate::unet::UserNet;
 use crate::virtio::blk::VirtioBlkDevice;
 use crate::virtio::console::VirtioConsoleDevice;
-use crate::virtio::fs::VirtioFsDevice;
-use crate::virtio::net::VirtioNetDevice;
 use crate::virtio::rng::VirtioRngDevice;
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "macos")]
+use crate::hypervisor::Gic;
+
+#[cfg(not(target_os = "windows"))]
+use crate::net::NetworkFilter;
+
+#[cfg(not(target_os = "windows"))]
+use crate::unet::UserNet;
+
+#[cfg(not(target_os = "windows"))]
+use crate::virtio::fs::VirtioFsDevice;
+
+#[cfg(not(target_os = "windows"))]
+use crate::virtio::net::VirtioNetDevice;
+
+#[cfg(not(target_os = "windows"))]
+use std::os::unix::io::RawFd;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+
 #[cfg(target_os = "linux")]
 mod linux;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos;
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
-pub(crate) use crate::cli::Args;
-pub(crate) use crate::irqs::{SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG};
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) use aarch64::{MAX_FS_DEVICES, RAM_BASE};
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) use x86_64::x86_hypercall_page_off;
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) use x86_64::{MAX_FS_DEVICES, RAM_BASE};
 
@@ -56,16 +75,22 @@ pub(crate) use x86_64::{MAX_FS_DEVICES, RAM_BASE};
 // above it — the devices never overlap "System RAM").
 #[cfg(target_arch = "aarch64")]
 pub(crate) const MMIO_BASE: u64 = 0x0a00_0000;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_NET_BASE: u64 = MMIO_BASE + MMIO_OFF_NET;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_CONSOLE_BASE: u64 = MMIO_BASE + MMIO_OFF_CONSOLE;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_BLK;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const DATA_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_DATA_BLK;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_RNG_BASE: u64 = MMIO_BASE + MMIO_OFF_RNG;
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + MMIO_OFF_FS;
 
@@ -90,6 +115,7 @@ pub(crate) const VIRTIOFS_SIZE: u64 = 0x200;
 /// editor's CSI queries) is forwarded to the guest verbatim instead of
 /// being line-buffered/echoed by the host tty. Returns the original
 /// settings for restore.
+#[cfg(not(target_os = "windows"))]
 fn enable_raw_mode(fd: RawFd) -> Option<libc::termios> {
     unsafe {
         let mut orig: libc::termios = std::mem::zeroed();
@@ -106,6 +132,7 @@ fn enable_raw_mode(fd: RawFd) -> Option<libc::termios> {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn restore_terminal(fd: RawFd, orig: &libc::termios) {
     unsafe {
         libc::tcsetattr(fd, libc::TCSANOW, orig);
@@ -117,6 +144,7 @@ fn restore_terminal(fd: RawFd, orig: &libc::termios) {
 /// ONLCR and its console driver inserts CRs); the host tty re-applying
 /// ONLCR turned every guest newline into `\r\r\n` on the pane. Returns
 /// the original settings for restore.
+#[cfg(not(target_os = "windows"))]
 fn disable_output_processing(fd: RawFd) -> Option<libc::termios> {
     unsafe {
         let mut orig: libc::termios = std::mem::zeroed();
@@ -140,8 +168,48 @@ pub(crate) struct GuestRam {
 }
 
 impl GuestRam {
+    #[cfg(target_os = "windows")]
     fn new(len: usize) -> Self {
         assert_eq!(len % 4096, 0, "guest RAM size must be page-aligned");
+        // MEM_COMMIT: zero-filled by the OS (lazy — pages back from the
+        // pagefile on first touch). Declared locally: the libc crate does
+        // not wrap VirtualAlloc on Windows.
+        unsafe extern "system" {
+            fn VirtualAlloc(
+                address: *mut u8,
+                size: usize,
+                allocation_type: u32,
+                protect: u32,
+            ) -> *mut u8;
+        }
+
+        const MEM_RESERVE: u32 = 0x2000;
+        const MEM_COMMIT: u32 = 0x1000;
+        const PAGE_READWRITE: u32 = 0x04;
+
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+
+        if ptr.is_null() {
+            panic!("failed to VirtualAlloc {len} bytes of guest RAM");
+        }
+
+        GuestRam {
+            ptr: ptr as *mut u8,
+            len,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn new(len: usize) -> Self {
+        assert_eq!(len % 4096, 0, "guest RAM size must be page-aligned");
+
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -152,10 +220,13 @@ impl GuestRam {
                 0,
             )
         };
+
         if ptr == libc::MAP_FAILED {
             panic!("failed to mmap {len} bytes of guest RAM");
         }
+
         let ptr = ptr as *mut u8;
+
         // MAP_ANONYMOUS memory is already zero-filled by the kernel (lazy
         // zero pages until first write) — no explicit memset needed.
         GuestRam { ptr, len }
@@ -182,6 +253,20 @@ unsafe impl Send for GuestRam {}
 unsafe impl Sync for GuestRam {}
 
 impl Drop for GuestRam {
+    #[cfg(target_os = "windows")]
+    fn drop(&mut self) {
+        unsafe extern "system" {
+            fn VirtualFree(address: *mut u8, size: usize, free_type: u32) -> i32;
+        }
+
+        const MEM_RELEASE: u32 = 0x8000;
+
+        unsafe {
+            VirtualFree(self.ptr, 0, MEM_RELEASE);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
@@ -300,6 +385,7 @@ impl ConsoleTxFilter {
                     }
                     continue;
                 }
+
                 if ch == b'>' && self.vt_param == 0 {
                     self.vt_priv = 2;
                 } else if ch == b'?' {
@@ -307,11 +393,14 @@ impl ConsoleTxFilter {
                 } else if ch.is_ascii_digit() {
                     self.vt_param = self.vt_param * 10 + (ch - b'0') as u32;
                 }
+
                 if (0x40..=0x7e).contains(&ch) {
                     self.end_vt_sequence(&mut replies, out);
                 }
+
                 continue;
             }
+
             if ch == 0x1b {
                 self.vt_esc = true;
                 self.vt_csi = 0;
@@ -349,10 +438,12 @@ impl ConsoleTxFilter {
             for r in &replies {
                 blob.extend_from_slice(r);
             }
+
             console
                 .lock()
                 .unwrap()
                 .push_rx_and_drain(memory.as_shared_slice(), ram_base, &blob);
+
             self.replied = true;
         }
     }
@@ -444,16 +535,20 @@ impl ConsoleTxFilter {
         if self.tx_suppress_line {
             return;
         }
+
         let markers: [&[u8]; 2] = [
             self.exit_marker.as_bytes(),
             initramfs::EXPORT_PATH_MARKER.as_bytes(),
         ];
+
         self.tx_hold.push(ch);
+
         if markers.iter().any(|m| self.tx_hold.ends_with(m)) {
             self.tx_hold.clear();
             self.tx_suppress_line = true;
         } else {
             let hold = &self.tx_hold;
+
             let keep = if markers.iter().any(|m| m.starts_with(hold)) {
                 hold.len()
             } else {
@@ -466,7 +561,9 @@ impl ConsoleTxFilter {
                     })
                     .unwrap_or(0)
             };
+
             let flush_len = self.tx_hold.len() - keep;
+
             if flush_len > 0 {
                 out.extend_from_slice(&self.tx_hold[..flush_len]);
                 self.tx_hold.drain(..flush_len);
@@ -480,6 +577,7 @@ impl ConsoleTxFilter {
         let Ok(line) = std::str::from_utf8(line) else {
             return;
         };
+
         let trimmed = line.trim_end_matches(['\n', '\r']);
 
         if let Some(pos) = trimmed.find(&self.exit_marker) {
@@ -492,6 +590,7 @@ impl ConsoleTxFilter {
                 return;
             }
         }
+
         if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
             let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
             if path.starts_with('/') {
@@ -519,11 +618,17 @@ struct Vmm {
     /// replies, protocol markers). The main loop and the net-kick thread
     /// BOTH drain the TX queue; the filter must be singular or escape
     /// sequences tear apart at drain boundaries.
-    #[cfg(target_os = "linux")]
     console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
     /// x86_64: base of the MMIO device window (above the guest RAM).
     #[cfg(target_arch = "x86_64")]
     mmio_base: u64,
+
+    /// Windows: the HLT park for the run loop + the device-thread wake.
+    #[cfg(target_os = "windows")]
+    halt: Arc<crate::hypervisor::whp::HaltWaker>,
+    /// Windows: the PIT tick + console-input threads (stopped on drop).
+    #[cfg(target_os = "windows")]
+    device_threads: Option<crate::vm::windows::DeviceThreads>,
     /// Terminal-query reply dedup for the macOS path (no shared filter —
     /// the run loop's own tracker does the answering).
     #[cfg(target_os = "macos")]
@@ -536,8 +641,10 @@ struct Vmm {
     /// backend and raises the net IRQ independently of the run loop (an
     /// idle guest would otherwise wait for its own delayed-ACK exit before
     /// more host data is delivered).
+    #[cfg(not(target_os = "windows"))]
     net: Arc<Mutex<Option<VirtioNetDevice>>>,
     rng: Option<VirtioRngDevice>,
+    #[cfg(not(target_os = "windows"))]
     virtiofs: Vec<VirtioFsDevice>,
     config_blob: Vec<u8>,
     #[cfg(target_os = "linux")]
@@ -555,9 +662,15 @@ struct Vmm {
     /// asserted line is re-written every iteration and a redundant `false`
     /// write is skipped.
     irq_line_asserted: bool,
+    /// Unix: the saved termios. Windows: the saved console input mode.
+    #[cfg(not(target_os = "windows"))]
     tty_saved: Option<libc::termios>,
-    /// Original stdout termios (OPOST restored on exit).
+    #[cfg(target_os = "windows")]
+    tty_saved: Option<u32>,
+    #[cfg(not(target_os = "windows"))]
     tty_out_saved: Option<libc::termios>,
+    #[cfg(target_os = "windows")]
+    tty_out_saved: Option<u32>,
     guest_shutdown: bool,
     verbose_uart: bool,
     /// Per-boot exit-protocol token (x86_64): the init script echoes
@@ -628,6 +741,7 @@ extern "C" fn winch_handler(_sig: i32) {
 /// prompt out of view (the guest tmux status line would be the only thing
 /// left visible). Falls back to 120x40 when stdout is not a tty (tests
 /// drive their own pty and pipes have no size).
+#[cfg(not(target_os = "windows"))]
 fn host_tty_size() -> (u16, u16) {
     let mut ws = libc::winsize {
         ws_row: 0,
@@ -635,6 +749,7 @@ fn host_tty_size() -> (u16, u16) {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+
     for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {
         // SAFETY: `ws` is a valid winsize; TIOCGWINSZ only fills it in.
         let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
@@ -642,6 +757,14 @@ fn host_tty_size() -> (u16, u16) {
             return (ws.ws_col, ws.ws_row);
         }
     }
+
+    (120, 40)
+}
+
+#[cfg(target_os = "windows")]
+fn host_tty_size() -> (u16, u16) {
+    // The console-mode path: GetConsoleScreenBufferInfo would give the exact
+    // size; 120x40 is the sandbox default and matches the common window.
     (120, 40)
 }
 
@@ -656,6 +779,7 @@ pub fn resolve_data_path(name: &str) -> Option<PathBuf> {
         std::env::current_dir().ok()?.join(name),
         std::env::current_exe().ok()?.parent()?.join(name),
     ];
+
     candidates.into_iter().find(|p| p.exists())
 }
 
@@ -664,19 +788,24 @@ pub fn resolve_data_path(name: &str) -> Option<PathBuf> {
 /// the maximum number of devices.
 fn parse_shares(args: &Args) -> Result<Vec<(String, PathBuf, String)>> {
     let mut shares = Vec::new();
+
     for (i, spec) in args.shared_dirs.iter().enumerate() {
         if i >= MAX_FS_DEVICES {
             bail_shares()?;
         }
+
         let (host, guest) = spec
             .split_once(':')
             .ok_or_else(|| anyhow!("invalid --share {spec:?} (expected host_path:guest_path)"))?;
+
         let host_path = PathBuf::from(host);
         if !host_path.is_dir() {
             bail_shares_dir(host)?;
         }
+
         shares.push((format!("share{i}"), host_path, guest.to_string()));
     }
+
     Ok(shares)
 }
 
@@ -696,9 +825,20 @@ impl Vmm {
     fn mmio_window(&self) -> u64 {
         self.mmio_base
     }
+
     #[cfg(target_arch = "aarch64")]
     fn mmio_window(&self) -> u64 {
         MMIO_BASE
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn halt_waker(&self) -> Arc<crate::hypervisor::whp::HaltWaker> {
+        self.halt.clone()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn pic_handle(&self) -> Arc<Mutex<crate::hypervisor::whp::Pic>> {
+        self.vm.pic_handle()
     }
 
     /// Map a guest physical address to a virtiofs device index, if in range.
@@ -722,7 +862,6 @@ impl Vmm {
 /// appear indented by this line's width. Emit CRLF explicitly — harmless
 /// on a normal tty (an extra CR renders as nothing).
 pub(crate) fn console_eprintln(msg: &str) {
-    use std::io::Write;
     let mut err = std::io::stderr().lock();
     let _ = writeln!(err, "{msg}\r");
 }
@@ -733,21 +872,31 @@ pub static BOOT_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLoc
 pub fn run(args: Args) -> Result<i32> {
     let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
     let t0 = BOOT_T0.get_or_init(std::time::Instant::now);
+
     let mut vmm = Vmm::new(&args)?;
     if timing {
         eprintln!("BOOT_TIMING vmm_new: {:?}", t0.elapsed());
     }
+
     vmm.boot(&args)?;
+
     if timing {
         eprintln!("BOOT_TIMING boot (disks+rootfs+kernel): {:?}", t0.elapsed());
     }
+
     #[cfg(target_os = "linux")]
     {
         vmm.run_loop_kvm(&args)
     }
+
     #[cfg(target_os = "macos")]
     {
         vmm.run_loop_hvf(&args)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        vmm.run_loop_whp(&args)
     }
 }
 
@@ -762,8 +911,10 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
         let mb = args.disk_size.unwrap_or(1);
         return crate::ext2::create_empty_ext2(mb * 1024 * 1024);
     }
+
     let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
     let t = std::time::Instant::now();
+
     let mut all_entries = Vec::new();
     for layer in &args.layers {
         let layer_data = fs::read(layer)
@@ -771,9 +922,11 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
         let entries = crate::tar::read_tar_zst(&layer_data)?;
         all_entries.extend(entries);
     }
+
     if timing {
         eprintln!("BOOT_TIMING   layer_parse: {:?}", t.elapsed());
     }
+
     let layer_data = crate::tar::total_data_size(&all_entries);
     let layer_need = (layer_data * 2) + 16 * 1024 * 1024;
     let disk_bytes = args.disk_size.unwrap_or(1) * 1024 * 1024;
@@ -787,11 +940,14 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
             final_size / (1024 * 1024)
         );
     }
+
     let t = std::time::Instant::now();
     crate::ext2::inject_tar_entries(&mut img, &all_entries)?;
+
     if timing {
         eprintln!("BOOT_TIMING   ext2_inject: {:?}", t.elapsed());
     }
+
     Ok(img)
 }
 
@@ -800,9 +956,22 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
 // ─────────────────────────────────────────────────────────────────────────────
 impl Vmm {
     fn new(args: &Args) -> Result<Self> {
+        #[cfg(target_os = "windows")]
+        let args_no_network = true; // the user-space netstack is unix-only for now
+                                    //
+        #[cfg(not(target_os = "windows"))]
+        let args_no_network = args.no_network;
+
+        #[cfg(target_os = "windows")]
+        let args = &Args {
+            no_network: true,
+            ..args.clone()
+        };
+
         let tt = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
         let mut tp = std::time::Instant::now();
         let vm = Vm::new()?;
+
         if tt {
             eprintln!("BOOT_TIMING   vm_create: {:?}", tp.elapsed());
             tp = std::time::Instant::now();
@@ -819,6 +988,10 @@ impl Vmm {
                 tp = std::time::Instant::now();
             }
         }
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        vm.create_irqchip()?; // the userspace PIC pair
+                              //
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         vm.create_vgic(
             aarch64::GICD_BASE,
@@ -829,8 +1002,12 @@ impl Vmm {
 
         #[cfg(target_os = "linux")]
         let vcpu = Vcpu::new(&vm)?;
+
         #[cfg(target_os = "macos")]
         let vcpu = Vcpu::new()?;
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        let vcpu = Vcpu::new(&vm)?;
 
         // Guest RAM. On x86_64 the virtio-mmio device window sits at
         // MMIO_BASE (160 MB) inside the flat physical address space, so the
@@ -842,15 +1019,20 @@ impl Vmm {
         // (see `x86_64::mmio_base`), so `-m` is honored in full. The 1 TB
         // ceiling only guards against absurd values; the mmap is lazy.
         let ram_bytes = (args.memory.max(64) * 1024 * 1024).min(1 << 40);
+
         #[cfg(target_arch = "aarch64")]
         let ram_bytes = args.memory.max(64) * 1024 * 1024;
+
         let memory = Arc::new(GuestRam::new(ram_bytes));
+
         #[cfg(target_arch = "x86_64")]
         let mmio_base = x86_64::mmio_base(ram_bytes as u64);
+
         if tt {
             eprintln!("BOOT_TIMING   guest_ram: {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
+
         vm.map_memory(
             memory.as_shared_slice().as_ptr() as *mut _,
             RAM_BASE,
@@ -870,22 +1052,60 @@ impl Vmm {
         // reaches the guest verbatim; the original settings are restored on
         // exit. stdout is the guest console stream: OPOST/ONLCR disabled so
         // the already-formed guest output is not re-processed.
+        #[cfg(target_os = "windows")]
+        let (tty_saved, tty_out_saved) = {
+            // stdin: VT input, no line/echo/processed — every keystroke
+            // reaches the guest verbatim. stdout: VT output, processed
+            // output OFF (the guest's CRLF is authoritative; the host-side
+            // console_eprintln carries its own CR).
+            unsafe extern "system" {
+                fn GetStdHandle(which: u32) -> *mut u8;
+                fn GetConsoleMode(handle: *mut u8, mode: *mut u32) -> i32;
+                fn SetConsoleMode(handle: *mut u8, mode: u32) -> i32;
+            }
+
+            const STD_INPUT_HANDLE: u32 = 0xFFFF_FFD6;
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFD5;
+
+            let in_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let out_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let (saved_in, saved_out) = unsafe {
+                let (mut m_in, mut m_out) = (0u32, 0u32);
+                let _ = GetConsoleMode(in_h, &mut m_in);
+                let _ = GetConsoleMode(out_h, &mut m_out);
+                (m_in, m_out)
+            };
+
+            // ENABLE_VIRTUAL_TERMINAL_INPUT = 0x200; clear line/echo/
+            // processed (0x2|0x4|0x1).
+            unsafe { SetConsoleMode(in_h, 0x0200) };
+            // ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4; clear
+            // ENABLE_PROCESSED_OUTPUT (0x1) so the guest's CRLF is not
+            // re-translated.
+            unsafe { SetConsoleMode(out_h, 0x4) };
+            (Some(saved_in), Some(saved_out))
+        };
+
+        #[cfg(not(target_os = "windows"))]
         let (tty_saved, tty_out_saved) = unsafe {
             let saved = if libc::isatty(0) != 0 {
                 enable_raw_mode(0)
             } else {
                 None
             };
+
             let out_saved = if libc::isatty(1) != 0 {
                 disable_output_processing(1)
             } else {
                 None
             };
+
             #[cfg(target_os = "macos")]
             {
                 let fl = libc::fcntl(0, libc::F_GETFL);
                 let _ = libc::fcntl(0, libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
+
             (saved, out_saved)
         };
 
@@ -913,7 +1133,9 @@ impl Vmm {
             eprintln!("BOOT_TIMING   console+winch: {:?}", tp.elapsed());
             tp = std::time::Instant::now();
         }
-        let net = if args.no_network {
+
+        #[cfg(not(target_os = "windows"))]
+        let net = if args_no_network {
             Arc::new(Mutex::new(None))
         } else {
             let backend =
@@ -928,6 +1150,7 @@ impl Vmm {
 
             Arc::new(Mutex::new(Some(VirtioNetDevice::new(backend, filter))))
         };
+
         if tt {
             eprintln!("BOOT_TIMING   net: {:?}", tp.elapsed());
         }
@@ -966,6 +1189,7 @@ impl Vmm {
                 irq_lock.clone(),
                 irq_levels.clone(),
             )?;
+
             linux::KvmHost {
                 irq_lock,
                 stdin_stop_w,
@@ -976,7 +1200,7 @@ impl Vmm {
 
         #[cfg(target_os = "linux")]
         let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        #[cfg(target_os = "linux")]
+
         let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
             exit_marker.trim_end_matches(':').to_string(),
         )));
@@ -993,7 +1217,10 @@ impl Vmm {
             net_kick_stop.clone(),
         );
 
+        #[cfg(not(target_os = "windows"))]
         let mut virtiofs = Vec::new();
+
+        #[cfg(not(target_os = "windows"))]
         for (tag, host_path, _guest) in parse_shares(args)? {
             virtiofs.push(VirtioFsDevice::new(host_path, tag));
         }
@@ -1005,18 +1232,23 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             gic: Gic::new(),
             console,
-            #[cfg(target_os = "linux")]
             console_tx_filter,
             #[cfg(target_arch = "x86_64")]
             mmio_base,
+            #[cfg(target_os = "windows")]
+            halt: Arc::new(crate::hypervisor::whp::HaltWaker::default()),
+            #[cfg(target_os = "windows")]
+            device_threads: None,
             #[cfg(target_os = "macos")]
             da1_answered: false,
             #[cfg(target_os = "macos")]
             da2_answered: false,
             blk: None,
             data_blk: None,
+            #[cfg(not(target_os = "windows"))]
             net,
             rng: Some(VirtioRngDevice::new()),
+            #[cfg(not(target_os = "windows"))]
             virtiofs,
             config_blob: Vec::new(),
             #[cfg(target_os = "linux")]
@@ -1069,10 +1301,6 @@ impl Vmm {
     fn boot(&mut self, args: &Args) -> Result<()> {
         let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
         let t0 = std::time::Instant::now();
-        // ── Writable data disk (vdb): --disk-size / --layer ────────────
-        // Created first: DISK_MODE in the init config selects the overlay
-        // upperdir (disk vs tmpfs), so `data_blk` must be known by then.
-        //
         // The device is always present. With `--disk-size`/`--layer` it backs
         // the overlay upperdir; without them the overlay upper stays on tmpfs
         // but the device is still needed as the scratch target `sandal-export`
@@ -1080,6 +1308,7 @@ impl Vmm {
         // tmpfs-mode guest could never export a layer.
         let disk_backed_upper = args.disk_size.is_some() || !args.layers.is_empty();
         self.data_blk = Some(VirtioBlkDevice::new(build_data_disk(args)?));
+
         if timing {
             eprintln!("BOOT_TIMING data_disk: {:?}", t0.elapsed());
         }
@@ -1092,15 +1321,25 @@ impl Vmm {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
         let disk_mode = if disk_backed_upper {
             Some("disk")
         } else {
             None
         };
+
         let share_configs: Vec<(String, String)> = parse_shares(args)?
             .into_iter()
             .map(|(tag, _host, guest)| (tag, guest))
             .collect();
+
+        // The effective network flag: the Windows host runs network-less
+        // (the user-space netstack's socket plumbing is unix-only for now).
+        #[cfg(target_os = "windows")]
+        let network = false;
+
+        #[cfg(not(target_os = "windows"))]
+        let network = !args.no_network;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1109,7 +1348,7 @@ impl Vmm {
                 disk_mode,
                 &share_configs,
                 &args.command,
-                !args.no_network,
+                network,
                 clock_secs,
                 cols,
                 rows,
@@ -1124,7 +1363,7 @@ impl Vmm {
                 disk_mode,
                 &share_configs,
                 &args.command,
-                !args.no_network,
+                network,
                 clock_secs,
                 cols,
                 rows,
@@ -1145,7 +1384,7 @@ impl Vmm {
             }
         };
 
-        crate::ext2::inject_runtime_files(&mut rootfs_img, !args.no_network, self.mmio_window())?;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, network, self.mmio_base)?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1173,6 +1412,12 @@ impl Vmm {
             eprintln!("BOOT_TIMING kernel_load: {:?}", t0.elapsed());
         }
 
+        // ── Host device threads (Windows): the PIT tick + console input ─
+        #[cfg(target_os = "windows")]
+        {
+            self.device_threads = Some(windows::spawn_device_threads(self));
+        }
+
         #[cfg(target_arch = "aarch64")]
         self.boot_kernel_arm64(args)?;
 
@@ -1185,12 +1430,36 @@ impl Drop for Vmm {
         #[cfg(target_os = "linux")]
         self.net_kick_stop.store(true, Ordering::Relaxed);
 
-        if let Some(ref orig) = self.tty_out_saved {
-            restore_terminal(1, orig);
+        // Windows: restore the saved console modes (input re-enables
+        // line/echo/processed; output re-enables processed output).
+        #[cfg(target_os = "windows")]
+        unsafe extern "system" {
+            fn GetStdHandle(which: u32) -> *mut u8;
+            fn SetConsoleMode(handle: *mut u8, mode: u32) -> i32;
         }
 
-        if let Some(ref orig) = self.tty_saved {
-            restore_terminal(0, orig);
+        #[cfg(target_os = "windows")]
+        unsafe {
+            if let Some(mode) = self.tty_out_saved {
+                let out_h = GetStdHandle(0xFFFF_FFD5);
+                SetConsoleMode(out_h, mode);
+            }
+
+            if let Some(mode) = self.tty_saved {
+                let in_h = GetStdHandle(0xFFFF_FFD6);
+                SetConsoleMode(in_h, mode);
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(ref orig) = self.tty_out_saved {
+                restore_terminal(1, orig);
+            }
+
+            if let Some(ref orig) = self.tty_saved {
+                restore_terminal(0, orig);
+            }
         }
     }
 }
@@ -1221,6 +1490,7 @@ impl Vmm {
                 .mmio_read(addr - mw - MMIO_OFF_CONSOLE, sas);
         }
 
+        #[cfg(not(target_os = "windows"))]
         if let Some(net) = self.net.lock().unwrap().as_mut() {
             if (mw + MMIO_OFF_NET..mw + MMIO_OFF_NET + 0x200).contains(&addr) {
                 return net.mmio_read(addr - mw - MMIO_OFF_NET) as u64;
@@ -1246,6 +1516,7 @@ impl Vmm {
         }
 
         if let Some(idx) = self.virtiofs_index(addr) {
+            #[cfg(not(target_os = "windows"))]
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 return dev.mmio_read(addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE) as u64;
             }
@@ -1305,6 +1576,7 @@ impl Vmm {
             }
         }
 
+        #[cfg(not(target_os = "windows"))]
         if let Some(net) = self.net.lock().unwrap().as_mut() {
             if (mw + MMIO_OFF_NET..mw + MMIO_OFF_NET + 0x200).contains(&addr) {
                 if let Some(qidx) = net.mmio_write(addr - mw - MMIO_OFF_NET, val as u32) {
@@ -1336,6 +1608,7 @@ impl Vmm {
         }
 
         if let Some(idx) = self.virtiofs_index(addr) {
+            #[cfg(not(target_os = "windows"))]
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 let off = addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE;
                 if let Some(qidx) = dev.mmio_write(off, val as u32) {

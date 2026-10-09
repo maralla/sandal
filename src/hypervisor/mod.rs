@@ -1,17 +1,24 @@
 //! Hypervisor backend abstraction.
 //!
-//! Two backends implement the same narrow surface used by the VMM core
+//! Three backends implement the same narrow surface used by the VMM core
 //! (`crate::vm`):
 //!
 //! - **macOS Apple Silicon** — Apple Hypervisor.framework (`hvf/`). The GIC
 //!   is emulated in software by the VMM (see `docs/vmm-spec.md`).
 //! - **Linux aarch64** — KVM (`kvm/`) with the in-kernel GICv3 (VGIC) and
 //!   in-kernel virtual timer, which removes the need for the software GIC.
+//! - **Windows x86_64** — Windows Hypervisor Platform (`whp/`). WHP exposes
+//!   partition/vCPU primitives only: the i8259 PIC and the PIT tick are
+//!   emulated in userspace by the backend, and virtio-mmio MMIO accesses
+//!   surface as memory-access exits that are completed with a focused x64
+//!   instruction decoder.
 
 #[cfg(target_os = "macos")]
 mod hvf;
 #[cfg(target_os = "linux")]
 pub mod kvm;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod whp;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared ARM64 register identifiers
@@ -82,11 +89,57 @@ impl Reg {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Backend exports
+// Guest exit vocabulary (shared by the x86_64 backends — KVM and WHP both
+// surface the same classes of exits to the shared `handle_kvm_exit` path)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// A vCPU exit. Historically named after KVM; the WHP backend produces the
+/// same variants from its own exit contexts.
+pub enum KvmExit {
+    /// Guest MMIO access (virtio devices, PL011 UART).
+    Mmio {
+        addr: u64,
+        len: usize,
+        is_write: bool,
+        data: [u8; 8],
+    },
+    /// Guest debug exception (arm64). For `BRK #imm`, `hsr` is ESR_EL2 with
+    /// EC = 0x3c and the immediate in the low 16 bits; the vCPU PC still
+    /// points at the instruction and must be advanced by the VMM.
+    #[cfg(target_arch = "aarch64")]
+    Debug { hsr: u32 },
+    /// Guest port I/O (x86_64): serial console (COM1), the legacy interrupt
+    /// controller ports and the VMM hypercall helpers. `count` is always 1
+    /// for our device model.
+    Io {
+        port: u16,
+        len: usize,
+        is_write: bool,
+        /// The value for OUT; filled by [`Vcpu::fill_io_read`] for IN.
+        value: u64,
+    },
+    /// The guest executed HLT (x86_64). The WHP run loop parks the vCPU
+    /// thread until a device event (timer tick, console input) is pending.
+    Hlt,
+    /// Debug exception (x86_64 single-step / breakpoints).
+    #[cfg(target_arch = "x86_64")]
+    DebugX86 { exception: u32, pc: u64, dr6: u64 },
+    /// KVM internal error (suberror code).
+    InternalError(u64),
+    /// PSCI SYSTEM_OFF / SYSTEM_RESET (arm64, handled in-kernel) or the x86
+    /// KVM system-event path; reported here.
+    SystemEvent(#[allow(dead_code)] u32),
+    /// vCPU failed to enter; the VM cannot continue.
+    FailEntry(u64),
+    /// Anything else (should not happen with this device model).
+    Unknown(u32),
+}
 
 #[cfg(target_os = "macos")]
 pub use hvf::{Gic, HvSysReg, Vcpu, Vm};
 
 #[cfg(target_os = "linux")]
-pub use kvm::{KvmExit, Vcpu, Vm};
+pub use kvm::{Vcpu, Vm};
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use whp::{Vcpu, Vm};

@@ -1374,6 +1374,7 @@ mod sys {
         }
     }
 
+    #[cfg(unix)]
     pub fn pipe() -> Option<(RawFd, RawFd)> {
         let mut fds = [0 as libc::c_int; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
@@ -1381,6 +1382,20 @@ mod sys {
         } else {
             None
         }
+    }
+
+    /// Windows: no pipe(2) — a loopback TCP socket pair gives the same
+    /// wakeup semantics (write end signals, read end drains).
+    #[cfg(windows)]
+    pub fn pipe() -> Option<(RawFd, RawFd)> {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let writer = std::net::TcpStream::connect(addr).ok()?;
+        let (reader, _) = listener.accept().ok()?;
+        let w = writer.into_raw_fd() as RawFd;
+        let r = reader.into_raw_fd() as RawFd;
+        Some((r, w))
     }
 }
 
