@@ -15,6 +15,100 @@ use std::os::fd::AsRawFd;
 pub(crate) const RAM_BASE: u64 = 0x0;
 
 pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal-x86";
+
+/// A loaded guest kernel image.
+///
+/// Unix file sources stay mmap'd (zero-copy) and the mapping is
+/// intentionally never unmapped for the process lifetime. Windows reads
+/// and the embedded release blob are owned buffers; the copy into guest
+/// memory completes inside `boot_kernel_x86`, so the owned buffer is
+/// freed when it drops at the end of that function.
+enum KernelImage {
+    Mapped {
+        ptr: *const u8,
+        len: usize,
+    },
+    #[cfg(any(target_os = "windows", sandal_embed_kernel))]
+    Owned(Vec<u8>),
+}
+
+impl KernelImage {
+    /// Resolve and load the kernel image: explicit `-k`, then the
+    /// embedded release blob (release builds only; see `build.rs` and the
+    /// Makefile `dist` target), then the data-path lookup next to the
+    /// binary.
+    fn acquire(args: &Args) -> Result<Self> {
+        if let Some(path) = &args.kernel {
+            return Self::from_file(path);
+        }
+        if let Some(image) = embedded_kernel() {
+            return Ok(image);
+        }
+        match resolve_data_path(KERNEL_ARTIFACT) {
+            Some(path) => Self::from_file(&path),
+            None => anyhow::bail!("kernel image not found"),
+        }
+    }
+
+    fn from_file(path: &std::path::Path) -> Result<Self> {
+        // Unix: mmap the kernel image. Windows: plain read (the file is
+        // ~14 MB; the read cost is negligible and avoids the MapViewOfFile
+        // FFI surface).
+        #[cfg(target_os = "windows")]
+        return Ok(Self::Owned(fs::read(path)?));
+        #[cfg(not(target_os = "windows"))]
+        {
+            let len = fs::metadata(path)?.len() as usize;
+            // The mapping is never munmapped for the process lifetime, so
+            // the raw pointer handed out below is sound.
+            let kernel_file = fs::File::open(path)?;
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    kernel_file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                anyhow::bail!("failed to mmap kernel image");
+            }
+            Ok(Self::Mapped {
+                ptr: mapped as *const u8,
+                len,
+            })
+        }
+    }
+
+    /// # Safety
+    /// The caller must keep `self` alive for the duration of the borrow;
+    /// `boot_kernel_x86` holds it for its whole body.
+    unsafe fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mapped { ptr, len } => std::slice::from_raw_parts(*ptr, *len),
+            #[cfg(any(target_os = "windows", sandal_embed_kernel))]
+            Self::Owned(vec) => vec,
+        }
+    }
+}
+
+/// The kernel embedded in release builds (`make dist`): zstd-compressed,
+/// decompressed at boot like the built-in rootfs payload. Dev builds
+/// compile to `None` and keep the data-path lookup.
+#[cfg(sandal_embed_kernel)]
+fn embedded_kernel() -> Option<KernelImage> {
+    const BUILTIN_KERNEL_ZST: &[u8] = include_bytes!("../kernel-x86_64.zst");
+    Some(KernelImage::Owned(
+        zstd::decode_all(BUILTIN_KERNEL_ZST).expect("failed to decompress embedded kernel"),
+    ))
+}
+
+#[cfg(not(sandal_embed_kernel))]
+fn embedded_kernel() -> Option<KernelImage> {
+    None
+}
 pub(crate) const MAX_FS_DEVICES: usize = 5;
 
 /// Legacy ISA IRQs usable for virtio-mmio devices (skips the timer,
@@ -60,39 +154,10 @@ impl Vmm {
         const E820_RAM: u32 = 1;
         const E820_RESERVED: u32 = 2;
 
-        let kernel_path = args
-            .kernel
-            .clone()
-            .or_else(|| resolve_data_path(KERNEL_ARTIFACT))
-            .ok_or_else(|| anyhow!("kernel image not found"))?;
-        let kernel_len = fs::metadata(&kernel_path)?.len() as usize;
-        // Unix: mmap the kernel image. Windows: plain read (the file is
-        // ~14 MB; the read cost is negligible and avoids the MapViewOfFile
-        // FFI surface).
-        #[cfg(target_os = "windows")]
-        let elf_vec = fs::read(&kernel_path)?;
-        #[cfg(target_os = "windows")]
-        let elf: &[u8] = &elf_vec;
-        // The mapping is never munmapped for the process lifetime, so the
-        // slice outliving the local pointer is sound.
-        #[cfg(not(target_os = "windows"))]
-        let elf: &[u8] = {
-            let kernel_file = fs::File::open(&kernel_path)?;
-            let mapped = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    kernel_len,
-                    libc::PROT_READ,
-                    libc::MAP_PRIVATE,
-                    kernel_file.as_raw_fd(),
-                    0,
-                )
-            };
-            if mapped == libc::MAP_FAILED {
-                anyhow::bail!("failed to mmap kernel image");
-            }
-            unsafe { std::slice::from_raw_parts(mapped as *const u8, kernel_len) }
-        };
+        let kernel_image = KernelImage::acquire(args)?;
+        // Safety: `kernel_image` outlives this borrow for the whole
+        // function body (see `KernelImage::as_slice`).
+        let elf: &[u8] = unsafe { kernel_image.as_slice() };
         if elf.len() < 64 || &elf[..4] != b"\x7fELF" {
             anyhow::bail!("kernel is not an ELF image");
         }

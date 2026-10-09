@@ -13,7 +13,7 @@ use super::{
 use crate::devicetree::DeviceTree;
 use crate::hypervisor::Reg;
 use crate::initramfs;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::fs;
 
 // ── Guest physical memory map (must match src/devicetree.rs) ────────────
@@ -29,18 +29,35 @@ pub(super) const GICR_SIZE: u64 = 0x2_0000; // 2 × 64 KB frames for 1 CPU
 pub(super) const UART_BASE: u64 = 0x0900_0000;
 
 pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal";
+
+/// The kernel embedded in release builds (`make dist`): zstd-compressed,
+/// decompressed at boot like the built-in rootfs payload. Dev builds
+/// compile to `None` and keep the data-path lookup.
+#[cfg(sandal_embed_kernel)]
+fn embedded_kernel() -> Option<Vec<u8>> {
+    const BUILTIN_KERNEL_ZST: &[u8] = include_bytes!("../kernel-aarch64.zst");
+    Some(zstd::decode_all(BUILTIN_KERNEL_ZST).expect("failed to decompress embedded kernel"))
+}
+
+#[cfg(not(sandal_embed_kernel))]
+fn embedded_kernel() -> Option<Vec<u8>> {
+    None
+}
 pub(crate) const MAX_FS_DEVICES: usize = 8;
 
 impl Vmm {
     #[cfg(target_arch = "aarch64")]
     pub(super) fn boot_kernel_arm64(&mut self, args: &Args) -> Result<()> {
         // ── Load the kernel Image ──────────────────────────────────────
-        let kernel_path = args
-            .kernel
-            .clone()
-            .or_else(|| resolve_data_path(KERNEL_ARTIFACT))
-            .ok_or_else(|| anyhow!("kernel image not found"))?;
-        let kernel = fs::read(&kernel_path)?;
+        let kernel: Vec<u8> = if let Some(path) = &args.kernel {
+            fs::read(path)?
+        } else if let Some(image) = embedded_kernel() {
+            image
+        } else if let Some(path) = resolve_data_path(KERNEL_ARTIFACT) {
+            fs::read(path)?
+        } else {
+            anyhow::bail!("kernel image not found")
+        };
         if kernel.len() < 64 {
             anyhow::bail!("kernel image too small");
         }
@@ -154,6 +171,9 @@ impl Vmm {
                 anyhow::bail!(
                     "KVM failed to enter the guest (hardware_entry_failure_reason=0x{reason:x})"
                 );
+            }
+            KvmExit::InternalError(sub) => {
+                anyhow::bail!("KVM internal error (suberror {sub})");
             }
             KvmExit::Unknown(r) => {
                 log::warn!("unexpected KVM exit reason {r}");

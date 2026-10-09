@@ -309,6 +309,7 @@ impl Vm {
 pub struct Vcpu {
     fd: RawFd,
     /// /dev/kvm system fd (for KVM_GET_SUPPORTED_CPUID).
+    #[allow(dead_code)] // read only by x86_64 paths
     kvm_fd: RawFd,
     run: *mut KvmRun,
     run_size: usize,
@@ -654,6 +655,7 @@ impl Vcpu {
     /// Enable trapping of guest `BRK` instructions to the VMM (the init
     /// protocol uses BRK immediates to call into the VMM).
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)] // never called on arm64-Linux
     pub fn set_guest_debug_sw_bp(&self) -> Result<()> {
         let mut dbg = KvmGuestDebug {
             control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,

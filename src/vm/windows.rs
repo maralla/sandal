@@ -108,7 +108,10 @@ impl Vmm {
             let _ = last_pump.elapsed(); // (the pump cadence follows exits)
             last_pump = Instant::now();
         }
-        eprintln!("sandal: run loop ended, guest exit code {:?}\r", self.guest_exit_code);
+        eprintln!(
+            "sandal: run loop ended, guest exit code {:?}\r",
+            self.guest_exit_code
+        );
         Ok(self.guest_exit_code.unwrap_or(0))
     }
 

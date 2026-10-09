@@ -1,4 +1,14 @@
 fn main() {
+    // Release builds (SANDAL_EMBED_KERNEL=1) embed the guest kernel so the
+    // binary is a single self-contained artifact; dev builds keep loading
+    // it from disk next to the binary. The cfg is always *declared* so
+    // both paths compile warning-free; only the env var enables it.
+    println!("cargo::rustc-check-cfg=cfg(sandal_embed_kernel)");
+    println!("cargo:rerun-if-env-changed=SANDAL_EMBED_KERNEL");
+    if std::env::var_os("SANDAL_EMBED_KERNEL").is_some() {
+        println!("cargo::rustc-cfg=sandal_embed_kernel");
+    }
+
     #[cfg(target_os = "macos")]
     {
         // Link against Hypervisor framework on macOS

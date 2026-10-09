@@ -677,6 +677,7 @@ struct Vmm {
     /// `<token><status>`; the VMM only treats that as the protocol, so
     /// user output containing the old fixed `SANDAL_EXIT:0` string is
     /// just output. The arm64 crafted init binary keeps the fixed marker.
+    #[allow(dead_code)] // read only by x86_64 paths
     exit_marker: String,
     /// Save path from the guest's `SANDAL_EXPORT_PATH:` console marker.
     export_save_path: Option<String>,
@@ -1205,7 +1206,7 @@ impl Vmm {
             exit_marker.trim_end_matches(':').to_string(),
         )));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         linux::spawn_net_kicker(
             vm.clone(),
             net.clone(),
@@ -1384,7 +1385,13 @@ impl Vmm {
             }
         };
 
-        crate::ext2::inject_runtime_files(&mut rootfs_img, network, self.mmio_base)?;
+        // The arm64 initramfs helpers are BRK-based and ignore the base
+        // (see initramfs.rs); only x86_64 pokes an MMIO hypercall window.
+        #[cfg(target_arch = "x86_64")]
+        let mmio_base = self.mmio_base;
+        #[cfg(target_arch = "aarch64")]
+        let mmio_base = 0u64;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, network, mmio_base)?;
 
         #[cfg(target_arch = "x86_64")]
         {

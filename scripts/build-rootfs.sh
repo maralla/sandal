@@ -25,7 +25,7 @@ if [ ! -x "$PACK_BIN" ]; then
     echo "Bootstrapping: building binary with stub rootfs..."
     touch "$OUTPUT"
     cargo build --release
-    if [ -f sandal.entitlements ]; then
+    if [ -f sandal.entitlements ] && [ "$(uname -s)" = "Darwin" ]; then
         codesign --entitlements sandal.entitlements -s - "$PACK_BIN" --force
     fi
 fi

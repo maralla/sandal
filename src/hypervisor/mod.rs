@@ -111,6 +111,7 @@ pub enum KvmExit {
     /// Guest port I/O (x86_64): serial console (COM1), the legacy interrupt
     /// controller ports and the VMM hypercall helpers. `count` is always 1
     /// for our device model.
+    #[allow(dead_code)] // x86-only exit; arm64 matches it as unreachable
     Io {
         port: u16,
         len: usize,
@@ -120,6 +121,7 @@ pub enum KvmExit {
     },
     /// The guest executed HLT (x86_64). The WHP run loop parks the vCPU
     /// thread until a device event (timer tick, console input) is pending.
+    #[allow(dead_code)] // x86-only exit; arm64 matches it as unreachable
     Hlt,
     /// Debug exception (x86_64 single-step / breakpoints).
     #[cfg(target_arch = "x86_64")]

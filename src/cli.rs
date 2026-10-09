@@ -46,7 +46,8 @@ pub struct RunArgs {
     #[arg(short = 'm', long = "memory", default_value = "256")]
     pub memory: usize,
 
-    /// Kernel image path [default: vmlinux-sandal]
+    /// Kernel image path [default: embedded kernel in release builds
+    /// (make dist), else vmlinux-sandal next to the binary]
     #[arg(short = 'k', long = "kernel")]
     pub kernel: Option<PathBuf>,
 

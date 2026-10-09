@@ -51,6 +51,7 @@ pub fn console_io_enabled() -> bool {
 /// vCPU is wedged in a busy-wait, so this is the only way to observe
 /// guest-side state during a console wedge.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // x86_64-only trace helper
 pub fn dump_guest_ram_lines(memory: &[u8], needle: &str, label: &str, max: usize, context: usize) {
     // Only when tracing to a FILE: without one the sink would eprintln! to
     // the console, and the host tty has OPOST disabled — a bare-\n line

@@ -235,13 +235,6 @@ pub fn pack_directory(dir: &Path) -> Result<Vec<u8>> {
     builder.build()
 }
 
-/// Create an empty ext2 filesystem image of the given size in bytes.
-/// Used for the overlay writable disk (--disk-size).  The image contains
-/// only the root directory, block group metadata, and bitmaps — all
-/// remaining space is free for guest use.
-///
-/// Supports multiple block groups for disks larger than 128 MB.
-
 fn host_file_mode(metadata: &std::fs::Metadata) -> u16 {
     #[cfg(unix)]
     {
@@ -258,6 +251,12 @@ fn host_file_mode(metadata: &std::fs::Metadata) -> u16 {
     }
 }
 
+/// Create an empty ext2 filesystem image of the given size in bytes.
+/// Used for the overlay writable disk (--disk-size).  The image contains
+/// only the root directory, block group metadata, and bitmaps — all
+/// remaining space is free for guest use.
+///
+/// Supports multiple block groups for disks larger than 128 MB.
 pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
     let total_blocks = size_bytes / BLOCK_SIZE;
     if total_blocks < 16 {

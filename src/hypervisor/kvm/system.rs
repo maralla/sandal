@@ -218,6 +218,9 @@ pub struct KvmGuestDebugArch {
 }
 
 #[cfg(target_arch = "aarch64")]
+// arm64-only debug-arch state; the BRK debug path is never wired on
+// arm64-Linux (see set_guest_debug_sw_bp), so this impl is unreachable.
+#[allow(clippy::derivable_impls)]
 impl Default for KvmGuestDebugArch {
     fn default() -> Self {
         KvmGuestDebugArch {

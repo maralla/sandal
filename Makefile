@@ -11,7 +11,7 @@ ALPINE_ARCH := aarch64
 else
 ALPINE_ARCH := $(UNAME_M)
 endif
-ALPINE_VERSION := 3.22
+ALPINE_VERSION := 3.24
 ALPINE_MIRROR := https://dl-cdn.alpinelinux.org/alpine
 ALPINE_ROOTFS_URL := $(ALPINE_MIRROR)/v$(ALPINE_VERSION)/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION).0-$(ALPINE_ARCH).tar.gz
 
@@ -23,15 +23,15 @@ ROOTFS_FILES := \
 	sbin/apk \
 	usr/bin/ldd \
 	usr/bin/ssl_client \
-	usr/lib/libapk.so.2.14.9 \
+	usr/lib/libapk.so.3.0.0 \
 	usr/lib/libcrypto.so.3 \
 	usr/lib/libssl.so.3 \
-	usr/lib/libz.so.1.3.1
+	usr/lib/libz.so.1.3.2
 
 # Symlinks: target:link-path (inside the rootfs tmp dir)
 ROOTFS_SYMLINKS := \
 	ld-musl-$(ALPINE_ARCH).so.1:lib/libc.musl-$(ALPINE_ARCH).so.1 \
-	libz.so.1.3.1:usr/lib/libz.so.1 \
+	libz.so.1.3.2:usr/lib/libz.so.1 \
 	../usr/lib/os-release:etc/os-release
 
 # Directories to create (beyond what the file copies imply)
@@ -67,7 +67,7 @@ ROOTFS_BASELAYOUT := \
 	etc/alpine-release \
 	usr/lib/os-release
 
-.PHONY: build debug test lint rootfs-minimal
+.PHONY: build debug test lint rootfs-minimal dist
 
 UNAME_S := $(shell uname -s)
 
@@ -161,7 +161,7 @@ $(addprefix rootfs/,$(ROOTFS_FILES)): $(ROOTFS_STAMP)
 
 # Build a minimal rootfs (busybox + musl + TLS + apk) and compress for embedding.
 rootfs-minimal: $(BUILTIN_ROOTFS)
-$(BUILTIN_ROOTFS): $(addprefix rootfs/,$(ROOTFS_FILES))
+$(BUILTIN_ROOTFS): $(ROOTFS_STAMP) $(addprefix rootfs/,$(ROOTFS_FILES))
 	@echo "Building minimal built-in rootfs..."
 	@ROOTFS_FILES="$(ROOTFS_FILES)" \
 	 ROOTFS_SYMLINKS="$(ROOTFS_SYMLINKS)" \
@@ -171,3 +171,34 @@ $(BUILTIN_ROOTFS): $(addprefix rootfs/,$(ROOTFS_FILES))
 	 ROOTFS_APK_KEYS="$(ROOTFS_APK_KEYS)" \
 	 ROOTFS_BASELAYOUT="$(ROOTFS_BASELAYOUT)" \
 	 scripts/build-rootfs.sh $(BUILTIN_ROOTFS) $(BINARY)
+
+# ── Single-file release build ─────────────────────────────────────
+# `make dist` embeds the guest kernel (zstd-compressed) into the binary
+# so the release artifact is one self-contained file: nothing to ship
+# alongside it, and it boots from any directory. Dev builds never set
+# SANDAL_EMBED_KERNEL — there the kernel stays a drop-in external file
+# next to the binary (see src/vm/x86_64.rs and src/vm/aarch64.rs).
+
+ifeq ($(UNAME_M),arm64)
+KERNEL_EMBED_SRC := vmlinux-sandal
+KERNEL_EMBED_DST := src/kernel-aarch64.zst
+else
+KERNEL_EMBED_SRC := vmlinux-sandal-x86
+KERNEL_EMBED_DST := src/kernel-x86_64.zst
+endif
+
+DIST_PLATFORM := $(shell printf '%s-%s' "$(UNAME_S)" "$(UNAME_M)" | tr '[:upper:]' '[:lower:]' | sed 's/^darwin/macos/;s/aarch64/arm64/')
+
+dist:
+	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (x86_64: make kernel-x86; arm64: scripts/build-kernel.sh)" >&2; exit 1; }
+	@zstd -19 -T0 $(KERNEL_EMBED_SRC) -o $(KERNEL_EMBED_DST)
+	SANDAL_EMBED_KERNEL=1 cargo build --release
+ifeq ($(UNAME_S),Darwin)
+	@codesign --entitlements $(ENTITLEMENTS) -s - $(BINARY) --force
+endif
+	@mkdir -p dist/$(DIST_PLATFORM)
+	@cp $(BINARY) dist/$(DIST_PLATFORM)/sandal-$(DIST_PLATFORM)
+	@rm -f dist/$(DIST_PLATFORM)/vmlinux-sandal*
+	@cp LICENSE dist/$(DIST_PLATFORM)/
+	@cd dist/$(DIST_PLATFORM) && sha256sum sandal-$(DIST_PLATFORM) LICENSE > SHA256SUMS
+	@echo "dist/$(DIST_PLATFORM)/sandal-$(DIST_PLATFORM): single-file release (kernel embedded)"

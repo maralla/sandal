@@ -12,6 +12,7 @@ kernel-build/
 *~
 rootfs.ext2*
 rootfs/
+src/kernel-*.zst
 kernels
 PROGRESS.md
 AGENTS.md

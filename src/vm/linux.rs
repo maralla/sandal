@@ -23,6 +23,7 @@ use super::{
 };
 use crate::hypervisor::{KvmExit, Vm};
 use crate::virtio::console::VirtioConsoleDevice;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::virtio::net::VirtioNetDevice;
 use anyhow::{anyhow, Result};
 use std::os::unix::io::RawFd;
@@ -276,7 +277,7 @@ impl Vmm {
 /// epoll set by the kernel automatically when their last fd reference is
 /// dropped; stale registrations are also pruned on every sync. The thread
 /// exits when `stop` is set (bounded by the 100 ms wait timeout).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn spawn_net_kicker(
     vm: Vm,
     net: Arc<Mutex<Option<VirtioNetDevice>>>,
