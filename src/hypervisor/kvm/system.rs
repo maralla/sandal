@@ -546,9 +546,16 @@ mod tests {
         );
         assert_eq!(KVM_IRQ_LINE, (1 << 30) | (8 << 16) | (0xAE << 8) | 0x61);
         assert_eq!(KVM_SET_ONE_REG, (1 << 30) | (16 << 16) | (0xAE << 8) | 0xac);
+        // kvm_guest_debug is arch-specific: x86_64 mirrors debugreg[8]
+        // (8 + 64 = 72 bytes); arm64 mirrors the 4 x 16 debug register
+        // arrays (8 + 512 = 520 bytes). Both mirrors match their UAPI.
+        #[cfg(target_arch = "x86_64")]
+        let uapi_size: u32 = 72;
+        #[cfg(target_arch = "aarch64")]
+        let uapi_size: u32 = 520;
         assert_eq!(
             KVM_SET_GUEST_DEBUG,
-            (1 << 30) | (72 << 16) | (0xAE << 8) | 0x9b
+            (1 << 30) | (uapi_size << 16) | (0xAE << 8) | 0x9b
         );
         assert_eq!(
             KVM_CREATE_DEVICE,

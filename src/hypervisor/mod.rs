@@ -95,6 +95,11 @@ impl Reg {
 
 /// A vCPU exit. Historically named after KVM; the WHP backend produces the
 /// same variants from its own exit contexts.
+///
+/// Shared exit vocabulary for the backends that produce one (KVM on Linux,
+/// WHP on Windows); the HVF backend handles its exits inline, so macOS
+/// never references this enum.
+#[cfg(not(target_os = "macos"))]
 pub enum KvmExit {
     /// Guest MMIO access (virtio devices, PL011 UART).
     Mmio {
