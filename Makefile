@@ -188,17 +188,21 @@ KERNEL_EMBED_DST := src/kernel-x86_64.zst
 endif
 
 DIST_PLATFORM := $(shell printf '%s-%s' "$(UNAME_S)" "$(UNAME_M)" | tr '[:upper:]' '[:lower:]' | sed 's/^darwin/macos/;s/aarch64/arm64/')
+SANDAL_VERSION := $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
 
 dist:
 	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (x86_64: make kernel-x86; arm64: scripts/build-kernel.sh)" >&2; exit 1; }
-	@zstd -19 -T0 $(KERNEL_EMBED_SRC) -o $(KERNEL_EMBED_DST)
+	@zstd -19 -T0 -f $(KERNEL_EMBED_SRC) -o $(KERNEL_EMBED_DST)
 	SANDAL_EMBED_KERNEL=1 cargo build --release
 ifeq ($(UNAME_S),Darwin)
 	@codesign --entitlements $(ENTITLEMENTS) -s - $(BINARY) --force
 endif
-	@mkdir -p dist/$(DIST_PLATFORM)
-	@cp $(BINARY) dist/$(DIST_PLATFORM)/sandal-$(DIST_PLATFORM)
-	@rm -f dist/$(DIST_PLATFORM)/vmlinux-sandal*
-	@cp LICENSE dist/$(DIST_PLATFORM)/
-	@cd dist/$(DIST_PLATFORM) && sha256sum sandal-$(DIST_PLATFORM) LICENSE > SHA256SUMS
-	@echo "dist/$(DIST_PLATFORM)/sandal-$(DIST_PLATFORM): single-file release (kernel embedded)"
+	@rm -rf dist/$(DIST_PLATFORM)
+	@mkdir -p dist
+	@_d=$$(mktemp -d); \
+		cp $(BINARY) $$_d/sandal; \
+		cp LICENSE README.md $$_d/; \
+		tar -C $$_d -czf dist/sandal-v$(SANDAL_VERSION)-$(DIST_PLATFORM).tar.gz sandal LICENSE README.md; \
+		rm -rf $$_d
+	@cd dist && sha256sum sandal-v$(SANDAL_VERSION)-$(DIST_PLATFORM).tar.gz > SHA256SUMS
+	@echo "dist/sandal-v$(SANDAL_VERSION)-$(DIST_PLATFORM).tar.gz: single-file release (kernel embedded)"
