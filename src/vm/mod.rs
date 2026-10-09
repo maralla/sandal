@@ -618,6 +618,8 @@ struct Vmm {
     /// replies, protocol markers). The main loop and the net-kick thread
     /// BOTH drain the TX queue; the filter must be singular or escape
     /// sequences tear apart at drain boundaries.
+    /// macOS keeps its own inline console path instead (process_console_tx).
+    #[cfg(not(target_os = "macos"))]
     console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
     /// x86_64: base of the MMIO device window (above the guest RAM).
     #[cfg(target_arch = "x86_64")]
@@ -677,7 +679,8 @@ struct Vmm {
     /// `<token><status>`; the VMM only treats that as the protocol, so
     /// user output containing the old fixed `SANDAL_EXIT:0` string is
     /// just output. The arm64 crafted init binary keeps the fixed marker.
-    #[allow(dead_code)] // read only by x86_64 paths
+    #[allow(dead_code)]
+    // read only by the macOS-only console path (process_console_tx); dead on Linux
     exit_marker: String,
     /// Save path from the guest's `SANDAL_EXPORT_PATH:` console marker.
     export_save_path: Option<String>,
@@ -1202,6 +1205,9 @@ impl Vmm {
         #[cfg(target_os = "linux")]
         let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // macOS keeps its own inline console path (process_console_tx);
+        // the shared filter exists only where it is drained.
+        #[cfg(not(target_os = "macos"))]
         let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
             exit_marker.trim_end_matches(':').to_string(),
         )));
@@ -1233,6 +1239,7 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             gic: Gic::new(),
             console,
+            #[cfg(not(target_os = "macos"))]
             console_tx_filter,
             #[cfg(target_arch = "x86_64")]
             mmio_base,

@@ -309,11 +309,7 @@ pub fn xor_rr(dst: u32, src: u32) -> Vec<u8> {
 /// `INC r64` (REX.W FF /0, REX.B for r8-r15).
 #[inline]
 fn inc_r64(r: u32) -> [u8; 3] {
-    [
-        (0x48 | (is_rex_high(r) as u8)) as u8,
-        0xFF,
-        (0xC0 | (r & 7)) as u8,
-    ]
+    [0x48 | (is_rex_high(r) as u8), 0xFF, (0xC0 | (r & 7)) as u8]
 }
 
 // ── Branches ────────────────────────────────────────────────────────────

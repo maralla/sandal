@@ -452,41 +452,29 @@ impl VirtioFsDevice {
                     self.reset();
                 }
             }
-            REG_QUEUE_DESC_LOW => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.desc_addr = (q.desc_addr & 0xFFFFFFFF00000000) | value as u64;
-                }
+            REG_QUEUE_DESC_LOW if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.desc_addr = (q.desc_addr & 0xFFFFFFFF00000000) | value as u64;
             }
-            REG_QUEUE_DESC_HIGH => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.desc_addr = (q.desc_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DESC_HIGH if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.desc_addr = (q.desc_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
             }
-            REG_QUEUE_DRIVER_LOW => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.avail_addr = (q.avail_addr & 0xFFFFFFFF00000000) | value as u64;
-                }
+            REG_QUEUE_DRIVER_LOW if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.avail_addr = (q.avail_addr & 0xFFFFFFFF00000000) | value as u64;
             }
-            REG_QUEUE_DRIVER_HIGH => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.avail_addr = (q.avail_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DRIVER_HIGH if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.avail_addr = (q.avail_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
             }
-            REG_QUEUE_DEVICE_LOW => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.used_addr = (q.used_addr & 0xFFFFFFFF00000000) | value as u64;
-                }
+            REG_QUEUE_DEVICE_LOW if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.used_addr = (q.used_addr & 0xFFFFFFFF00000000) | value as u64;
             }
-            REG_QUEUE_DEVICE_HIGH => {
-                if (self.queue_sel as usize) < NUM_QUEUES {
-                    let q = &mut self.queues[self.queue_sel as usize];
-                    q.used_addr = (q.used_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DEVICE_HIGH if (self.queue_sel as usize) < NUM_QUEUES => {
+                let q = &mut self.queues[self.queue_sel as usize];
+                q.used_addr = (q.used_addr & 0x00000000FFFFFFFF) | ((value as u64) << 32);
             }
             _ => {}
         }
