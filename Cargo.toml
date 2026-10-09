@@ -1,6 +1,6 @@
 [package]
 name = "sandal"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 authors = ["maralla"]
 description = "A high-performance, lightweight sandbox for running untrusted code securely (macOS Hypervisor.framework / Linux KVM)"

@@ -199,6 +199,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 	@rm -rf dist/$(DIST_PLATFORM)
 	@mkdir -p dist
+	@rm -f dist/sandal-v*.tar.gz
 	@_d=$$(mktemp -d); \
 		cp $(BINARY) $$_d/sandal; \
 		cp LICENSE README.md $$_d/; \
