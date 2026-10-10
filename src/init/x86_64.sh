@@ -5,7 +5,11 @@
 set --
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
-export TERM=linux
+# Terminal type: the boot config passes the host's TERM through (like
+# COLS/ROWS); linux (8 colors) is only the fallback. Reassignment below
+# (config parse) updates the exported value.
+TERM=${TERM:-linux}
+export TERM
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 mount -t proc proc /proc
@@ -27,6 +31,7 @@ while IFS= read -r line; do
         NETWORK=*) NETWORK=${line#NETWORK=} ;;
         CLOCK=*) CLOCK=${line#CLOCK=} ;;
         SHARE=*) SHARES_TEXT="$SHARES_TEXT${line#SHARE=}\n" ;;
+        TERM=*) TERM=${line#TERM=} ;;
         COLS=*) COLS=${line#COLS=} ;;
         ROWS=*) ROWS=${line#ROWS=} ;;
         EXIT=*) EXIT_TOKEN=${line#EXIT=} ;;

@@ -461,7 +461,10 @@ impl VirtioConsoleDevice {
             ));
         }
 
-        output
+        // The host terminal runs with output processing disabled (verbatim
+        // escape passthrough), so the \n → \r\n translation has to happen
+        // here — once, at the single point every caller drains this through.
+        super::onlcr(output)
     }
 
     /// Dump the raw vring state of both queues from guest RAM (wedge

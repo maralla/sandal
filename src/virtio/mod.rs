@@ -11,6 +11,33 @@ pub mod net;
 pub mod rng;
 use std::sync::atomic::{fence, Ordering};
 
+/// Reproduce ONLCR explicitly for console-bound output.
+///
+/// The VMM runs the host terminal with output processing disabled so guest
+/// escape sequences reach the terminal verbatim — which also stops the
+/// terminal from translating `\n` to `\r\n`, so after that point every
+/// line keeps its column: the boot diagnostics and the guest shell print as
+/// a staircase (lines shifted right by the width of the previous line, the
+/// prompt landing mid-screen). Translating `\n` → `\r\n` here is exactly
+/// what the terminal would have done under ONLCR — and ONLCR never spared
+/// escape sequences either, so translating every `\n` is semantics
+/// preserving: CSI/OSC parameter and final bytes never contain `\n`.
+pub fn onlcr(bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.contains(&b'\n') {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(
+        bytes.len() + bytes.iter().filter(|&&b| b == b'\n').count(),
+    );
+    for &b in &bytes {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
 // Virtio MMIO magic value ("virt")
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x74726976;
 pub const VIRTIO_MMIO_VERSION: u32 = 2;

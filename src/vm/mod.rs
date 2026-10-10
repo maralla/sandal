@@ -1349,6 +1349,21 @@ impl Vmm {
         #[cfg(not(target_os = "windows"))]
         let network = !args.no_network;
 
+        // The guest runs the host's terminal type (see build_init_config_text):
+        // TERM=linux caps every TUI at 8 colors. Only terminal-type names
+        // pass — the value lands in a line-based config file, so anything
+        // else would corrupt it; empty keeps the guest's linux fallback.
+        let host_term = std::env::var("TERM")
+            .ok()
+            .filter(|t| {
+                !t.is_empty()
+                    && t.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                    && t.chars().skip(1).all(|c| {
+                        c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+                    })
+            })
+            .unwrap_or_default();
+
         #[cfg(target_arch = "x86_64")]
         {
             let (cols, rows) = self.console.lock().unwrap().terminal_size();
@@ -1361,6 +1376,7 @@ impl Vmm {
                 cols,
                 rows,
                 &self.exit_marker,
+                &host_term,
             );
         }
 
@@ -1398,7 +1414,7 @@ impl Vmm {
         let mmio_base = self.mmio_base;
         #[cfg(target_arch = "aarch64")]
         let mmio_base = 0u64;
-        crate::ext2::inject_runtime_files(&mut rootfs_img, network, mmio_base)?;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, network, mmio_base, &host_term)?;
 
         #[cfg(target_arch = "x86_64")]
         {

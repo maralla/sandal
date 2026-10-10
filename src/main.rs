@@ -1,3 +1,18 @@
+// The VMM runs the host terminal with output processing disabled (guest
+// escape sequences must pass verbatim), which also stops the terminal from
+// translating `\n` to `\r\n` — so the VMM's own diagnostics would print as
+// a staircase (each line keeping the previous line's column). Shadow
+// `eprintln!` for the whole crate with the explicit translation instead:
+// exactly what the terminal would have done under ONLCR, and ONLCR never
+// spared escape sequences either, so this is semantics preserving.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        let text = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let bytes = $crate::virtio::onlcr(text.into_bytes());
+        let _ = ::std::io::Write::write_all(&mut ::std::io::stderr(), &bytes);
+    }};
+}
+
 mod cli;
 #[cfg(target_arch = "aarch64")]
 mod devicetree;

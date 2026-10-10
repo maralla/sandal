@@ -2422,7 +2422,12 @@ fn remove_dir_entry(
 
 /// Inject all runtime files into a pre-built ext2 image.
 /// This adds /init, device nodes, CA certificates and the sandal-export helpers.
-pub fn inject_runtime_files(image: &mut [u8], network: bool, mmio_base: u64) -> Result<()> {
+pub fn inject_runtime_files(
+    image: &mut [u8],
+    network: bool,
+    mmio_base: u64,
+    host_term: &str,
+) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
     let mut alloc = Ext2Alloc::default();
@@ -2440,24 +2445,36 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, mmio_base: u64) -> 
     // hvc0: virtio-console device (major 229, minor 0)
     inject_chardev(image, &sb, &bgdt, &mut alloc, "dev/hvc0", 0o666, 229, 0)?;
 
-    // Terminal database: the guest console runs with TERM=linux, and the
-    // python REPL's readline (ncurses) needs the matching terminfo entry —
-    // without it the REPL falls back to dumb settings (no line editing).
-    // The terminfo format is arch-independent, so the host's entry works.
-    ensure_dir_path(image, &sb, &bgdt, &mut alloc, "usr/share/terminfo/l")?;
-    for host_terminfo in ["/lib/terminfo/l/linux", "/usr/share/terminfo/l/linux"] {
-        if let Ok(data) = std::fs::read(host_terminfo) {
-            if !data.is_empty() {
-                inject_file(
-                    image,
-                    &sb,
-                    &bgdt,
-                    &mut alloc,
-                    "usr/share/terminfo/l/linux",
-                    &data,
-                    0o644,
-                )?;
-                break;
+    // Terminal database: the guest console runs with the host's terminal
+    // type (passed through the boot config like COLS/ROWS; TERM=linux caps
+    // every TUI at 8 colors, which is what broke colorschemes), with linux
+    // as the fallback. The python REPL's readline (ncurses) needs the
+    // matching entry too — without it the REPL falls back to dumb settings
+    // (no line editing). The terminfo format is arch-independent, so the
+    // host's entries work; a name missing from the host database is
+    // skipped (the guest keeps its linux fallback).
+    for term in [host_term, "linux"] {
+        if term.is_empty() {
+            continue;
+        }
+        let sub = &term[..1];
+        let guest_path = format!("usr/share/terminfo/{sub}/{term}");
+        ensure_dir_path(image, &sb, &bgdt, &mut alloc, &format!("usr/share/terminfo/{sub}"))?;
+        for root in ["/lib/terminfo", "/usr/share/terminfo"] {
+            let host_path = format!("{root}/{sub}/{term}");
+            if let Ok(data) = std::fs::read(&host_path) {
+                if !data.is_empty() {
+                    inject_file(
+                        image,
+                        &sb,
+                        &bgdt,
+                        &mut alloc,
+                        &guest_path,
+                        &data,
+                        0o644,
+                    )?;
+                    break;
+                }
             }
         }
     }

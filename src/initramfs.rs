@@ -151,6 +151,7 @@ pub fn build_init_config_text(
     console_cols: u16,
     console_rows: u16,
     exit_token: &str,
+    host_term: &str,
 ) -> Vec<u8> {
     let mut out = String::new();
     if disk_mode.is_some() {
@@ -163,6 +164,13 @@ pub fn build_init_config_text(
     }
     out.push_str(&format!("COLS={}\n", console_cols));
     out.push_str(&format!("ROWS={}\n", console_rows));
+    // The guest runs the user's terminal type, not a hardcoded console type:
+    // TERM=linux caps vim and every TUI at 8 colors (t_Co=8), which is what
+    // broke colorschemes. Sanitized by the caller; empty means no line and
+    // the guest init keeps its linux fallback.
+    if !host_term.is_empty() {
+        out.push_str(&format!("TERM={host_term}\n"));
+    }
     out.push_str(&format!("EXIT={}\n", exit_token));
     for arg in command {
         out.push_str(&format!("ARG={arg}\n"));
