@@ -38,9 +38,69 @@ for d in $ROOTFS_DIRS; do
     mkdir -p "$_R/$d"
 done
 
-# Copy binaries and libraries
+# Normalize a relative path by collapsing "." and ".." components. Pure
+# bash so it works with the system bash 3.2 on macOS (no `readlink -f`).
+normalize_rel() {
+    local out="" part
+    local IFS=/
+    for part in $1; do
+        case "$part" in
+            ""|.) ;;
+            ..) case "$out" in */*) out="${out%/*}" ;; *) out="" ;; esac ;;
+            *) out="${out:+$out/}$part" ;;
+        esac
+    done
+    printf '%s\n' "$out"
+}
+
+# Copy one path from the source tree into the staging tree, preserving
+# symlinks: the link is recreated verbatim and its target is copied too
+# (recursively). Entries may be listed by their loader-facing name
+# (usr/lib/libz.so.1) while the real patch-versioned file is pulled in as the
+# link target, so ROOTFS_FILES never pins an Alpine version.
+copy_from_rootfs() {
+    local rel="$1"
+    local depth="${2:-0}"
+    local src="$SRCDIR/$rel"
+
+    if [ "$depth" -gt 8 ]; then
+        echo "build-rootfs: symlink chain too deep at '$rel'" >&2
+        exit 1
+    fi
+
+    mkdir -p "$_R/$(dirname "$rel")"
+
+    if [ -L "$src" ]; then
+        local target real
+        target="$(readlink "$src")"
+        ln -sfn "$target" "$_R/$rel"
+        case "$target" in
+            /*) real="${target#/}" ;;
+            *)  real="$(normalize_rel "$(dirname "$rel")/$target")" ;;
+        esac
+        copy_from_rootfs "$real" $((depth + 1))
+    elif [ -f "$src" ]; then
+        cp "$src" "$_R/$rel"
+    else
+        echo "build-rootfs: no file matched ROOTFS_FILES entry: $rel" >&2
+        exit 1
+    fi
+}
+
+# Copy binaries and libraries. Entries may be shell globs (e.g.
+# usr/lib/libapk.so.*) so patch-versioned sonames are resolved from the pinned
+# Alpine tree instead of being hardcoded in the Makefile.
 for f in $ROOTFS_FILES; do
-    cp "$SRCDIR/$f" "$_R/$f"
+    found=0
+    for src in $SRCDIR/$f; do
+        [ -e "$src" ] || [ -L "$src" ] || continue
+        copy_from_rootfs "${src#"$SRCDIR"/}"
+        found=1
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "build-rootfs: no file matched ROOTFS_FILES entry: $f" >&2
+        exit 1
+    fi
 done
 
 # Create symlinks

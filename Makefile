@@ -11,27 +11,33 @@ ALPINE_ARCH := aarch64
 else
 ALPINE_ARCH := $(UNAME_M)
 endif
-ALPINE_VERSION := 3.24
+ALPINE_VERSION := 3.24.2
+ALPINE_RELEASE := $(shell v="$(ALPINE_VERSION)"; echo "$${v%.*}")
 ALPINE_MIRROR := https://dl-cdn.alpinelinux.org/alpine
-ALPINE_ROOTFS_URL := $(ALPINE_MIRROR)/v$(ALPINE_VERSION)/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION).0-$(ALPINE_ARCH).tar.gz
+ALPINE_ROOTFS_URL := $(ALPINE_MIRROR)/v$(ALPINE_RELEASE)/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION)-$(ALPINE_ARCH).tar.gz
 
 # Binaries and libraries to copy into the minimal rootfs (paths relative to rootfs/).
 # To add a new component, just append to ROOTFS_FILES.
+#
+# Entries may be shell globs, and symlinks are dereferenced by
+# scripts/build-rootfs.sh. That lets us name the loader-facing path (the
+# DT_NEEDED soname, e.g. usr/lib/libz.so.1) and glob the patch-versioned real
+# file (usr/lib/libapk.so.*) instead of pinning versions like
+# `libapk.so.2.14.9` / `libz.so.1.3.1` that change on every Alpine release.
 ROOTFS_FILES := \
 	bin/busybox \
 	lib/ld-musl-$(ALPINE_ARCH).so.1 \
 	sbin/apk \
 	usr/bin/ldd \
 	usr/bin/ssl_client \
-	usr/lib/libapk.so.3.0.0 \
-	usr/lib/libcrypto.so.3 \
-	usr/lib/libssl.so.3 \
-	usr/lib/libz.so.1.3.2
+	usr/lib/libapk.so.* \
+	usr/lib/libcrypto.so.* \
+	usr/lib/libssl.so.* \
+	usr/lib/libz.so.1
 
 # Symlinks: target:link-path (inside the rootfs tmp dir)
 ROOTFS_SYMLINKS := \
 	ld-musl-$(ALPINE_ARCH).so.1:lib/libc.musl-$(ALPINE_ARCH).so.1 \
-	libz.so.1.3.2:usr/lib/libz.so.1 \
 	../usr/lib/os-release:etc/os-release
 
 # Directories to create (beyond what the file copies imply)
