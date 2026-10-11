@@ -98,10 +98,10 @@ endif
 .PHONY: kernel-x86
 
 # Build the x86_64 guest kernel (Linux hosts only; on macOS the committed
-# arm64 `vmlinux-sandal` is used). Produces a stripped ELF vmlinux with the
-# PVH entry note, booted directly by the VMM (no firmware).
+# arm64 `vmlinux-sandal-aarch64` is used). Produces a stripped ELF vmlinux
+# with the PVH entry note, booted directly by the VMM (no firmware).
 kernel-x86:
-	@bash scripts/build-kernel-x86.sh
+	@bash scripts/build-kernel.sh x86_64
 
 ifeq ($(UNAME_S)-$(UNAME_M),Linux-x86_64)
 KERNEL_DEP := kernel-x86
@@ -180,10 +180,10 @@ $(BUILTIN_ROOTFS): $(ROOTFS_STAMP) $(addprefix rootfs/,$(ROOTFS_FILES))
 # next to the binary (see src/vm/x86_64.rs and src/vm/aarch64.rs).
 
 ifeq ($(UNAME_M),arm64)
-KERNEL_EMBED_SRC := vmlinux-sandal
+KERNEL_EMBED_SRC := vmlinux-sandal-aarch64
 KERNEL_EMBED_DST := src/kernel-aarch64.zst
 else
-KERNEL_EMBED_SRC := vmlinux-sandal-x86
+KERNEL_EMBED_SRC := vmlinux-sandal-x86_64
 KERNEL_EMBED_DST := src/kernel-x86_64.zst
 endif
 
@@ -191,7 +191,7 @@ DIST_PLATFORM := $(shell printf '%s-%s' "$(UNAME_S)" "$(UNAME_M)" | tr '[:upper:
 SANDAL_VERSION := $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
 
 dist:
-	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (x86_64: make kernel-x86; arm64: scripts/build-kernel.sh)" >&2; exit 1; }
+	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (x86_64: make kernel-x86; arm64: scripts/build-kernel.sh aarch64 HOST)" >&2; exit 1; }
 	@zstd -19 -T0 -f $(KERNEL_EMBED_SRC) -o $(KERNEL_EMBED_DST)
 	SANDAL_EMBED_KERNEL=1 cargo build --release
 ifeq ($(UNAME_S),Darwin)

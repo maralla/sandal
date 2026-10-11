@@ -1358,9 +1358,9 @@ impl Vmm {
             .filter(|t| {
                 !t.is_empty()
                     && t.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-                    && t.chars().skip(1).all(|c| {
-                        c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
-                    })
+                    && t.chars()
+                        .skip(1)
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
             })
             .unwrap_or_default();
 

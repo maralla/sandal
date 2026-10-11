@@ -26,9 +26,7 @@ pub fn onlcr(bytes: Vec<u8>) -> Vec<u8> {
     if !bytes.contains(&b'\n') {
         return bytes;
     }
-    let mut out = Vec::with_capacity(
-        bytes.len() + bytes.iter().filter(|&&b| b == b'\n').count(),
-    );
+    let mut out = Vec::with_capacity(bytes.len() + bytes.iter().filter(|&&b| b == b'\n').count());
     for &b in &bytes {
         if b == b'\n' {
             out.push(b'\r');

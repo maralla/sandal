@@ -1,5 +1,5 @@
 # sandal x86_64 guest kernel fragment — a COMPLETE minimal config applied
-# over allnoconfig (see build-kernel-x86.sh).
+# over allnoconfig (see build-kernel.sh x86_64).
 #
 # The VMM is a KVM userspace VMM with:
 #   - PVH direct boot (ELF vmlinux, hvm_start_info) — no firmware, no ACPI

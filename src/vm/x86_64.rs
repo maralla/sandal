@@ -14,7 +14,7 @@ use std::os::fd::AsRawFd;
 // ── Guest physical memory map ───────────────────────────────────────────
 pub(crate) const RAM_BASE: u64 = 0x0;
 
-pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal-x86";
+pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal-x86_64";
 
 /// A loaded guest kernel image.
 ///

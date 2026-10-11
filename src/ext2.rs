@@ -2459,20 +2459,18 @@ pub fn inject_runtime_files(
         }
         let sub = &term[..1];
         let guest_path = format!("usr/share/terminfo/{sub}/{term}");
-        ensure_dir_path(image, &sb, &bgdt, &mut alloc, &format!("usr/share/terminfo/{sub}"))?;
+        ensure_dir_path(
+            image,
+            &sb,
+            &bgdt,
+            &mut alloc,
+            &format!("usr/share/terminfo/{sub}"),
+        )?;
         for root in ["/lib/terminfo", "/usr/share/terminfo"] {
             let host_path = format!("{root}/{sub}/{term}");
             if let Ok(data) = std::fs::read(&host_path) {
                 if !data.is_empty() {
-                    inject_file(
-                        image,
-                        &sb,
-                        &bgdt,
-                        &mut alloc,
-                        &guest_path,
-                        &data,
-                        0o644,
-                    )?;
+                    inject_file(image, &sb, &bgdt, &mut alloc, &guest_path, &data, 0o644)?;
                     break;
                 }
             }

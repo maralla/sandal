@@ -28,7 +28,7 @@ pub(super) const GICR_SIZE: u64 = 0x2_0000; // 2 × 64 KB frames for 1 CPU
 
 pub(super) const UART_BASE: u64 = 0x0900_0000;
 
-pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal";
+pub(super) const KERNEL_ARTIFACT: &str = "vmlinux-sandal-aarch64";
 
 /// The kernel embedded in release builds (`make dist`): zstd-compressed,
 /// decompressed at boot like the built-in rootfs payload. Dev builds
