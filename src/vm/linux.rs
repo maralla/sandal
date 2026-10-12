@@ -195,6 +195,11 @@ impl Vmm {
             {
                 let irq_lock = self.host.irq_lock.clone();
                 let _guard = irq_lock.lock();
+                // Drain the stdin handoff queue and retry the device RX
+                // backlog every iteration, not only when new input arrived:
+                // (Console input is injected and pulsed by the stdin
+                // poller's own thread; the net poll and the line mirror
+                // are all that run here.)
                 if let Some(net) = self.net.lock().unwrap().as_mut() {
                     net.poll_backend();
                     net.process_rx(self.memory.as_shared_slice(), RAM_BASE);
@@ -473,19 +478,16 @@ fn console_irq_line() -> u32 {
 /// Spawn the KVM stdin poller thread.
 ///
 /// Blocks on poll(2) for host stdin (the interactive pty). On input, injects
-/// the bytes directly into the guest console RX virtqueue and pulses the
-/// console interrupt line — the main thread blocks in KVM_RUN and cannot
-/// drain a host-side buffer. The irq_lock is held across "inject + raise" so
-/// the raise can never be reordered after the main loop's lowering decision
-/// (see [`Vmm::run_loop_kvm`]). Exits when a byte arrives on `stop_r` or
+/// the bytes directly into the guest console RX virtqueue and requests a
+/// console interrupt pulse — the main thread blocks in KVM_RUN and cannot
+/// drain a host-side buffer. Exits when a byte arrives on `stop_r` or
 /// stdin reaches EOF.
 #[cfg(target_os = "linux")]
 pub(super) fn spawn_stdin_poller(
-    vm: Vm,
     console: Arc<Mutex<VirtioConsoleDevice>>,
     memory: Arc<GuestRam>,
-    irq_lock: Arc<Mutex<()>>,
     irq_levels: IrqLevels,
+    vm: Vm,
 ) -> Result<(JoinHandle<()>, RawFd)> {
     let mut pipe_fds = [0 as libc::c_int; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -528,22 +530,33 @@ pub(super) fn spawn_stdin_poller(
             let mut chunk = [0u8; 4096];
             let n = unsafe { libc::read(0, chunk.as_mut_ptr() as *mut _, chunk.len()) };
             if n > 0 {
-                // Inject directly into the console RX virtqueue: the main
-                // thread blocks in KVM_RUN and cannot drain a buffer.
-                {
-                    let _guard = irq_lock.lock();
-                    console.lock().unwrap().push_rx_and_drain(
+                // Inject and raise right here, on this thread: deferring
+                // the injection to the main loop paces input at the main
+                // loop's own iteration rate — seconds per command. The
+                // console lock is held only for the injection (the main
+                // loop holds it only briefly for its TX drain), and the
+                // pulse needs no lock: the main loop's line update mirrors
+                // the device state, so a lock-free pulse is simply the
+                // last write and can never be reordered behind a lowering
+                // decision.
+                let dropped = {
+                    let mut console = console.lock().unwrap();
+                    let (_, dropped) = console.push_rx_and_drain(
                         memory.as_shared_slice(),
                         RAM_BASE,
                         &chunk[..n as usize],
                     );
-                    // Wake the vCPU on the console's interrupt line. The
-                    // x86_64 PIC latches edges, so pulse high→low→high; on
-                    // arm64 the VGIC re-delivers the level line.
-                    let line = console_irq_line();
-                    let idx = (SPI_CONSOLE - SPI_NET) as usize;
-                    irq_pulse(&irq_levels, idx, &vm, line);
+                    dropped
+                };
+                if dropped > 0 {
+                    crate::vm::console_eprintln(&format!(
+                        "sandal: dropped {dropped} bytes of console input the guest \
+                         refused for too long (a full tty or a busy guest): re-send it"
+                    ));
                 }
+                let line = console_irq_line();
+                let idx = (SPI_CONSOLE - SPI_NET) as usize;
+                irq_pulse(&irq_levels, idx, &vm, line);
                 continue;
             }
             if n == 0 {

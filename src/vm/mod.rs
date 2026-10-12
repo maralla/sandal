@@ -439,10 +439,16 @@ impl ConsoleTxFilter {
                 blob.extend_from_slice(r);
             }
 
-            console
+            let (_, dropped) = console
                 .lock()
                 .unwrap()
                 .push_rx_and_drain(memory.as_shared_slice(), ram_base, &blob);
+            if dropped > 0 {
+                console_eprintln(&format!(
+                    "sandal: dropped {dropped} bytes of console input the guest refused \
+                     for too long (a full tty or a busy guest): re-send it"
+                ));
+            }
 
             self.replied = true;
         }
@@ -1187,11 +1193,10 @@ impl Vmm {
             let irq_lock = Arc::new(Mutex::new(()));
             let irq_levels = linux::new_irq_levels();
             let (stdin_thread, stdin_stop_w) = linux::spawn_stdin_poller(
-                vm.clone(),
                 console.clone(),
                 memory.clone(),
-                irq_lock.clone(),
                 irq_levels.clone(),
+                vm.clone(),
             )?;
 
             linux::KvmHost {
@@ -1583,7 +1588,14 @@ impl Vmm {
                 if qidx == 0 {
                     // RX queue: the guest posted buffers; drain any pending
                     // host input into them.
-                    console.drain_rx_backlog(self.memory.as_shared_slice(), RAM_BASE);
+                    let (_, dropped) =
+                        console.drain_rx_backlog(self.memory.as_shared_slice(), RAM_BASE);
+                    if dropped > 0 {
+                        console_eprintln(&format!(
+                            "sandal: dropped {dropped} bytes of console input the guest \
+                             refused for too long (a full tty or a busy guest): re-send it"
+                        ));
+                    }
                 }
             }
 
@@ -1867,11 +1879,17 @@ impl Vmm {
             for r in &replies {
                 blob.extend_from_slice(r);
             }
-            self.console.lock().unwrap().push_rx_and_drain(
+            let (_, dropped) = self.console.lock().unwrap().push_rx_and_drain(
                 self.memory.as_shared_slice(),
                 RAM_BASE,
                 &blob,
             );
+            if dropped > 0 {
+                console_eprintln(&format!(
+                    "sandal: dropped {dropped} bytes of console input the guest refused \
+                     for too long (a full tty or a busy guest): re-send it"
+                ));
+            }
 
             #[cfg(target_os = "linux")]
             {

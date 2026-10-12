@@ -69,6 +69,17 @@ pub struct VirtioConsoleDevice {
     /// Host stdin (and init blob) not yet copied into the guest receiveq — survives `read()` when
     /// the guest has not posted RX buffers yet.
     pub rx_backlog: Vec<u8>,
+    /// When the backlog last failed to make progress (the guest refusing
+    /// input). Past [`RX_STALL_TIMEOUT`] the backlog is dropped: a
+    /// permanently refusing guest must not turn host input into a silent
+    /// infinite wait.
+    pub rx_stall_since: Option<std::time::Instant>,
+    /// Adaptive per-push delivery window (1..=RX_WINDOW_MAX). Grows on
+    /// every accepted push (the guest's true acceptance rate), resets to 1
+    /// on every refused push: delivery runs at what the guest actually
+    /// accepts instead of one byte per drain cycle, and a refusal costs
+    /// only the re-probe.
+    pub rx_window: usize,
 
     /// Monotonically increments each time the VMM delivers RX data or processes TX.
     /// Used to detect work that arrives between the guest's ISR read of INTERRUPT_STATUS
@@ -105,6 +116,8 @@ impl VirtioConsoleDevice {
             cols,
             rows,
             rx_backlog: Vec::new(),
+            rx_stall_since: None,
+            rx_window: 1,
             work_gen: 0,
             work_gen_at_read: 0,
         }
@@ -281,6 +294,8 @@ impl VirtioConsoleDevice {
         self.interrupt_status = 0;
         self.driver_features = 0;
         self.rx_backlog.clear();
+        self.rx_stall_since = None;
+        self.rx_window = 1;
         self.work_gen = 0;
         self.work_gen_at_read = 0;
         for q in &mut self.queues {
@@ -290,34 +305,65 @@ impl VirtioConsoleDevice {
 
     /// Append host bytes then inject as much as the guest receiveq can take. Returns whether any
     /// byte was delivered (and thus `interrupt_status` may be non-zero).
-    pub fn push_rx_and_drain(&mut self, memory: &mut [u8], ram_base: u64, chunk: &[u8]) -> bool {
+    pub fn push_rx_and_drain(
+        &mut self,
+        memory: &mut [u8],
+        ram_base: u64,
+        chunk: &[u8],
+    ) -> (bool, usize) {
         if !chunk.is_empty() {
             self.rx_backlog.extend_from_slice(chunk);
         }
         self.drain_rx_backlog(memory, ram_base)
     }
 
-    /// Retry injecting [`Self::rx_backlog`] (e.g. after the guest posts new receiveq buffers).
-    pub fn drain_rx_backlog(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
+    /// How long a refusing guest may hold host input before it is dropped.
+    const RX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Absolute cap on the adaptive delivery window.
+    const RX_WINDOW_MAX: usize = 4096;
+
+    /// Retry injecting [`Self::rx_backlog`] (e.g. after the guest posts new
+    /// receiveq buffers). Returns `(progressed, dropped)`: `dropped` is the
+    /// byte count the guest refused for longer than [`RX_STALL_TIMEOUT`]
+    /// and that was discarded. Dropping is deliberate: a guest that stops
+    /// accepting input (a full tty line discipline, a busy guest) must not
+    /// turn host input into a silent infinite wait — the input is lost and
+    /// the caller reports it, so the sender can retry.
+    pub fn drain_rx_backlog(&mut self, memory: &mut [u8], ram_base: u64) -> (bool, usize) {
         let mut progressed = false;
         loop {
             if self.rx_backlog.is_empty() {
+                self.rx_stall_since = None;
                 break;
             }
             let mut pending = mem::take(&mut self.rx_backlog);
-            let n = self.inject_rx(memory, ram_base, &pending);
+            let chunk = &pending[..pending.len().min(self.rx_window)];
+            let n = self.inject_rx(memory, ram_base, chunk);
             pending.drain(..n);
             self.rx_backlog = pending;
             if n == 0 {
                 crate::vmm_trace::write_console_io(format_args!(
-                    "RX_BACKLOG_STALL pending_len={}",
-                    self.rx_backlog.len()
+                    "RX_BACKLOG_STALL pending_len={} window={}",
+                    self.rx_backlog.len(),
+                    self.rx_window
                 ));
+                // Refused: reset the window and start the stall timer.
+                self.rx_window = 1;
+                let since = *self.rx_stall_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Self::RX_STALL_TIMEOUT {
+                    let dropped = self.rx_backlog.len();
+                    self.rx_backlog.clear();
+                    self.rx_stall_since = None;
+                    return (progressed, dropped);
+                }
                 break;
             }
             progressed = true;
+            self.rx_stall_since = None;
+            // Accepted: grow the window toward the guest's true rate.
+            self.rx_window = (self.rx_window * 2).min(Self::RX_WINDOW_MAX);
         }
-        progressed
+        (progressed, 0)
     }
 
     /// Process the TX queue (guest → host), at most [`Self::TX_HEADS_PER_SLICE`] heads per call.
@@ -546,10 +592,25 @@ impl VirtioConsoleDevice {
     /// Inject a prefix of `data` into the RX queue. Returns **how many bytes** from the start of
     /// `data` were copied into guest memory and **completed** on the used ring (possibly across
     /// multiple avail heads). `0` means no progress (no buffers, stale ring, or not ready).
+    /// Maximum host bytes moved into the guest per call.
+    ///
+    /// The guest virtio-console driver pushes each injected buffer into its
+    /// tty in one call and requeues the buffer when the tty will not take
+    /// it all: a chunk larger than the tty's per-push acceptance deadlocks
+    /// the input at the accepted prefix (the receiveq ring never advances
+    /// past the requeued buffer). One byte per call always fits what the
+    /// tty will accept, so the ring advances on every push and delivery
+    /// flows at the guest's true acceptance rate — and stalls only while
+    /// the guest genuinely stops accepting, which is the correct
+    /// backpressure. The rest stays in `rx_backlog`, retried on the
+    /// guest's next buffer post.
+    const MAX_RX_CHUNK: usize = 4096;
+
     pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, data: &[u8]) -> usize {
         if data.is_empty() {
             return 0;
         }
+        let data = &data[..data.len().min(Self::MAX_RX_CHUNK)];
 
         let q = self.queues[RX_QUEUE].clone();
         if !q.ready || q.num == 0 {
