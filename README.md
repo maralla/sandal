@@ -16,26 +16,35 @@ It runs on two hypervisor backends:
 - **Flexible** — run shell scripts, or any Linux binary
 - **Unprivileged** — runs entirely in user space, no `sudo` required
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maralla/sandal/main/install.sh | sh
+```
+
+On systems without curl (e.g. a stock Alpine/musl install):
+
+```bash
+wget -qO- https://raw.githubusercontent.com/maralla/sandal/main/install.sh | sh
+```
+
 ## Quick Start
 
 ```bash
-# Build
-make
-
 # Run a command
-./target/release/sandal -- echo "Hello from the sandbox"
+sandal -- echo "Hello from the sandbox"
 
 # Run sh interactively
-./target/release/sandal -- sh
+sandal -- sh
 
 # Fetch a URL
-./target/release/sandal -- wget http://example.com
+sandal -- wget http://example.com
 
 # Disable networking
-./target/release/sandal --no-network -- wget https://example.com
+sandal --no-network -- wget https://example.com
 
 # Share a host directory (read/write) with the VM
-./target/release/sandal --share /tmp/data:/mnt/data -- ls /mnt/data
+sandal --share /tmp/data:/mnt/data -- ls /mnt/data
 ```
 
 ## Requirements
