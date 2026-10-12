@@ -101,19 +101,15 @@ else
 PYTHON := python3
 endif
 
-.PHONY: kernel-x86
+.PHONY: kernel
 
-# Build the x86_64 guest kernel (Linux hosts only; on macOS the committed
-# arm64 `vmlinux-sandal-aarch64` is used). Produces a stripped ELF vmlinux
-# with the PVH entry note, booted directly by the VMM (no firmware).
-kernel-x86:
-	@bash scripts/build-kernel.sh x86_64
-
-ifeq ($(UNAME_S)-$(UNAME_M),Linux-x86_64)
-KERNEL_DEP := kernel-x86
-else
-KERNEL_DEP :=
-endif
+# Fetch the prebuilt guest kernel for this architecture. The kernels are
+# built and released by the sandal-assets project (its kernel-* tags);
+# scripts/fetch-kernel.sh verifies the download against the release's
+# SHA256SUMS. The file lands in the project root, where the VMM resolves
+# it (see resolve_data_path); delete it to re-fetch a newer release.
+kernel:
+	@bash scripts/fetch-kernel.sh
 
 # Test suites:
 #   - cargo unit tests (incl. the ustar layer round-trips and the KVM backend
@@ -132,10 +128,11 @@ endif
 #   - interactive console hang gate (tests/test_interactive_gate.sh)
 #
 # The guest is a Linux VM (arch matches the host): the integration/gate
-# guest, so they require macOS on Apple Silicon (HVF) or Linux on arm64 with
-# /dev/kvm. On other hosts (e.g. x86_64) they print SKIP and pass — the unit
-# tests above still run everywhere.
-test: build $(KERNEL_DEP)
+# tests need its kernel — fetched from the sandal-assets release above —
+# and run on macOS on Apple Silicon (HVF) or Linux on arm64 with /dev/kvm.
+# On other hosts (e.g. x86_64) they print SKIP and pass — the unit tests
+# above still run everywhere.
+test: build kernel
 	cargo test --release
 	$(PYTHON) tests/test_devices.py
 	$(PYTHON) tests/test_blk.py
@@ -197,7 +194,7 @@ DIST_PLATFORM := $(shell printf '%s-%s' "$(UNAME_S)" "$(UNAME_M)" | tr '[:upper:
 SANDAL_VERSION := $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml | head -1)
 
 dist:
-	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (x86_64: make kernel-x86; arm64: scripts/build-kernel.sh aarch64 HOST)" >&2; exit 1; }
+	@test -f $(KERNEL_EMBED_SRC) || { echo "missing $(KERNEL_EMBED_SRC) (make kernel)" >&2; exit 1; }
 	@zstd -19 -T0 -f $(KERNEL_EMBED_SRC) -o $(KERNEL_EMBED_DST)
 	SANDAL_EMBED_KERNEL=1 cargo build --release
 ifeq ($(UNAME_S),Darwin)
