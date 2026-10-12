@@ -7,7 +7,7 @@ Sandal executes commands in a hardware-isolated environment with sub-second star
 It runs on two hypervisor backends:
 
 - **macOS** on Apple Silicon via Hypervisor.framework (software GIC, see `docs/vmm-spec.md`)
-- **Linux** on arm64 via KVM (in-kernel GICv3/vtimer)
+- **Linux** (x86_64 or arm64) via KVM (in-kernel GICv3/vtimer on arm64)
 
 ## Features
 
@@ -41,8 +41,11 @@ make
 ## Requirements
 
 - macOS 11.0+ on Apple Silicon (M1/M2/M3/M4), or
-- Linux on arm64 with `/dev/kvm` available (user must have access, e.g. be in
+- Linux (x86_64 or arm64) with `/dev/kvm` available (user must have access, e.g. be in
   the `kvm` group). No root privileges required.
+- A guest kernel: `make kernel` fetches the prebuilt kernel from the
+  [sandal-assets](https://github.com/maralla/sandal-assets) release —
+  see [docs/kernel.md](docs/kernel.md).
 
 ## License
 

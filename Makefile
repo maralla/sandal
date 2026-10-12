@@ -129,9 +129,9 @@ kernel:
 #
 # The guest is a Linux VM (arch matches the host): the integration/gate
 # tests need its kernel — fetched from the sandal-assets release above —
-# and run on macOS on Apple Silicon (HVF) or Linux on arm64 with /dev/kvm.
-# On other hosts (e.g. x86_64) they print SKIP and pass — the unit tests
-# above still run everywhere.
+# and run on macOS on Apple Silicon (HVF) or Linux with /dev/kvm. On
+# other hosts they print SKIP and pass — the unit tests above still run
+# everywhere.
 test: build kernel
 	cargo test --release
 	$(PYTHON) tests/test_devices.py
