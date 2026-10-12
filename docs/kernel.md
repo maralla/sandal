@@ -43,15 +43,3 @@ scripts/build-kernel.sh aarch64 HOST    # cross-build on HOST over SSH (macOS fl
 See that repository's README for details. The build writes
 `vmlinux-sandal-<arch>` into the sandal-assets root; copy it into this
 project's root under the same name to use it.
-
-## Release model
-
-sandal-assets publishes the prebuilt kernels as release assets: pushing a
-`kernel-X.Y.Z` tag there builds both architectures on GitHub arm64/x86_64
-runners and creates a release with `vmlinux-sandal-<arch>` +
-`SHA256SUMS` assets. `releases/latest` points at the newest release, and
-`make kernel` above follows it.
-
-The kernel version is pinned in sandal-assets' configs
-(`scripts/kernel.config`, `scripts/kernel-x86.fragment`) — not in this
-repository.
