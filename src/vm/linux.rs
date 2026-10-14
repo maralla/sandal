@@ -108,7 +108,7 @@ pub(super) fn irq_pulse(levels: &IrqLevels, idx: usize, vm: &Vm, line: u32) {
 
 impl Vmm {
     #[cfg(target_os = "linux")]
-    pub(super) fn run_loop_kvm(&mut self, _args: &Args) -> Result<i32> {
+    pub(super) fn run_loop_kvm(&mut self, args: &Args) -> Result<i32> {
         loop {
             // Host terminal resized: re-apply the geometry to the guest
             // console and interrupt it (the virtio console driver feeds the
@@ -296,7 +296,13 @@ impl Vmm {
                 crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
             );
         }
-        Ok(self.guest_exit_code.unwrap_or(0))
+        // The session-failure codes get a diagnostic (see
+        // diagnose_session_exit): the guest produced no output — a silent
+        // exit is indistinguishable from a hang. The code forwards
+        // unchanged.
+        let code = self.guest_exit_code.unwrap_or(0);
+        crate::vm::diagnose_session_exit(code, &args.command);
+        Ok(code)
     }
 
     /// KVM interrupt line for a device SPI:

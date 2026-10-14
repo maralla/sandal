@@ -8,7 +8,14 @@ the VMM's exit protocol — the init script's exit marker — EXACTLY:
   * a signal death would forward 128+signal (the reaper's other path —
     exercised end-to-end by test_console_input's Ctrl-C check, 130),
   * nothing else may substitute: the VMM exits 0 only when the marker
-    never matched, which is exactly the failure this test catches.
+    never matched, which is exactly the failure this test catches;
+  * the session-failure code (125: the session helper's exec failed —
+    e.g. a typo in the workload command) forwards UNCHANGED, but no
+    longer SILENTLY: the guest produces no output at all in that case
+    (the session never started), and a silent exit was indistinguishable
+    from a hang. The VMM now diagnoses its own protocol codes (see
+    vm::diagnose_session_exit); this test is the reproduction — `uanme`
+    for `uname` exited 125 with not one byte of output.
 
 The agent is pure machine code drafted with the x86_64 DSL
 (src/initramfs/tools/x86_64/portagent.rs — its program documentation is
@@ -51,6 +58,31 @@ def main() -> None:
             print(f"exit {code}: forwarded {rc} (want {code}): WRONG")
             raise SystemExit(1)
         print(f"exit {code}: forwarded {rc}: OK")
+
+    # The session-failure code: a nonexistent workload command (the exact
+    # reproduction — `uanme` for `uname`). The code must forward
+    # unchanged (125), and the diagnostic must print: the silence was the
+    # bug, not the code.
+    import time
+
+    vm = Vm(command=("uanme", "-a"))
+    try:
+        deadline = time.time() + 90
+        rc = None
+        while time.time() < deadline:
+            vm.read_more(0.2)
+            if vm.proc.poll() is not None:
+                rc = vm.proc.returncode
+                break
+    finally:
+        vm.close()
+    if rc != 125:
+        print(f"session-failure: forwarded {rc} (want 125): WRONG")
+        raise SystemExit(1)
+    if b"failed to execute the workload command" not in vm.buf:
+        print("session-failure: the diagnostic is MISSING (the silent exit): WRONG")
+        raise SystemExit(1)
+    print("session-failure 125 forwards unchanged + the diagnostic prints: OK")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const PIT_TICK_US: u64 = 4000;
 
 impl Vmm {
-    pub(super) fn run_loop_whp(&mut self, _args: &Args) -> Result<i32> {
+    pub(super) fn run_loop_whp(&mut self, args: &Args) -> Result<i32> {
         let mut last_pump = Instant::now();
 
         loop {
@@ -112,7 +112,13 @@ impl Vmm {
             "sandal: run loop ended, guest exit code {:?}\r",
             self.guest_exit_code
         );
-        Ok(self.guest_exit_code.unwrap_or(0))
+        // The session-failure codes get a diagnostic (see
+        // diagnose_session_exit): the guest produced no output — a silent
+        // exit is indistinguishable from a hang. The code forwards
+        // unchanged.
+        let code = self.guest_exit_code.unwrap_or(0);
+        crate::vm::diagnose_session_exit(code, &args.command);
+        Ok(code)
     }
 
     /// Poll the user-space net backend and deliver pending packets to the

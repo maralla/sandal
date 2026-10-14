@@ -1008,6 +1008,33 @@ pub fn run(args: Args) -> Result<i32> {
     // The Vmm drops here (scope end): guest RAM munmap, device teardown.
 }
 
+/// Diagnose the session-failure protocol codes before they are returned.
+///
+/// The guest produced NO output in these cases — the session never
+/// started — so a silent exit is indistinguishable from a hang: the
+/// operator sees nothing at all (MEASURED by reproduction: a typo in
+/// the workload command — `uanme` for `uname` — exited 125 with not
+/// one byte of output). The VMM names the failure itself: it built the
+/// command line, and the codes are its own protocol (the portagent:
+/// 125 = the session exec failed; the init script: 126 = no session
+/// transport). The code is forwarded UNCHANGED (see
+/// test_exit_codes.py); only the diagnostic is added.
+pub(crate) fn diagnose_session_exit(code: i32, command: &[String]) {
+    match code {
+        125 => eprintln!(
+            "sandal: failed to execute the workload command `{}`: not found \
+             or not executable (the session helper's exec failed)",
+            command.join(" ")
+        ),
+        126 => eprintln!(
+            "sandal: no session: the session transport never opened (the host \
+             device port did not come up, or the session helper rejected its \
+             arguments)"
+        ),
+        _ => {}
+    }
+}
+
 /// Build the writable overlay data disk (vdb).
 ///
 /// Layer tar entries are injected under `upper/` (see

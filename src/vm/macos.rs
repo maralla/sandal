@@ -93,7 +93,7 @@ impl Vmm {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) fn run_loop_hvf(&mut self, _args: &Args) -> Result<i32> {
+    pub(super) fn run_loop_hvf(&mut self, args: &Args) -> Result<i32> {
         loop {
             // Host terminal resized: re-apply the geometry to the guest
             // console. The console's config-change interrupt is
@@ -208,7 +208,13 @@ impl Vmm {
                 break;
             }
         }
-        Ok(self.guest_exit_code.unwrap_or(0))
+        // The session-failure codes get a diagnostic (see
+        // diagnose_session_exit): the guest produced no output — a silent
+        // exit is indistinguishable from a hang. The code forwards
+        // unchanged.
+        let code = self.guest_exit_code.unwrap_or(0);
+        crate::vm::diagnose_session_exit(code, &args.command);
+        Ok(code)
     }
 }
 

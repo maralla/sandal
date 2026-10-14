@@ -42,13 +42,14 @@ class Vm:
         os.setsid()
         fcntl.ioctl(0, 0x540E, 0)  # TIOCSCTTY: fd 0 = this session's ctty
 
-    def __init__(self, extra_args=(), verbose_env="SANDAL_TEST_VERBOSE"):
+    def __init__(self, extra_args=(), command=("sh",),
+                 verbose_env="SANDAL_TEST_VERBOSE"):
         master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         self.master = master
         self.verbose_env = verbose_env
         self.proc = subprocess.Popen(
-            [str(SANDAL), *extra_args, "--", "sh"],
+            [str(SANDAL), *extra_args, "--", *command],
             stdin=slave,
             stdout=slave,
             stderr=slave,
