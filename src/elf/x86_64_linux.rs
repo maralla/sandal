@@ -10,6 +10,7 @@
 pub mod nr {
     pub const READ: u32 = 0;
     pub const WRITE: u32 = 1;
+    pub const POLL: u32 = 7;
     pub const CLOSE: u32 = 3;
     pub const IOCTL: u32 = 16;
     pub const SOCKET: u32 = 41;
@@ -17,8 +18,10 @@ pub mod nr {
     pub const EXECVE: u32 = 59;
     pub const EXIT: u32 = 60;
     pub const WAIT4: u32 = 61;
+    pub const KILL: u32 = 62;
     pub const CHDIR: u32 = 80;
     pub const SETSID: u32 = 112;
+    pub const NANO_SLEEP: u32 = 35;
     pub const PIVOT_ROOT: u32 = 155;
     pub const MOUNT: u32 = 165;
     pub const REBOOT: u32 = 169;
@@ -44,12 +47,23 @@ pub const MS_BIND: u32 = 0x1000;
 
 // ── Signals ───────────────────────────────────────────────────────────
 pub const SIGCHLD: u32 = 17;
+pub const SIGKILL: u32 = 9;
 
 // ── Terminal ──────────────────────────────────────────────────────────
 /// Terminal ioctls.
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+/// Unlock the pty pair (unlockpt(0)); the slave open fails EIO without it.
+pub const TIOCSPTLCK: u32 = 0x4004_5431;
+/// The pty slave fd straight from the master (the flags argument IS the
+/// peer fd's open flags — O_RDWR, or every session write fails EBADF).
+pub const TIOCGPTPEER: u32 = 0x5441;
+/// Apply a winsize {rows, cols, 0, 0} to the pair.
+pub const TIOCSWINSZ: u32 = 0x5414;
+
+// ── poll(2) ───────────────────────────────────────────────────────────
+pub const POLLIN: u32 = 0x001;
 
 // ── Networking ────────────────────────────────────────────────────────
 pub const AF_INET: u32 = 2;

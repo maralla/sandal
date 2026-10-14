@@ -112,7 +112,7 @@ impl Vmm {
             // window live). The config path only ever lands when the guest
             // driver's config work runs — on its own schedule — so the
             // resize ALSO rides the port input stream as a record the
-            // session agent strips and applies (see portagent.c's
+            // session agent strips and applies (see portagent.rs's
             // RESIZE_MAGIC): the input path is the one channel that is
             // demonstrably up, and the kernel SIGWINCHs the session when
             // the agent applies the record, so the session re-sizes itself
@@ -136,7 +136,7 @@ impl Vmm {
                 let config_change = self.console.lock().unwrap().set_size(cols, rows);
                 if config_change {
                     // The resize record: [u32 "RSZ1"][u16 cols][u16 rows],
-                    // little-endian — portagent.c's RESIZE_MAGIC
+                    // little-endian — the resize record's magic
                     // (0x315a5352 LE = the bytes "RSZ1"). Queued for the
                     // port input stream: delivered whole, ahead of the
                     // backlog (see set_resize_record — a split record

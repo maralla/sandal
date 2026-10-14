@@ -2495,26 +2495,14 @@ pub fn inject_runtime_files(
         }
     }
 
-    // Controlling-terminal helper: /bin/ctty claims the console as the user
-    // command's controlling terminal (job control + tty signals in the
-    // guest). A crafted x86_64 ELF — pure machine code, no toolchain.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        &mut alloc,
-        "bin/ctty",
-        initramfs::tools::x86_64::ctty::ctty_helper(),
-        0o755,
-    )?;
-
     // Session agent: /bin/portagent moves the interactive session onto the
     // virtio-console host device port (a pty bridged to the port — real
-    // tty semantics at port throughput). Freestanding C built by build.rs
-    // (see portagent.c); the cfg is only emitted when that build succeeded.
-    // The init script falls back to ctty when the helper is missing.
-    #[cfg(sandal_portagent_helper)]
+    // tty semantics at port throughput). THE session transport: there is
+    // no console-session fallback anymore (the init script runs the
+    // portagent or nothing). A crafted x86_64 ELF — pure machine code
+    // built with the per-arch DSL (see portagent.rs) — no toolchain,
+    // no sibling binary.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     inject_file(
         image,
         &sb,

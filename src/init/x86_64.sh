@@ -110,29 +110,17 @@ done
 
 cd /root
 
-# ── Run the command on the console ────────────────────────────────────
-# Give the console a real window size: the virtio console does not carry
-# TIOCGWINSZ, and without it the shell's line editor guesses the width and
-# wraps lines incorrectly.
-stty -F /dev/console rows "$ROWS" cols "$COLS" 2>/dev/null
-# /bin/ctty starts a new session and claims the console as the CONTROLLING
-# terminal via TIOCSCTTY (shells open redirections with O_NOCTTY, so a
-# script alone can never do this). With a controlling terminal the guest
-# shell has working job control and tty signals (Ctrl-C, Ctrl-Z).
+# ── Run the command on the session transport ──────────────────────────
+# The console device is init/kernel output only — never a session: no
+# console-session fallback exists anymore, so nothing here configures it.
 # The crafted helper has no PATH search — resolve the command first.
 #
-# Stdin MUST be opened read-write (<>): the interactive tty fd is inherited
-# by everything on the console — tmux's client passes STDIN_FILENO to the
-# server as its terminal fd, and a server writing a redraw to an O_RDONLY
-# fd gets EBADF on every write, so the attached pane never draws (input
-# still works, which makes the hang extra confusing). `>` for stdout stays
-# one-way; the console is the same file anyway.
-# The session transport. The fast path: the virtio-console host device
-# port (/dev/vport*p1 — the chardev the multiport console device creates),
-# bridged to a pty by /bin/portagent: real tty semantics (job control,
-# signals, line editing) at port throughput instead of the console
-# device's per-line round trips. The crafted helpers have no PATH search —
-# resolve the command first, once, for every branch.
+# The session transport: the virtio-console host device port
+# (/dev/vport*p1 — the chardev the multiport console device creates),
+# bridged to a pty by /bin/portagent — real tty semantics (job control,
+# signals, line editing) at port throughput. THE session: no fallback
+# transport exists. The crafted helper has no PATH search — resolve the
+# command first.
 CMD="$(command -v "$1")"
 [ -n "$CMD" ] || CMD="$1"
 # busybox's `command -v` prints the bare applet name for shell builtins
@@ -157,38 +145,17 @@ if [ -n "$PORT" ] && [ -x /bin/portagent ]; then
     # on the port: the control sequence is BATCHED (one message per posted
     # head, one pulse — see src/virtio/console.rs), so the port opened
     # during kernel boot, deterministically, BEFORE this script runs — the
-    # device node above exists iff that happened. The old second copy on
-    # the console existed to deliver the marker while the port stream was
-    # still coming up (the pre-batch control handshake took seconds or
-    # never); it is gone. A missing node takes the else branch — the
-    # console session, console marker and all.
+    # device node above exists iff that happened.
     echo "${EXIT_TOKEN}SESSION:port" > "$PORT" 2>/dev/null
     /bin/portagent "$PORT" "$ROWS" "$COLS" "$CMD" "$@"
     STATUS=$?
-    if [ "$STATUS" = 121 ]; then
-        # The pty bridge failed (no pty, or the peer ioctl refused):
-        # the baseline console session instead. The marker moves the host
-        # input back to the console RX queue — both transports again.
-        echo "${EXIT_TOKEN}SESSION:console" > "$PORT" 2>/dev/null
-        echo "${EXIT_TOKEN}SESSION:console"
-        if [ -x /bin/ctty ]; then
-            /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
-            STATUS=$?
-        else
-            setsid sh -c 'exec "$@"' sh "$CMD" "$@" <> /dev/console > /dev/console 2>&1
-            STATUS=$?
-        fi
-    fi
 else
-    echo "${EXIT_TOKEN}SESSION:console"
-    if [ -x /bin/ctty ]; then
-        /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
-        STATUS=$?
-    else
-        setsid sh -c 'exec "$@"' sh "$CMD" "$@" <> /dev/console > /dev/console 2>&1
-        STATUS=$?
-    fi
+    # No session transport (the port never opened, or the helper is
+    # missing): NO session — no console-session fallback, ever. The
+    # exit marker forwards the status; the VMM tears the VM down.
+    STATUS=126
 fi
+
 # The session child was a session leader on a real tty: its death
 # disassociates the controlling terminal and vhangups it — every
 # inherited fd on that tty is hung up with it, so the exit-marker
@@ -201,8 +168,10 @@ exec >/dev/console 2>&1
 # protocol by echoing script text or fixed strings. BOTH transports
 # carry the marker (each stream's own filter suppresses its copy):
 # whichever side is alive captures the code — the port (the session
-# transport), the console (the fallback). A failed open is just a lost
-# copy; the other still delivers.
+# transport), the console (the boot protocol's completion redundancy:
+# with no console session there is nothing to fall back TO, but the code
+# itself must still reach the VMM). A failed open is just a lost copy;
+# the other still delivers.
 [ -n "$PORT" ] && echo "${EXIT_TOKEN}${STATUS}" > "$PORT" 2>/dev/null
 echo "${EXIT_TOKEN}${STATUS}" >/dev/console 2>/dev/null
 poweroff -f

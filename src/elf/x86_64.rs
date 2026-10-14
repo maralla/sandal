@@ -159,6 +159,31 @@ pub fn movzx_r64_m8(dst: u32, base: u32, disp: i32) -> Vec<u8> {
     b
 }
 
+/// `MOVZX r64, word [r64 + disp]` (0F B7 /r) — the zero-extended 16-bit
+/// load (the record scan: a u16 field of the resize record).
+pub fn movzx_r64_m16(dst: u32, base: u32, disp: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(9);
+    b.push(rex(true, is_rex_high(dst), false, is_rex_high(base)) as u8);
+    b.push(0x0F);
+    b.push(0xB7);
+    emit_modrm_mem(&mut b, dst, base, disp);
+    append_disp(&mut b, base, disp);
+    b
+}
+
+/// `MOVZX r64, dword [r64 + disp]` (8B /r, no REX.W) — the zero-extended
+/// 32-bit load: the 32-bit register write zeroes the upper half, so the
+/// full r64 carries the zero-extended 32-bit value (the record scan: the
+/// record's magic dword).
+pub fn movzx_r64_m32(dst: u32, base: u32, disp: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8);
+    b.push(rex(false, is_rex_high(dst), false, is_rex_high(base)) as u8);
+    b.push(0x8B);
+    emit_modrm_mem(&mut b, dst, base, disp);
+    append_disp(&mut b, base, disp);
+    b
+}
+
 /// `MOV dword [r64 + disp], imm32` (C7 /0) — sign-extended to 64.
 pub fn mov_m_imm32(base: u32, disp: i32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(11);
@@ -421,6 +446,14 @@ impl X86ElfBuilder {
         let off = self.data.len();
         self.data.extend_from_slice(s.as_bytes());
         self.data.push(0);
+        off
+    }
+
+    /// Add raw bytes to the data section (a struct or a fixed buffer the
+    /// program addresses rip-relative — see `emit_lea_data`).
+    pub fn emit_data_bytes(&mut self, bytes: &[u8]) -> usize {
+        let off = self.data.len();
+        self.data.extend_from_slice(bytes);
         off
     }
 
@@ -756,6 +789,30 @@ macro_rules! store32i {
 macro_rules! loadzx8 {
     ($e:expr, $rd:tt, $base:tt, $disp:expr) => {
         $e.emit(&$crate::elf::x86_64::movzx_r64_m8(
+            $crate::elf::x86_64::xreg!($rd),
+            $crate::elf::x86_64::xreg!($base),
+            $disp as i32,
+        ))
+    };
+}
+
+/// `MOVZX r64, word [r64 + disp]` — the zero-extended 16-bit load
+/// (a u16 field of the resize record).
+macro_rules! loadzx16 {
+    ($e:expr, $rd:tt, $base:tt, $disp:expr) => {
+        $e.emit(&$crate::elf::x86_64::movzx_r64_m16(
+            $crate::elf::x86_64::xreg!($rd),
+            $crate::elf::x86_64::xreg!($base),
+            $disp as i32,
+        ))
+    };
+}
+
+/// `MOVZX r64, dword [r64 + disp]` — the zero-extended 32-bit load
+/// (the resize record's magic dword).
+macro_rules! loadzx32 {
+    ($e:expr, $rd:tt, $base:tt, $disp:expr) => {
+        $e.emit(&$crate::elf::x86_64::movzx_r64_m32(
             $crate::elf::x86_64::xreg!($rd),
             $crate::elf::x86_64::xreg!($base),
             $disp as i32,
@@ -1184,6 +1241,8 @@ pub(crate) use jcc_fwd;
 pub(crate) use lea;
 pub(crate) use load64;
 pub(crate) use loadb_inc;
+pub(crate) use loadzx16;
+pub(crate) use loadzx32;
 pub(crate) use loadzx8;
 pub(crate) use mov_i;
 pub(crate) use mov_rr_;
