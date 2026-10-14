@@ -163,14 +163,41 @@ impl Vmm {
                 }
             }
 
+            // The port-instantiation control sequence: without it the guest
+            // driver instantiates NO console at all (hvc0 exists only after
+            // CONSOLE_PORT), so every platform pumps it until delivered. Its
+            // interrupt lands through the pending-interrupt update above.
+            // The captured control replies (parsed by the pump for the
+            // PORT_READY processing proof).
+            let control_tx = self.console.lock().unwrap().process_tx(
+                self.memory.as_shared_slice(),
+                RAM_BASE,
+                crate::virtio::console::CONTROL_TX,
+            );
+            self.console
+                .lock()
+                .unwrap()
+                .pump_control_sequence(
+                    self.memory.as_shared_slice(),
+                    RAM_BASE,
+                    &control_tx,
+                );
+
             // Drain guest console TX → host stdout (intercepting protocol markers).
             let tx = self
                 .console
                 .lock()
                 .unwrap()
-                .process_tx(self.memory.as_shared_slice(), RAM_BASE);
+                .process_tx(
+                    self.memory.as_shared_slice(),
+                    RAM_BASE,
+                    crate::virtio::console::CONSOLE_TX,
+                );
             if !tx.is_empty() {
-                self.process_console_tx(&tx);
+                // The host terminal runs with output processing disabled, so
+                // the \n → \r\n translation happens here, once, for the
+                // console stream (the only stream this platform has).
+                self.process_console_tx(&crate::virtio::onlcr(tx));
             }
 
             // Host stdin → guest console RX.
@@ -618,6 +645,7 @@ impl Vmm {
             self.console.lock().unwrap().push_rx_and_drain(
                 self.memory.as_shared_slice(),
                 RAM_BASE,
+                crate::virtio::console::CONSOLE_RX,
                 &buf[..n as usize],
             );
         }

@@ -109,11 +109,61 @@ impl Vmm {
             // Host terminal resized: re-apply the geometry to the guest
             // console and interrupt it (the virtio console driver feeds the
             // config change to hvc_resize, so the guest tty tracks the host
-            // window live).
+            // window live). The config path only ever lands when the guest
+            // driver's config work runs — on its own schedule — so the
+            // resize ALSO rides the port input stream as a record the
+            // session agent strips and applies (see portagent.c's
+            // RESIZE_MAGIC): the input path is the one channel that is
+            // demonstrably up, and the kernel SIGWINCHs the session when
+            // the agent applies the record, so the session re-sizes itself
+            // exactly like a real terminal would.
+            // Host terminal geometry: the kernel's SIGWINCH, MEASURED
+            // (instrumented handler, run in a real tmux pane AND in the
+            // test harness after vm_harness.py's _claim_ctty setup):
+            // the signal fires wherever the console pty is the VMM's
+            // controlling terminal — tmux TIOCSCTTYs its panes (real
+            // panes), and the harness setsid + TIOCSCTTYs its pty —
+            // and NEVER elsewhere (a launch that inherits no ctty gets
+            // no live resize; the boot geometry stands, and host_tty_size
+            // falls back to 120x40 off-tty). set_size dedupes against
+            // the device's own config: a repeat signal for the same size
+            // produces no second record. No poll: a TIOCGWINSZ-per-
+            // iteration poll was measured redundant wherever the ctty
+            // holds and was removed — the harness now exercises the real
+            // signal path instead.
             if HOST_WINCH.swap(false, Ordering::Relaxed) {
                 let (cols, rows) = host_tty_size();
                 let config_change = self.console.lock().unwrap().set_size(cols, rows);
                 if config_change {
+                    // The resize record: [u32 "RSZ1"][u16 cols][u16 rows],
+                    // little-endian — portagent.c's RESIZE_MAGIC
+                    // (0x315a5352 LE = the bytes "RSZ1"). Queued for the
+                    // port input stream: delivered whole, ahead of the
+                    // backlog (see set_resize_record — a split record
+                    // leaks its magic into the input stream).
+                    let mut record: [u8; 8] = [0; 8];
+                    record[0..4].copy_from_slice(&0x315a_5352u32.to_le_bytes());
+                    record[4..6].copy_from_slice(&(cols as u16).to_le_bytes());
+                    record[6..8].copy_from_slice(&(rows as u16).to_le_bytes());
+                    self.console
+                        .lock()
+                        .unwrap()
+                        .set_resize_record(crate::virtio::console::PORT_RX, record);
+                    // Deliver it RIGHT HERE, at the poll: a truly idle
+                    // session never generates the input pushes or kicks the
+                    // later drains ride on, and the resize must not depend
+                    // on them (a host zoom while the session sits at a
+                    // prompt would otherwise resize nothing, for as long as
+                    // the session stays idle — which is exactly when a
+                    // user zooms). The pulse below covers the delivery.
+                    self.console
+                        .lock()
+                        .unwrap()
+                        .drain_resize_record(
+                            self.memory.as_shared_slice(),
+                            RAM_BASE,
+                            crate::virtio::console::PORT_RX,
+                        );
                     let _guard = self.host.irq_lock.lock();
                     irq_pulse(
                         &self.host.irq_levels,
@@ -141,50 +191,45 @@ impl Vmm {
                 }
             }
 
-            // Drain guest console TX → host stdout. On Linux the drained
-            // bytes go through the SHARED ConsoleTxFilter — the same one the
-            // net-kick thread uses. Two independent escape-sequence trackers
-            // would tear sequences apart at drain boundaries (one drainer
-            // sees `ESC [`, the other the rest), mangle query replies and
-            // corrupt the protocol-marker state, so the filter state must be
-            // singular.
-            let tx = self
-                .console
-                .lock()
-                .unwrap()
-                .process_tx(self.memory.as_shared_slice(), RAM_BASE);
-            if !tx.is_empty() {
-                let mut out = Vec::new();
-                let (replied, exit_code, export_path) = {
-                    let mut f = self.console_tx_filter.lock().unwrap();
-                    f.feed(&tx, &self.console, &self.memory, RAM_BASE, &mut out);
-                    let replied = f.replied;
-                    f.replied = false;
-                    (replied, f.exit_code.take(), f.export_path.take())
-                };
-                if !out.is_empty() {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(&out);
-                    let _ = std::io::stdout().flush();
-                }
-                if let Some(code) = exit_code {
-                    self.guest_exit_code = Some(code);
-                    self.guest_shutdown = true;
-                }
-                if let Some(path) = export_path {
-                    self.export_save_path = Some(path);
-                }
-                if replied {
-                    // The filter answered a terminal query: the reply went
-                    // into the console RX. Raise the line under the lock.
-                    let _guard = self.host.irq_lock.lock();
-                    irq_pulse(
-                        &self.host.irq_levels,
-                        (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
-                        &self.vm,
-                        self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
-                    );
-                }
+            // Drain every console stream → host stdout. Each stream goes
+            // through its own SHARED filter (the same instances the
+            // net-kick thread uses — two independent trackers per stream
+            // would tear escape sequences apart at drain boundaries).
+            let (pending, _) = drain_console_streams(
+                &self.console,
+                &self.memory,
+                &self.console_tx_filter,
+                &self.port_tx_filter,
+            );
+            // The shutdown/export protocol: whichever drain matched the
+            // marker left it set in the shared filter — take it here (the
+            // only place with a shutdown path).
+            let (exit_code, export_path) = {
+                let mut f = self.console_tx_filter.lock().unwrap();
+                let mut g = self.port_tx_filter.lock().unwrap();
+                (
+                    f.exit_code.take().or(g.exit_code.take()),
+                    f.export_path.take().or(g.export_path.take()),
+                )
+            };
+            if let Some(code) = exit_code {
+                self.guest_exit_code = Some(code);
+                self.guest_shutdown = true;
+            }
+            if let Some(path) = export_path {
+                self.export_save_path = Some(path);
+            }
+            if pending {
+                // The control sequence was delivered or a filter answered a
+                // terminal query: the reply went into an RX queue. Raise the
+                // line under the lock (a fresh edge, not the line update).
+                let _guard = self.host.irq_lock.lock();
+                irq_pulse(
+                    &self.host.irq_levels,
+                    (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
+                    &self.vm,
+                    self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
+                );
             }
 
             // Drain host input and network data into the guest, then mirror
@@ -289,6 +334,7 @@ pub(super) fn spawn_net_kicker(
     console: Arc<Mutex<VirtioConsoleDevice>>,
     memory: Arc<GuestRam>,
     filter: Arc<Mutex<super::ConsoleTxFilter>>,
+    port_filter: Arc<Mutex<super::ConsoleTxFilter>>,
     irq_lock: Arc<Mutex<()>>,
     irq_levels: IrqLevels,
     stop: Arc<AtomicBool>,
@@ -320,17 +366,15 @@ pub(super) fn spawn_net_kicker(
 
             // Pump: deliver anything pending, then sync + wait on the fds.
             {
-                // Drain the console TX: a guest writer blocked on a full TX
-                // virtqueue (full-screen apps like tmux) cannot generate
-                // exits, so the main loop alone would never drain it. Feed
-                // the raw bytes through the marker filter and pulse the
-                // console IRQ so the guest's blocked tty write resumes.
-                let console_tx = console
-                    .lock()
-                    .unwrap()
-                    .process_tx(memory.as_shared_slice(), RAM_BASE);
-                if console_tx.is_empty() {
-                    // Console TX wedge detection: the queue looks idle but a
+                // Drain every console stream: a guest writer blocked on a
+                // full TX virtqueue (full-screen apps like tmux) cannot
+                // generate exits, so the main loop alone would never drain
+                // it. Each stream goes through its own shared filter; the
+                // control handshake is what keeps the console alive at all.
+                let (console_irq_pending, progressed) =
+                    drain_console_streams(&console, &memory, &filter, &port_filter);
+                if !progressed {
+                    // Console wedge detection: every stream looks idle but a
                     // guest console writer may be stuck (e.g. tmux's draw).
                     // Once output has been seen this boot, dump the vring
                     // state parsed straight from guest RAM (the only
@@ -360,28 +404,8 @@ pub(super) fn spawn_net_kicker(
                     saw_tx = true;
                     wedged_empty_drains = 0;
                 }
-                let mut console_irq_pending = !console_tx.is_empty();
-                if !console_tx.is_empty() {
-                    let mut out = Vec::new();
-                    filter
-                        .lock()
-                        .unwrap()
-                        .feed(&console_tx, &console, &memory, RAM_BASE, &mut out);
-                    if !out.is_empty() {
-                        use std::io::Write;
-                        let _ = std::io::stdout().write_all(&out);
-                        let _ = std::io::stdout().flush();
-                    }
-                    // The guest's terminal queries were answered: the reply
-                    // went into the console RX, so the console IRQ is
-                    // pending too.
-                    if filter.lock().unwrap().replied {
-                        filter.lock().unwrap().replied = false;
-                        console_irq_pending = true;
-                    }
-                }
                 let _guard = irq_lock.lock();
-                // The console completions (TX drained above) and any query
+                // The console completions (drained above) and any query
                 // replies pended the console vring interrupt: raise the line
                 // here. The main loop is blocked in KVM_RUN when the guest
                 // is halted and would never learn of them otherwise — its
@@ -460,6 +484,151 @@ pub(super) fn spawn_net_kicker(
 
         unsafe { libc::close(epfd) };
     })
+}
+
+
+/// Drain every console stream and emit it (shared by the run loop and the
+/// net-kick thread — the only two places the console device is pumped on
+/// Linux). One filter instance per stream, shared between both callers:
+/// two independent escape-sequence trackers would tear sequences apart at
+/// drain boundaries and corrupt the protocol-marker state.
+///
+/// Streams, in pump order:
+///   - the control handshake: the port-instantiation sequence, delivered
+///     once — without it the guest driver instantiates NO console at all
+///     (hvc0 exists only after CONSOLE_PORT), so this is what keeps every
+///     console alive;
+///   - the console port's stream (the guest init and kernel output):
+///     markers + terminal-query answering, with the \n → \r\n translation
+///     applied once, here (the host terminal runs with output processing
+///     disabled);
+///   - the host device port's stream (the interactive session): verbatim
+///     (the guest pty already formed those bytes), with terminal-query
+///     answering — the replies go back through the port's own RX queue so
+///     the guest agent reads them as input;
+///   - the control replies: completing the driver's posts (its control path
+///     spins until the completion lands, exactly like the console TX); the
+///     payload is the driver's own bookkeeping — logged, emitted nowhere.
+///
+/// Returns `(pending, progressed)`: `pending` means the caller must raise
+/// the console interrupt line (the control sequence was delivered, or a
+/// filter answered a terminal query into an RX queue); `progressed` means
+/// some stream produced bytes (the net-kick thread's wedge detector
+/// inverts it).
+///
+/// The shutdown/export protocol markers are matched by the shared filters
+/// but NOT consumed here: the filter instances are shared with the run
+/// loop, which is the only place with a shutdown path — whatever this
+/// drain matches stays set in the filter until the run loop takes it.
+#[cfg(target_os = "linux")]
+fn drain_console_streams(
+    console: &Arc<Mutex<VirtioConsoleDevice>>,
+    memory: &Arc<GuestRam>,
+    console_filter: &Arc<Mutex<super::ConsoleTxFilter>>,
+    port_filter: &Arc<Mutex<super::ConsoleTxFilter>>,
+) -> (bool, bool) {
+    use std::io::Write;
+    let mut pending = false;
+    let mut progressed = false;
+
+    // The console port's stream.
+    let console_tx = console.lock().unwrap().process_tx(
+        memory.as_shared_slice(),
+        RAM_BASE,
+        crate::virtio::console::CONSOLE_TX,
+    );
+    let console_completed = !console_tx.is_empty();
+    if !console_tx.is_empty() {
+        progressed = true;
+        // The \n → \r\n translation, once, for this stream only.
+        let tx = crate::virtio::onlcr(console_tx);
+        let mut out = Vec::new();
+        let replied = {
+            let mut f = console_filter.lock().unwrap();
+            f.feed(&tx, console, memory, RAM_BASE, &mut out);
+            let replied = f.replied;
+            f.replied = false;
+            replied
+        };
+        if !out.is_empty() {
+            let _ = std::io::stdout().write_all(&out);
+            let _ = std::io::stdout().flush();
+        }
+        // A TX completion landed (a post was captured): the guest driver's
+        // vq callback must reclaim it and wake the blocked writer, or the
+        // next write parks until an unrelated timer exit — the ~80 ms
+        // per post pacer.
+        if replied || console_completed {
+            pending = true;
+        }
+    }
+
+    // The host device port's stream: verbatim.
+    let port_tx = console.lock().unwrap().process_tx(
+        memory.as_shared_slice(),
+        RAM_BASE,
+        crate::virtio::console::PORT_TX,
+    );
+    let port_completed = !port_tx.is_empty();
+    if !port_tx.is_empty() {
+        progressed = true;
+        let mut out = Vec::new();
+        let replied = {
+            let mut f = port_filter.lock().unwrap();
+            f.feed(&port_tx, console, memory, RAM_BASE, &mut out);
+            let replied = f.replied;
+            f.replied = false;
+            replied
+        };
+        if !out.is_empty() {
+            let _ = std::io::stdout().write_all(&out);
+            let _ = std::io::stdout().flush();
+        }
+        // Same as the console stream: a landed completion must pulse, or
+        // the port's bulk stream paces at the timer's period.
+        if replied || port_completed {
+            pending = true;
+        }
+    }
+
+    // The control replies FIRST: complete the driver's pending post — its
+    // control path spins until the completion lands, exactly like the
+    // console TX. The payload is the driver's own bookkeeping — logged,
+    // emitted nowhere.
+    let control_tx = console.lock().unwrap().process_tx(
+        memory.as_shared_slice(),
+        RAM_BASE,
+        crate::virtio::console::CONTROL_TX,
+    );
+    if !control_tx.is_empty() {
+        progressed = true;
+        crate::vmm_trace::write_console_io(format_args!(
+            "CONTROL_TX bytes={} preview=\"{}\"",
+            control_tx.len(),
+            crate::vmm_trace::bytes_preview(&control_tx, 32)
+        ));
+    }
+
+    // The control handshake LAST, in the same pump call: the driver reads
+    // the control buffer at get_buf time, so message k must be written in
+    // the very call that completes the driver's reply for message k-1 —
+    // otherwise the buffer holds the LAST message by the time the driver
+    // finally runs, and every earlier message is lost.
+    let pumped = console
+        .lock()
+        .unwrap()
+        .pump_control_sequence(memory.as_shared_slice(), RAM_BASE);
+    // NOTE: pulse only on a NEW event (a delivery or a capture) — pulsing
+    // on every call while the sequence is merely DELIVERED is an IRQ
+    // storm: the kernel's storm detector disables the line ("nobody
+    // cared"), the driver's work never runs again, and the port session
+    // parks on an unprocessed host_connected bit forever.
+    if pumped {
+        pending = true;
+        progressed = true;
+    }
+
+    (pending, progressed)
 }
 
 /// Console interrupt line (the same mapping the main loop uses).
@@ -541,9 +710,19 @@ pub(super) fn spawn_stdin_poller(
                 // decision.
                 let dropped = {
                     let mut console = console.lock().unwrap();
+                    // The session target: the console RX queue until the
+                    // guest init moves the session onto the host device
+                    // port (the SESSION:port marker, parsed by the console
+                    // TX filter) — then the port RX queue.
+                    let rxq = if console.session_input_on_port {
+                        crate::virtio::console::PORT_RX
+                    } else {
+                        crate::virtio::console::CONSOLE_RX
+                    };
                     let (_, dropped) = console.push_rx_and_drain(
                         memory.as_shared_slice(),
                         RAM_BASE,
+                        rxq,
                         &chunk[..n as usize],
                     );
                     dropped

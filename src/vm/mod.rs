@@ -277,10 +277,18 @@ impl Drop for GuestRam {
 /// The console TX pipeline: escape-sequence tracking (DSR/DA query replies),
 /// protocol-marker filtering, and the line/cursor state. Owned by the
 /// net-kick thread that drains the console TX virtqueue (Linux).
+///
+/// One instance per stream: the console port's stream (the guest init and
+/// kernel output; query replies go back through the CONSOLE RX queue) and
+/// the host device port's stream (the interactive session; replies go back
+/// through the PORT RX queue so the guest agent can read them).
 #[cfg(target_os = "linux")]
 pub(crate) struct ConsoleTxFilter {
     /// The per-boot exit-protocol token.
     pub exit_marker: String,
+    /// Which RX queue (host → guest) this stream's terminal-query replies
+    /// are injected through: the stream's own port's RX queue.
+    pub rx_queue: usize,
     /// Console TX line buffer used to intercept protocol markers.
     tx_line: Vec<u8>,
     /// Bytes held back because they may start a protocol marker.
@@ -325,9 +333,10 @@ pub(crate) struct ConsoleTxFilter {
 
 #[cfg(target_os = "linux")]
 impl ConsoleTxFilter {
-    pub(crate) fn new(exit_marker: String) -> Self {
+    pub(crate) fn new(exit_marker: String, rx_queue: usize) -> Self {
         ConsoleTxFilter {
             exit_marker,
+            rx_queue,
             tx_line: Vec::new(),
             tx_hold: Vec::new(),
             tx_suppress_line: false,
@@ -428,7 +437,7 @@ impl ConsoleTxFilter {
                 self.tx_suppress_line = false;
                 self.tx_hold.clear();
                 let line = std::mem::take(&mut self.tx_line);
-                self.process_console_line(&line);
+                self.process_console_line(&line, console);
             }
         }
 
@@ -442,7 +451,12 @@ impl ConsoleTxFilter {
             let (_, dropped) = console
                 .lock()
                 .unwrap()
-                .push_rx_and_drain(memory.as_shared_slice(), ram_base, &blob);
+                .push_rx_and_drain(
+                    memory.as_shared_slice(),
+                    ram_base,
+                    self.rx_queue,
+                    &blob,
+                );
             if dropped > 0 {
                 console_eprintln(&format!(
                     "sandal: dropped {dropped} bytes of console input the guest refused \
@@ -579,7 +593,11 @@ impl ConsoleTxFilter {
 
     /// Handle one complete guest console line (marker side effects only —
     /// visible output has already been streamed).
-    fn process_console_line(&mut self, line: &[u8]) {
+    fn process_console_line(
+        &mut self,
+        line: &[u8],
+        console: &Arc<Mutex<VirtioConsoleDevice>>,
+    ) {
         let Ok(line) = std::str::from_utf8(line) else {
             return;
         };
@@ -587,7 +605,23 @@ impl ConsoleTxFilter {
         let trimmed = line.trim_end_matches(['\n', '\r']);
 
         if let Some(pos) = trimmed.find(&self.exit_marker) {
-            let code = trimmed[pos + self.exit_marker.len()..].trim();
+            let tail = trimmed[pos + self.exit_marker.len()..].trim();
+            // Session routing: the guest init moves the interactive session
+            // onto the host device port (the portagent) or keeps it on the
+            // console. Token-authenticated like the exit protocol —
+            // workload output can never act as the protocol.
+            if tail == "SESSION:port" {
+                let mut dev = console.lock().unwrap();
+                if crate::virtio::console::PORT_RX < dev.queue_count() {
+                    dev.session_input_on_port = true;
+                }
+                return;
+            }
+            if tail == "SESSION:console" {
+                console.lock().unwrap().session_input_on_port = false;
+                return;
+            }
+            let code = tail;
             // Only a real integer is the exit protocol. Commands like
             // `cat /init` surface the script's unexpanded placeholder —
             // that must not shut the VM down.
@@ -627,6 +661,11 @@ struct Vmm {
     /// macOS keeps its own inline console path instead (process_console_tx).
     #[cfg(not(target_os = "macos"))]
     console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
+    /// The host device port's stream filter (Linux: the interactive
+    /// session; replies go back through the port RX queue so the guest
+    /// agent can read them).
+    #[cfg(not(target_os = "macos"))]
+    port_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
     /// x86_64: base of the MMIO device window (above the guest RAM).
     #[cfg(target_arch = "x86_64")]
     mmio_base: u64,
@@ -738,7 +777,16 @@ struct Vmm {
 // Host terminal geometry
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Set by the SIGWINCH handler when the host terminal is resized.
+/// Set by the SIGWINCH handler when the host terminal is resized. MEASURED
+/// (instrumented handler + poll, run in a real tmux pane and in the test
+/// harness before and after vm_harness.py's _claim_ctty setup): the signal
+/// fires wherever the console pty is the VMM's controlling terminal — tmux
+/// TIOCSCTTYs its panes (real panes), the harness setsid + TIOCSCTTYs its
+/// pty — and NEVER where it isn't (no ctty: no live resize; the boot
+/// geometry stands, and host_tty_size falls back to 120x40 off-tty). The
+/// per-iteration TIOCGWINSZ poll that used to back this up was measured
+/// redundant wherever the ctty holds and was removed; set_size dedupes
+/// repeat signals against the device's own config.
 static HOST_WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn winch_handler(_sig: i32) {
@@ -1213,8 +1261,22 @@ impl Vmm {
         // macOS keeps its own inline console path (process_console_tx);
         // the shared filter exists only where it is drained.
         #[cfg(not(target_os = "macos"))]
+        // One filter per stream (see ConsoleTxFilter): the console port's
+        // stream (the guest init/kernel output) and the host device port's
+        // stream (the interactive session). Replies go back through each
+        // stream's own port RX queue.
         let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
             exit_marker.trim_end_matches(':').to_string(),
+            crate::virtio::console::CONSOLE_RX,
+        )));
+        let port_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
+            exit_marker.trim_end_matches(':').to_string(),
+            // The port stream's query replies (ESC[6n etc. written by the
+            // session to its own stdout) must come back through the PORT
+            // input: the session's stdin is the port (the session agent
+            // bridges a pty to it), so the replies land in the port RX
+            // queue to reach the session's line editor.
+            crate::virtio::console::PORT_RX,
         )));
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1224,6 +1286,7 @@ impl Vmm {
             console.clone(),
             memory.clone(),
             console_tx_filter.clone(),
+            port_tx_filter.clone(),
             host.irq_lock.clone(),
             host.irq_levels.clone(),
             net_kick_stop.clone(),
@@ -1246,6 +1309,8 @@ impl Vmm {
             console,
             #[cfg(not(target_os = "macos"))]
             console_tx_filter,
+            #[cfg(not(target_os = "macos"))]
+            port_tx_filter,
             #[cfg(target_arch = "x86_64")]
             mmio_base,
             #[cfg(target_os = "windows")]
@@ -1583,19 +1648,80 @@ impl Vmm {
 
         if (mw + MMIO_OFF_CONSOLE..mw + MMIO_OFF_CONSOLE + 0x200).contains(&addr) {
             let mut console = self.console.lock().unwrap();
+            let is_reset = addr - mw - MMIO_OFF_CONSOLE == super::virtio::REG_STATUS && val == 0;
             let notify = console.mmio_write(addr - mw - MMIO_OFF_CONSOLE, val as u32);
+            if is_reset {
+                // TEMP DIAGNOSTIC: the driver reset the console device —
+                // dump the kernel log ring and the vring state.
+                crate::vmm_trace::dump_guest_ram_lines(
+                    self.memory.as_shared_slice(),
+                    "not syncing",
+                    "PANIC",
+                    8,
+                    400,
+                );
+                crate::vmm_trace::dump_guest_ram_lines(
+                    self.memory.as_shared_slice(),
+                    "Error",
+                    "ERR",
+                    8,
+                    400,
+                );
+                crate::vmm_trace::dump_guest_ram_lines(
+                    self.memory.as_shared_slice(),
+                    "virtio",
+                    "VIRTIO",
+                    8,
+                    400,
+                );
+                crate::vmm_trace::dump_guest_ram_lines(
+                    self.memory.as_shared_slice(),
+                    "hvc",
+                    "HVC",
+                    8,
+                    400,
+                );
+            }
             if let Some(qidx) = notify {
-                if qidx == 0 {
-                    // RX queue: the guest posted buffers; drain any pending
-                    // host input into them.
-                    let (_, dropped) =
-                        console.drain_rx_backlog(self.memory.as_shared_slice(), RAM_BASE);
-                    if dropped > 0 {
-                        console_eprintln(&format!(
-                            "sandal: dropped {dropped} bytes of console input the guest \
-                             refused for too long (a full tty or a busy guest): re-send it"
-                        ));
+                match qidx as usize {
+                    crate::virtio::console::CONSOLE_RX
+                    | crate::virtio::console::PORT_RX => {
+                        // An RX queue: the guest posted buffers; drain any
+                        // pending host input into them.
+                        let (_, dropped) = console.drain_rx_backlog(
+                            self.memory.as_shared_slice(),
+                            RAM_BASE,
+                            qidx as usize,
+                        );
+                        if dropped > 0 {
+                            console_eprintln(&format!(
+                                "sandal: dropped {dropped} bytes of console input the guest \
+                                 refused for too long (a full tty or a busy guest): re-send it"
+                            ));
+                        }
                     }
+                    crate::virtio::console::CONTROL_RX => {
+                        // The control queue: retry the port-instantiation
+                        // sequence (a no-op once delivered). Its interrupt
+                        // lands through the next line update.
+                        let control_tx = console.process_tx(
+                            self.memory.as_shared_slice(),
+                            RAM_BASE,
+                            crate::virtio::console::CONTROL_TX,
+                        );
+                        if !control_tx.is_empty() {
+                            crate::vmm_trace::write_console_io(format_args!(
+                                "CONTROL_TX bytes={} preview=\"{}\"",
+                                control_tx.len(),
+                                crate::vmm_trace::bytes_preview(&control_tx, 32)
+                            ));
+                        }
+                        console.pump_control_sequence(
+                            self.memory.as_shared_slice(),
+                            RAM_BASE,
+                        );
+                    }
+                    _ => {}
                 }
             }
 
@@ -1882,6 +2008,7 @@ impl Vmm {
             let (_, dropped) = self.console.lock().unwrap().push_rx_and_drain(
                 self.memory.as_shared_slice(),
                 RAM_BASE,
+                crate::virtio::console::CONSOLE_RX,
                 &blob,
             );
             if dropped > 0 {

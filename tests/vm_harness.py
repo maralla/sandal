@@ -29,6 +29,19 @@ CMD_TIMEOUT = 30.0
 class Vm:
     """A sandal VM spawned on its own pty."""
 
+    # The full login setup, minus the foreground pgrp: setsid + TIOCSCTTY
+    # makes the pty the session's controlling terminal, so the kernel's
+    # SIGWINCH-on-resize reaches the VMM (measured: without this the
+    # signal NEVER fires — the spawn's pty has no controlling session).
+    # tcsetpgrp is deliberately NOT set: a foreground pgrp would turn the
+    # terminal's control characters into signals for the VMM itself
+    # (Ctrl-C would kill the VMM instead of riding the input stream into
+    # the guest, where the guest's own session does its job control).
+    @staticmethod
+    def _claim_ctty():
+        os.setsid()
+        fcntl.ioctl(0, 0x540E, 0)  # TIOCSCTTY: fd 0 = this session's ctty
+
     def __init__(self, extra_args=(), verbose_env="SANDAL_TEST_VERBOSE"):
         master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
@@ -40,6 +53,7 @@ class Vm:
             stdout=slave,
             stderr=slave,
             close_fds=True,
+            preexec_fn=self._claim_ctty,
         )
         os.close(slave)
         self.buf = b""

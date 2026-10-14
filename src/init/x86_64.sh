@@ -86,8 +86,18 @@ ln -sf /proc/self/fd/2 /dev/stderr
 
 # PTYs: tmux/screen/shells-with-job-control need the devpts mount for
 # /dev/pts (devtmpfs provides /dev/ptmx but not the pts filesystem).
+# newinstance: a private devpts instance whose ptmx WORKS — the pty lands
+# in THIS instance, so /dev/pts/ptmx and TIOCGPTPEER give the master's
+# own slave (a plain compat mount's ptmx is non-functional, and the pty
+# would land in a different instance than the slave path resolves in).
 mkdir -p /dev/pts
-mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t devpts devpts -o newinstance /dev/pts 2>/dev/null
+# Make /dev/ptmx resolve INTO the devpts instance (the distro layout):
+# devtmpfs's own ptmx node allocates ptys in a different devpts instance
+# than /dev/pts resolves in, so the master and the slave path never meet.
+# A symlink makes every ptmx open land in THIS instance.
+rm -f /dev/ptmx 2>/dev/null
+ln -sf pts/ptmx /dev/ptmx 2>/dev/null
 
 # ── Virtiofs shares (--share host:guest) ──────────────────────────────
 printf '%b' "$SHARES_TEXT" | while IFS= read -r line; do
@@ -117,21 +127,84 @@ stty -F /dev/console rows "$ROWS" cols "$COLS" 2>/dev/null
 # fd gets EBADF on every write, so the attached pane never draws (input
 # still works, which makes the hang extra confusing). `>` for stdout stays
 # one-way; the console is the same file anyway.
-if [ -x /bin/ctty ]; then
-    CMD="$(command -v "$1")"
-    [ -n "$CMD" ] || CMD="$1"
-    shift
-    /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
+# The session transport. The fast path: the virtio-console host device
+# port (/dev/vport*p1 — the chardev the multiport console device creates),
+# bridged to a pty by /bin/portagent: real tty semantics (job control,
+# signals, line editing) at port throughput instead of the console
+# device's per-line round trips. The crafted helpers have no PATH search —
+# resolve the command first, once, for every branch.
+CMD="$(command -v "$1")"
+[ -n "$CMD" ] || CMD="$1"
+# busybox's `command -v` prints the bare applet name for shell builtins
+# (true, false, echo) — a relative path execve(2) refuses (ENOENT: no cwd
+# search). Force an absolute path: applet-name hits are the busybox
+# symlink farm, /bin first.
+case "$CMD" in
+    /*) ;;
+    *) CMD="/bin/$CMD" ;;
+esac
+shift
+PORT=
+for p in /dev/vport*p1; do
+    [ -c "$p" ] && PORT=$p && break
+done
+if [ -n "$PORT" ] && [ -x /bin/portagent ]; then
+    # Tell the VMM the session layout (the token-authenticated marker;
+    # each stream's own filter suppresses the line like the exit protocol):
+    # the WHOLE session — input, echo, and output — rides the host device
+    # port (the portagent bridges a pty to it: real tty semantics at port
+    # throughput). Host stdin must move to the port RX queue. ONE copy,
+    # on the port: the control sequence is BATCHED (one message per posted
+    # head, one pulse — see src/virtio/console.rs), so the port opened
+    # during kernel boot, deterministically, BEFORE this script runs — the
+    # device node above exists iff that happened. The old second copy on
+    # the console existed to deliver the marker while the port stream was
+    # still coming up (the pre-batch control handshake took seconds or
+    # never); it is gone. A missing node takes the else branch — the
+    # console session, console marker and all.
+    echo "${EXIT_TOKEN}SESSION:port" > "$PORT" 2>/dev/null
+    /bin/portagent "$PORT" "$ROWS" "$COLS" "$CMD" "$@"
     STATUS=$?
+    if [ "$STATUS" = 121 ]; then
+        # The pty bridge failed (no pty, or the peer ioctl refused):
+        # the baseline console session instead. The marker moves the host
+        # input back to the console RX queue — both transports again.
+        echo "${EXIT_TOKEN}SESSION:console" > "$PORT" 2>/dev/null
+        echo "${EXIT_TOKEN}SESSION:console"
+        if [ -x /bin/ctty ]; then
+            /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
+            STATUS=$?
+        else
+            setsid sh -c 'exec "$@"' sh "$CMD" "$@" <> /dev/console > /dev/console 2>&1
+            STATUS=$?
+        fi
+    fi
 else
-    setsid sh -c 'exec "$@"' sh "$@" <> /dev/console > /dev/console 2>&1
-    STATUS=$?
+    echo "${EXIT_TOKEN}SESSION:console"
+    if [ -x /bin/ctty ]; then
+        /bin/ctty "$CMD" "$@" <> /dev/console > /dev/console 2>&1
+        STATUS=$?
+    else
+        setsid sh -c 'exec "$@"' sh "$CMD" "$@" <> /dev/console > /dev/console 2>&1
+        STATUS=$?
+    fi
 fi
+# The session child was a session leader on a real tty: its death
+# disassociates the controlling terminal and vhangups it — every
+# inherited fd on that tty is hung up with it, so the exit-marker
+# echo would fast-fail (EIO) and the boot would sail into `poweroff
+# -f` with the marker never delivered. Reopen fresh.
+exec >/dev/console 2>&1
 
 # Exit protocol: the VMM matches `<per-boot token><status>` — a random
 # token delivered in the config, so workload output can never act as the
-# protocol by echoing script text or fixed strings.
-echo "${EXIT_TOKEN}${STATUS}"
+# protocol by echoing script text or fixed strings. BOTH transports
+# carry the marker (each stream's own filter suppresses its copy):
+# whichever side is alive captures the code — the port (the session
+# transport), the console (the fallback). A failed open is just a lost
+# copy; the other still delivers.
+[ -n "$PORT" ] && echo "${EXIT_TOKEN}${STATUS}" > "$PORT" 2>/dev/null
+echo "${EXIT_TOKEN}${STATUS}" >/dev/console 2>/dev/null
 poweroff -f
 # Fallback if poweroff is not serviced.
 sleep 5

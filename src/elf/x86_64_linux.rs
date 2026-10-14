@@ -46,6 +46,7 @@ pub const MS_BIND: u32 = 0x1000;
 pub const SIGCHLD: u32 = 17;
 
 // ── Terminal ──────────────────────────────────────────────────────────
+/// Terminal ioctls.
 pub const TIOCSCTTY: u32 = 0x540E;
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;

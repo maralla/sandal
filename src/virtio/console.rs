@@ -5,9 +5,24 @@
 /// terminal I/O, batching characters through virtqueues instead of trapping
 /// per-byte.
 ///
-/// Two queues:
-///   - Queue 0 (receiveq / RX): host → guest (stdin keypresses)
-///   - Queue 1 (transmitq / TX): guest → host (stdout output)
+/// Two ports, six queues (virtio-console "multiport"; see
+/// [`VirtioConsoleDevice::pump_control_sequence`]):
+///   - port 0 — the console port (hvc0): kernel printk, the guest init, and
+///     the VMM's shutdown/export protocol.
+///   - port 1 — a host device port (/dev/virtio-ports/vport0p1): the
+///     interactive session rides a guest pty bridged to this port by the
+///     guest-side agent, because the console port's tty path spends one full
+///     hypervisor round trip per output LINE (measured ~150 KB/s) while the
+///     host port moves whole buffers per round trip.
+///
+/// Queues (two per port, plus one control pair — the order the guest driver
+/// requests them in, see its init_vqs):
+///   - queue 0: console RX (host → guest)
+///   - queue 1: console TX (guest → host)
+///   - queue 2: control RX (host → guest control messages)
+///   - queue 3: control TX (guest → host control replies)
+///   - queue 4: port RX (host → guest)
+///   - queue 5: port TX (guest → host)
 use std::mem;
 
 use super::*;
@@ -16,13 +31,45 @@ use super::*;
 const VIRTIO_ID_CONSOLE: u32 = 3;
 
 const QUEUE_SIZE: u32 = 128;
-const NUM_QUEUES: usize = 2;
+const NUM_QUEUES: usize = 6;
 
-const RX_QUEUE: usize = 0;
-const TX_QUEUE: usize = 1;
+/// Queue roles (the guest driver's own ordering; see the module docs).
+pub const CONSOLE_RX: usize = 0;
+pub const CONSOLE_TX: usize = 1;
+pub const CONTROL_RX: usize = 2;
+pub const CONTROL_TX: usize = 3;
+pub const PORT_RX: usize = 4;
+pub const PORT_TX: usize = 5;
 
 /// Feature bit: console size (cols, rows) is available in config space.
 const VIRTIO_CONSOLE_F_SIZE: u64 = 1 << 0;
+/// Feature bit: multiple ports (the host device port).
+const VIRTIO_CONSOLE_F_MULTIPORT: u64 = 1 << 1;
+
+/// How many ports the device offers (the console port + the host port). The
+/// guest driver validates this against its own maximum (0x8000) and requests
+/// (ports + 1) * 2 queues.
+const MAX_NR_PORTS: u32 = 2;
+
+/// Control message events (the guest driver's uapi numbering).
+const CTRL_PORT_ADD: u16 = 1;
+#[allow(dead_code)]
+const CTRL_PORT_REMOVE: u16 = 2;
+#[allow(dead_code)]
+const CTRL_PORT_READY: u16 = 3;
+const CTRL_CONSOLE_PORT: u16 = 4;
+#[allow(dead_code)]
+const CTRL_RESIZE: u16 = 5;
+const CTRL_PORT_OPEN: u16 = 6;
+
+/// One control message: { u32 id, u16 event, u16 value }.
+fn control_message(id: u32, event: u16, value: u16) -> [u8; 8] {
+    let mut m = [0u8; 8];
+    m[0..4].copy_from_slice(&id.to_le_bytes());
+    m[4..6].copy_from_slice(&event.to_le_bytes());
+    m[6..8].copy_from_slice(&value.to_le_bytes());
+    m
+}
 
 /// ARM64 Data Abort ISS `SAS` field: access size for the faulting load/store.
 #[inline]
@@ -52,6 +99,41 @@ fn read_console_config_le(cfg: &[u8; 16], byte_off: usize, sas: u8) -> u64 {
     }
 }
 
+/// One RX (host → guest) channel's delivery state: the undelivered
+/// backlog (see [`VirtioConsoleDevice::drain_rx_backlog`]).
+pub struct RxChannel {
+    /// Host bytes not yet copied into the guest receiveq — survives `read()`
+    /// when the guest has not posted RX buffers yet.
+    pub backlog: Vec<u8>,
+    /// When the backlog last failed to make progress (the guest refusing
+    /// input). Past the stall timeout the backlog is dropped: a permanently
+    /// refusing guest must not turn host input into a silent infinite wait.
+    pub stall_since: Option<std::time::Instant>,
+    /// A pending terminal-resize record (see [`VirtioConsoleDevice::`]
+    /// `set_resize_record`): delivered WHOLE, in one direct injection ahead
+    /// of the backlog — never through the backlog itself, whose adaptive
+    /// window would split it (a split record leaks its magic into the
+    /// input stream) and whose size an idle session never grew (a host
+    /// zoom on an idle session would resize nothing).
+    pub resize_record: Option<[u8; 8]>,
+}
+
+impl RxChannel {
+    fn new() -> Self {
+        RxChannel {
+            backlog: Vec::new(),
+            stall_since: None,
+            resize_record: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.backlog.clear();
+        self.stall_since = None;
+        self.resize_record = None;
+    }
+}
+
 pub struct VirtioConsoleDevice {
     // MMIO state
     pub device_features_sel: u32,
@@ -66,20 +148,24 @@ pub struct VirtioConsoleDevice {
     pub cols: u16,
     pub rows: u16,
 
-    /// Host stdin (and init blob) not yet copied into the guest receiveq — survives `read()` when
-    /// the guest has not posted RX buffers yet.
-    pub rx_backlog: Vec<u8>,
-    /// When the backlog last failed to make progress (the guest refusing
-    /// input). Past [`RX_STALL_TIMEOUT`] the backlog is dropped: a
-    /// permanently refusing guest must not turn host input into a silent
-    /// infinite wait.
-    pub rx_stall_since: Option<std::time::Instant>,
-    /// Adaptive per-push delivery window (1..=RX_WINDOW_MAX). Grows on
-    /// every accepted push (the guest's true acceptance rate), resets to 1
-    /// on every refused push: delivery runs at what the guest actually
-    /// accepts instead of one byte per drain cycle, and a refusal costs
-    /// only the re-probe.
-    pub rx_window: usize,
+    /// Host→guest delivery state per RX channel: the console port (queue 0)
+    /// and the host device port (queue 4).
+    pub console_rx: RxChannel,
+    pub port_rx: RxChannel,
+
+    /// The port-instantiation control sequence's delivery mask: one bit
+    /// per message, cleared as each message lands in its own posted
+    /// control-RX head (see [`VirtioConsoleDevice::pump_control_sequence`]).
+    /// Covers boot ordering only — a partial batch is re-delivered next
+    /// pump call; once every bit lands the sequence is never touched again.
+    pub control_seq_pending: u8,
+
+    /// True once the guest's init signaled `SESSION:port`: the interactive
+    /// session moved onto the host device port, so host stdin is injected
+    /// into the port RX queue instead of the console RX queue. Set from
+    /// the session marker (token-authenticated like the exit marker) and
+    /// read by the stdin poller under this lock.
+    pub session_input_on_port: bool,
 
     /// Monotonically increments each time the VMM delivers RX data or processes TX.
     /// Used to detect work that arrives between the guest's ISR read of INTERRUPT_STATUS
@@ -97,6 +183,17 @@ impl VirtioConsoleDevice {
     /// VMM thread (stdin + main loop make progress between `vcpu.run()` entries).
     const TX_HEADS_PER_SLICE: u16 = 256;
 
+    /// How long a refusing guest may hold host input before it is dropped.
+    const RX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Maximum host bytes moved into the guest per call: a constant page.
+    /// The old adaptive window (grow on acceptance, reset to 1 on refusal)
+    /// ramped delivery back up over seconds after every refusal — the typed
+    /// line's terminating Enter lagged behind its characters — while the
+    /// driver takes exactly one page per cycle either way (measured in
+    /// kernel-build/linux-7.2.10/drivers/char/virtio_console.c: in_intr
+    /// stashes one PAGE_SIZE buffer per IRQ): the adaptivity was pure lag.
+    const MAX_RX_CHUNK: usize = 4096;
+
     /// The advertised terminal geometry (cols, rows). The guest tty needs a
     /// real window size: without it, fullscreen editors (vi) that size
     /// themselves from TIOCGWINSZ lay out a degenerate 0x0 grid.
@@ -110,14 +207,15 @@ impl VirtioConsoleDevice {
             driver_features: 0,
             driver_features_sel: 0,
             queue_sel: 0,
-            queues: [VirtqState::new(QUEUE_SIZE), VirtqState::new(QUEUE_SIZE)],
+            queues: std::array::from_fn(|_| VirtqState::new(QUEUE_SIZE)),
             status: 0,
             interrupt_status: 0,
             cols,
             rows,
-            rx_backlog: Vec::new(),
-            rx_stall_since: None,
-            rx_window: 1,
+            console_rx: RxChannel::new(),
+            port_rx: RxChannel::new(),
+            control_seq_pending: 0b11111,
+            session_input_on_port: false,
             work_gen: 0,
             work_gen_at_read: 0,
         }
@@ -127,6 +225,10 @@ impl VirtioConsoleDevice {
         let mut cfg = [0u8; 16];
         cfg[0..2].copy_from_slice(&self.cols.to_le_bytes());
         cfg[2..4].copy_from_slice(&self.rows.to_le_bytes());
+        // max_nr_ports (virtio spec §5.3.7): the console port + the host
+        // device port. The guest driver only instantiates hvc0 and the
+        // /dev/virtio-ports node after the control sequence says so.
+        cfg[4..8].copy_from_slice(&MAX_NR_PORTS.to_le_bytes());
         cfg
     }
 
@@ -145,6 +247,19 @@ impl VirtioConsoleDevice {
         true
     }
 
+    /// The number of queues the guest set up (the port queues exist only
+    /// in the multiport device; single-port guests keep the session on the
+    /// console queues).
+    pub fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
+    /// True once the control handshake's whole sequence has been DELIVERED
+    /// (see [`VirtioConsoleDevice::pump_control_sequence`]). Delivery is
+    /// not processing: the guest driver's work may not have consumed the
+    /// last message yet, so the caller must keep pulsing the interrupt
+    /// until the guest's own behavior confirms it (the port writes flow).
+
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     ///
     /// `sas` is the ARM64 Data Abort ISS access size (`0` byte … `3` doubleword). Required for
@@ -160,7 +275,8 @@ impl VirtioConsoleDevice {
             REG_DEVICE_ID => VIRTIO_ID_CONSOLE as u64,
             REG_VENDOR_ID => VIRTIO_MMIO_VENDOR as u64,
             REG_DEVICE_FEATURES => {
-                let features = VIRTIO_F_VERSION_1 | VIRTIO_CONSOLE_F_SIZE;
+                let features =
+                    VIRTIO_F_VERSION_1 | VIRTIO_CONSOLE_F_SIZE | VIRTIO_CONSOLE_F_MULTIPORT;
                 if self.device_features_sel == 0 {
                     features & 0xFFFFFFFF
                 } else {
@@ -230,7 +346,7 @@ impl VirtioConsoleDevice {
                     // counters start over — ours must too, or we drain phantoms.
                     if value != 0 && !was_ready {
                         crate::vmm_trace::write_console_io(format_args!(
-                            "TX_QUEUE_SETUP sel={sel} avail={:#x} used={:#x} num={} last_avail={}",
+                            "QUEUE_SETUP q={sel} avail={:#x} used={:#x} num={} last_avail={}",
                             self.queues[sel].avail_addr,
                             self.queues[sel].used_addr,
                             self.queues[sel].num,
@@ -255,7 +371,7 @@ impl VirtioConsoleDevice {
                 if value == 0 {
                     crate::vmm_trace::write_console_io(format_args!(
                         "TX_RESET last_avail={}",
-                        self.queues[TX_QUEUE].last_avail_idx
+                        self.queues[CONSOLE_TX].last_avail_idx
                     ));
                     self.reset();
                 }
@@ -293,9 +409,10 @@ impl VirtioConsoleDevice {
         self.status = 0;
         self.interrupt_status = 0;
         self.driver_features = 0;
-        self.rx_backlog.clear();
-        self.rx_stall_since = None;
-        self.rx_window = 1;
+        self.console_rx.reset();
+        self.port_rx.reset();
+        self.control_seq_pending = 0b11111;
+        self.session_input_on_port = false;
         self.work_gen = 0;
         self.work_gen_at_read = 0;
         for q in &mut self.queues {
@@ -303,89 +420,167 @@ impl VirtioConsoleDevice {
         }
     }
 
-    /// Append host bytes then inject as much as the guest receiveq can take. Returns whether any
-    /// byte was delivered (and thus `interrupt_status` may be non-zero).
+    fn rx_channel(&mut self, q: usize) -> Option<&mut RxChannel> {
+        match q {
+            CONSOLE_RX => Some(&mut self.console_rx),
+            PORT_RX => Some(&mut self.port_rx),
+            _ => None,
+        }
+    }
+
+    /// Append host bytes then inject as much as the guest receiveq can take.
+    /// `q` is the RX queue (CONSOLE_RX or PORT_RX). Returns whether any byte
+    /// was delivered (and thus `interrupt_status` may be non-zero), plus the
+    /// byte count dropped after refusing input for the stall timeout.
     pub fn push_rx_and_drain(
         &mut self,
         memory: &mut [u8],
         ram_base: u64,
+        q: usize,
         chunk: &[u8],
     ) -> (bool, usize) {
-        if !chunk.is_empty() {
-            self.rx_backlog.extend_from_slice(chunk);
+        if let Some(ch) = self.rx_channel(q) {
+            if !chunk.is_empty() {
+                ch.backlog.extend_from_slice(chunk);
+            }
         }
-        self.drain_rx_backlog(memory, ram_base)
+        self.drain_rx_backlog(memory, ram_base, q)
     }
 
-    /// How long a refusing guest may hold host input before it is dropped.
-    const RX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    /// Absolute cap on the adaptive delivery window.
-    const RX_WINDOW_MAX: usize = 4096;
+    /// Retry injecting the backlog of RX queue `q` (e.g. after the guest
+    /// posts new receiveq buffers). Returns `(progressed, dropped)`:
+    /// `dropped` is the byte count the guest refused for longer than the
+    /// stall timeout and that was discarded. Dropping is deliberate: a guest
+    /// that stops accepting input (a full tty line discipline, a busy guest)
+    /// must not turn host input into a silent infinite wait — the input is
+    /// lost and the caller reports it, so the sender can retry.
+    /// Queue a terminal-resize record for the port input stream (see the
+    /// session agent's RESIZE_MAGIC): delivered WHOLE, in ONE direct
+    /// injection ahead of the backlog — never through the backlog itself:
+    /// its adaptive window would split the record (a split record leaks
+    /// its magic into the input stream), and an idle session's window
+    /// never grew past 1, so a window-gated record would never deliver
+    /// at all (a host zoom on an idle session would resize nothing). It
+    /// is idempotent, and the boot geometry never depends on it (the init
+    /// script passes it on the agent's command line).
+    pub fn set_resize_record(&mut self, q: usize, record: [u8; 8]) {
+        if let Some(ch) = self.rx_channel(q) {
+            ch.resize_record = Some(record);
+        }
+    }
 
-    /// Retry injecting [`Self::rx_backlog`] (e.g. after the guest posts new
-    /// receiveq buffers). Returns `(progressed, dropped)`: `dropped` is the
-    /// byte count the guest refused for longer than [`RX_STALL_TIMEOUT`]
-    /// and that was discarded. Dropping is deliberate: a guest that stops
-    /// accepting input (a full tty line discipline, a busy guest) must not
-    /// turn host input into a silent infinite wait — the input is lost and
-    /// the caller reports it, so the sender can retry.
-    pub fn drain_rx_backlog(&mut self, memory: &mut [u8], ram_base: u64) -> (bool, usize) {
-        let mut progressed = false;
-        loop {
-            if self.rx_backlog.is_empty() {
-                self.rx_stall_since = None;
-                break;
+    /// The pending resize record, delivered whole if the port's input
+    /// path has a posted buffer. Returns whether anything was delivered
+    /// (the caller pulses).
+    pub fn drain_resize_record(&mut self, memory: &mut [u8], ram_base: u64, q: usize) -> bool {
+        let record = match self.rx_channel(q) {
+            Some(ch) => match ch.resize_record {
+                Some(record) => record,
+                None => return false,
+            },
+            None => return false,
+        };
+        // ONE injection, whole: the record never rides the backlog (whose
+        // adaptive window would split it — a split record leaks its magic
+        // into the input stream, and an idle session's window never grew
+        // past 1, so a window-gated record would never deliver at all —
+        // a host zoom on an idle session would resize nothing). The one
+        // direct injection is atomic by construction: the whole 8 bytes
+        // in one buffer, one completion.
+        let n = self.inject_rx(memory, ram_base, q, &record);
+        if n == record.len() {
+            if let Some(ch) = self.rx_channel(q) {
+                ch.resize_record = None;
             }
-            let mut pending = mem::take(&mut self.rx_backlog);
-            let chunk = &pending[..pending.len().min(self.rx_window)];
-            let n = self.inject_rx(memory, ram_base, chunk);
+            return true;
+        }
+        false
+    }
+
+    pub fn drain_rx_backlog(
+        &mut self,
+        memory: &mut [u8],
+        ram_base: u64,
+        q: usize,
+    ) -> (bool, usize) {
+        let mut progressed = false;
+        // The resize record goes first, whole: it must never interleave
+        // with the backlog (a split record leaks its magic; see
+        // set_resize_record).
+        if self.drain_resize_record(memory, ram_base, q) {
+            progressed = true;
+        }
+        loop {
+            let mut pending = match self.rx_channel(q) {
+                Some(ch) => {
+                    if ch.backlog.is_empty() {
+                        ch.stall_since = None;
+                        break;
+                    }
+                    mem::take(&mut ch.backlog)
+                }
+                None => return (progressed, 0),
+            };
+            // A constant page per call — the old adaptive window (grow on
+            // acceptance, reset to 1 on refusal) only added ramp lag: the
+            // driver takes one page per cycle either way (see MAX_RX_CHUNK).
+            let chunk_len = pending.len().min(Self::MAX_RX_CHUNK);
+            let n = self.inject_rx(memory, ram_base, q, &pending[..chunk_len]);
             pending.drain(..n);
-            self.rx_backlog = pending;
+            let Some(ch) = self.rx_channel(q) else {
+                return (progressed, 0);
+            };
+            ch.backlog = pending;
             if n == 0 {
                 crate::vmm_trace::write_console_io(format_args!(
-                    "RX_BACKLOG_STALL pending_len={} window={}",
-                    self.rx_backlog.len(),
-                    self.rx_window
+                    "RX_BACKLOG_STALL q={q} pending_len={}",
+                    ch.backlog.len()
                 ));
-                // Refused: reset the window and start the stall timer.
-                self.rx_window = 1;
-                let since = *self.rx_stall_since.get_or_insert_with(std::time::Instant::now);
+                // Refused: start (or keep) the stall timer.
+                let since = *ch.stall_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= Self::RX_STALL_TIMEOUT {
-                    let dropped = self.rx_backlog.len();
-                    self.rx_backlog.clear();
-                    self.rx_stall_since = None;
+                    let dropped = ch.backlog.len();
+                    ch.backlog.clear();
+                    ch.stall_since = None;
                     return (progressed, dropped);
                 }
                 break;
             }
             progressed = true;
-            self.rx_stall_since = None;
-            // Accepted: grow the window toward the guest's true rate.
-            self.rx_window = (self.rx_window * 2).min(Self::RX_WINDOW_MAX);
+            ch.stall_since = None;
         }
         (progressed, 0)
     }
 
-    /// Process the TX queue (guest → host), at most [`Self::TX_HEADS_PER_SLICE`] heads per call.
-    pub fn process_tx(&mut self, memory: &mut [u8], ram_base: u64) -> Vec<u8> {
-        let q = self.queues[TX_QUEUE].clone();
-        if !q.ready || q.num == 0 {
+    /// Process TX queue `q` (guest → host): CONSOLE_TX (the console/init
+    /// stream), CONTROL_TX (the driver's control replies), or PORT_TX (the
+    /// session stream). Returns the captured bytes RAW — the caller applies
+    /// stream policy (the console stream's \n → \r\n translation, the
+    /// marker/query filter); the port stream passes verbatim (the guest pty
+    /// already formed those bytes).
+    ///
+    /// At most [`Self::TX_HEADS_PER_SLICE`] heads per call.
+    pub fn process_tx(&mut self, memory: &mut [u8], ram_base: u64, q: usize) -> Vec<u8> {
+        let qs = self.queues[q].clone();
+        if !qs.ready || qs.num == 0 {
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_SKIP reason=queue_not_ready ready={} num={}",
-                q.ready, q.num
+                "TX_SKIP q={q} reason=queue_not_ready ready={} num={}",
+                qs.ready, qs.num
             ));
             return Vec::new();
         }
 
-        let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
+        let avail_idx = match read_avail_idx(memory, ram_base, qs.avail_addr) {
             Some(idx) => idx,
             None => {
-                crate::vmm_trace::write_console_io(format_args!("TX_SKIP reason=bad_avail_ring"));
+                crate::vmm_trace::write_console_io(format_args!(
+                    "TX_SKIP q={q} reason=bad_avail_ring"
+                ));
                 return Vec::new();
             }
         };
 
-        let mut last_avail = self.queues[TX_QUEUE].last_avail_idx;
+        let mut last_avail = self.queues[q].last_avail_idx;
         // Overtake guard (guest lapping the avail ring): the avail ring has
         // only `num` slots: once the driver is a full ring ahead of
         // `last_avail`, the slot for every older submission has been
@@ -398,25 +593,25 @@ impl VirtioConsoleDevice {
         // tmux gets EAGAIN once and its write event is never re-armed).
         // Only the last `num` submissions have trustworthy slots: drop the
         // contaminated prefix and drain that window.
-        let num16 = q.num as u16;
+        let num16 = qs.num as u16;
         if num16 != 0 && avail_idx.wrapping_sub(last_avail) > num16 {
             let target = avail_idx.wrapping_sub(num16);
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_OVERTAKE last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
+                "TX_OVERTAKE q={q} last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
                 target
             ));
             last_avail = target;
         }
 
         if last_avail == avail_idx {
-            let used_idx = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+            let used_idx = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_SKIP reason=no_new_heads last_avail={last_avail} avail_idx={avail_idx} used_idx={used_idx} avail_addr={:#x} used_addr={:#x} num={} ready={}",
-                q.avail_addr, q.used_addr, q.num, q.ready
+                "TX_SKIP q={q} reason=no_new_heads last_avail={last_avail} avail_idx={avail_idx} used_idx={used_idx} avail_addr={:#x} used_addr={:#x} num={} ready={}",
+                qs.avail_addr, qs.used_addr, qs.num, qs.ready
             ));
         }
         let mut used_count = 0u16;
-        let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+        let used_idx_start = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
         let mut output = Vec::new();
 
         while last_avail != avail_idx {
@@ -424,12 +619,12 @@ impl VirtioConsoleDevice {
                 break;
             }
 
-            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
+            let desc_head = match read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num)
             {
                 Some(d) => d,
                 None => {
                     crate::vmm_trace::write_console_io(format_args!(
-                        "TX_SKIP reason=bad_avail_ring_entry last_avail={last_avail} avail_idx={avail_idx}"
+                        "TX_SKIP q={q} reason=bad_avail_ring_entry last_avail={last_avail} avail_idx={avail_idx}"
                     ));
                     break;
                 }
@@ -439,7 +634,7 @@ impl VirtioConsoleDevice {
             let mut idx = desc_head;
             let mut chain_len = 0u32;
             while let Some((addr, len, flags, next)) =
-                read_descriptor(memory, ram_base, q.desc_addr, idx)
+                read_descriptor(memory, ram_base, qs.desc_addr, idx)
             {
                 // TX descriptors are device-readable (no WRITE flag)
                 if flags & VIRTQ_DESC_F_WRITE == 0 {
@@ -462,16 +657,16 @@ impl VirtioConsoleDevice {
             if write_used_ring(
                 memory,
                 ram_base,
-                q.used_addr,
+                qs.used_addr,
                 used_idx_start.wrapping_add(used_count),
-                q.num,
+                qs.num,
                 desc_head as u32,
                 chain_len,
             )
             .is_none()
             {
                 crate::vmm_trace::write_console_io(format_args!(
-                    "TX_SKIP reason=bad_used_ring used_count={used_count}"
+                    "TX_SKIP q={q} reason=bad_used_ring used_count={used_count}"
                 ));
                 break;
             }
@@ -479,19 +674,19 @@ impl VirtioConsoleDevice {
             last_avail = last_avail.wrapping_add(1);
         }
 
-        self.queues[TX_QUEUE].last_avail_idx = last_avail;
+        self.queues[q].last_avail_idx = last_avail;
 
         if used_count > 0 {
             let _ = write_used_idx(
                 memory,
                 ram_base,
-                q.used_addr,
+                qs.used_addr,
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
             self.work_gen += 1;
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_SET_IRQ used_count={used_count} out_bytes={} irq_status={} last_avail={}",
+                "TX_SET_IRQ q={q} used_count={used_count} out_bytes={} irq_status={} last_avail={}",
                 output.len(),
                 self.interrupt_status,
                 last_avail
@@ -500,20 +695,96 @@ impl VirtioConsoleDevice {
 
         if crate::vmm_trace::console_io_enabled() && used_count > 0 {
             crate::vmm_trace::write_console_io(format_args!(
-                "TX_BATCH heads={} out_bytes={} preview=\"{}\"",
-                used_count,
+                "TX_BATCH q={q} heads={used_count} out_bytes={} preview=\"{}\"",
                 output.len(),
                 crate::vmm_trace::bytes_preview(&output, 32)
             ));
         }
 
-        // The host terminal runs with output processing disabled (verbatim
-        // escape passthrough), so the \n → \r\n translation has to happen
-        // here — once, at the single point every caller drains this through.
-        super::onlcr(output)
+        output
     }
 
-    /// Dump the raw vring state of both queues from guest RAM (wedge
+    /// Deliver the port-instantiation control sequence into the control RX
+    /// queue, once: the guest driver only instantiates the console port
+    /// (hvc0) and the host device port (/dev/virtio-ports/vport0p1) after
+    /// these messages, so without them NO console exists at all — this is
+    /// what keeps every platform's console alive in multiport mode.
+    ///
+    /// The sequence is delivered as soon as the driver has posted control RX
+    /// buffers (its probe does that before anything else), one 8-byte
+    /// message per buffer — exactly the shape its poll loop expects. It is
+    /// idempotent and needs no handshake: the driver's own DEVICE_READY
+    /// reply on CONTROL_TX is not waited for, so no platform has to drain
+    /// the control queue to get its console.
+    ///
+    ///   - PORT_ADD(0)      → the console port (its RX buffers are posted
+    ///                        by the driver itself, exactly as before)
+    ///   - PORT_ADD(1)      → the host device port
+    ///   - CONSOLE_PORT(0)  → instantiate hvc0 on port 0
+    ///   - PORT_OPEN(1)     → mark the host port connected (its file
+    ///                        operations refuse I/O until this)
+    ///
+    /// Returns true if the sequence was delivered this call (the caller must
+    /// raise the device interrupt so the driver's control work runs).
+    /// Deliver the port-instantiation control sequence, BATCHED: every
+    /// message in its own posted control-RX head, in one pump call, with
+    /// one pulse (the caller raises the line once per delivery). This used
+    /// to be a five-field proof-gated state machine with a 40-retry
+    /// watchdog, working around "the driver posts exactly ONE control RX
+    /// buffer" — which was never measured: the HOST re-filled the same
+    /// head (`last_avail_idx.wrapping_sub(1)`) and gated each message on
+    /// the driver's reply. MEASURED in the driver
+    /// (kernel-build/linux-7.2.10/drivers/char/virtio_console.c): it posts
+    /// QUEUE_SIZE (128) control heads at probe (`fill_queue` loops until
+    /// `num_free == 0`), and its control work handler LOOPS
+    /// `virtqueue_get_buf` over EVERY filled head in ONE work run — so a
+    /// batched sequence is processed whole, in order, with nothing to
+    /// overwrite and nothing to lose: each message sits in its own
+    /// descriptor until the work run consumes all of them. The delivery
+    /// mask covers boot ordering only (the queue is not ready in the
+    /// first pump calls); a partial batch is re-delivered next call, and
+    /// once every bit lands the sequence is never touched again. No proof
+    /// gating, no stall timing, no watchdog: a guest whose control work
+    /// never runs delivers nothing, and its session falls back to the
+    /// console device (the init script's 121 path) — the same end state
+    /// the watchdog's give-up produced, without the 20 s of re-delivery.
+    pub fn pump_control_sequence(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
+        const SEQ: [(u32, u16, u16); 5] = [
+            (0, CTRL_PORT_ADD, 0),
+            (1, CTRL_PORT_ADD, 0),
+            (0, CTRL_CONSOLE_PORT, 1),
+            (1, CTRL_PORT_OPEN, 1),
+            (0, CTRL_PORT_OPEN, 1),
+        ];
+        if self.control_seq_pending == 0 {
+            return false; // delivered whole, never again
+        }
+        let mut delivered_any = false;
+        for (i, &(id, event, value)) in SEQ.iter().enumerate() {
+            let bit = 1u8 << i;
+            if self.control_seq_pending & bit == 0 {
+                continue;
+            }
+            let msg = control_message(id, event, value);
+            // One message per head, via the same path the input stream
+            // takes: inject_rx advances the used ring and last_avail_idx
+            // per head and sets the vring interrupt itself.
+            let n = self.inject_rx(memory, ram_base, CONTROL_RX, &msg);
+            if n == msg.len() {
+                self.control_seq_pending &= !bit;
+                delivered_any = true;
+                crate::vmm_trace::write_console_io(format_args!(
+                    "CONTROL_SEQ msg={} of {} delivered (batched) pending={:#04x}",
+                    i + 1,
+                    SEQ.len(),
+                    self.control_seq_pending
+                ));
+            }
+        }
+        delivered_any
+    }
+
+    /// Dump the raw vring state of every queue from guest RAM (wedge
     /// diagnostics): the device's `last_avail_idx` beside the rings' own
     /// indices, the full avail-ring head-id window, the full used-ring
     /// (id, len) window, and the descriptor table entries for every id the
@@ -524,40 +795,45 @@ impl VirtioConsoleDevice {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)] // x86_64-only diagnostics
     pub fn dump_vrings(&self, memory: &[u8], ram_base: u64) {
-        for (name, q) in [
-            ("RX", &self.queues[RX_QUEUE]),
-            ("TX", &self.queues[TX_QUEUE]),
-        ] {
-            if !q.ready || q.num == 0 {
-                crate::vmm_trace::write_console_io(format_args!(
-                    "VRING {name} not-ready num={} ready={}",
-                    q.num, q.ready
-                ));
-                continue;
-            }
-            let avail_idx = read_avail_idx(memory, ram_base, q.avail_addr).unwrap_or(0);
-            let used_idx = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+        for q in 0..NUM_QUEUES {
+            self.dump_one_vring(memory, ram_base, q);
+        }
+    }
+
+    /// One queue's vring state (see [`Self::dump_vrings`]).
+    #[cfg(target_os = "linux")]
+    fn dump_one_vring(&self, memory: &[u8], ram_base: u64, q: usize) {
+        let qs = &self.queues[q];
+        if !qs.ready || qs.num == 0 {
             crate::vmm_trace::write_console_io(format_args!(
-                "VRING {name} num={} last_avail(dev)={} avail_idx(ring)={avail_idx} used_idx(ring)={used_idx} desc={:#x} avail={:#x} used={:#x}",
-                q.num, q.last_avail_idx, q.desc_addr, q.avail_addr, q.used_addr,
+                "VRING q={q} not-ready num={} ready={}",
+                qs.num, qs.ready
+            ));
+            return;
+        }
+            let avail_idx = read_avail_idx(memory, ram_base, qs.avail_addr).unwrap_or(0);
+            let used_idx = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
+            crate::vmm_trace::write_console_io(format_args!(
+                "VRING q={q} num={} last_avail(dev)={} avail_idx(ring)={avail_idx} used_idx(ring)={used_idx} desc={:#x} avail={:#x} used={:#x}",
+                qs.num, qs.last_avail_idx, qs.desc_addr, qs.avail_addr, qs.used_addr,
             ));
 
             // Avail ring: the head id in each of the `num` slots.
             let mut slots = String::new();
-            for s in 0..q.num as u16 {
+            for s in 0..qs.num as u16 {
                 let id =
-                    read_avail_ring(memory, ram_base, q.avail_addr, s, q.num).unwrap_or(0xffff);
+                    read_avail_ring(memory, ram_base, qs.avail_addr, s, qs.num).unwrap_or(0xffff);
                 slots.push_str(&format!("{id},"));
             }
             crate::vmm_trace::write_console_io(format_args!(
-                "VRING {name} AVAIL_SLOTS(id per slot 0..num): {slots}"
+                "VRING q={q} AVAIL_SLOTS(id per slot 0..num): {slots}"
             ));
 
             // Used ring: every (id, len) entry in the window.
             let mut entries = String::new();
             let mut used_ids: Vec<u16> = Vec::new();
-            for s in 0..q.num as u16 {
-                match read_used_ring_entry(memory, ram_base, q.used_addr, s, q.num) {
+            for s in 0..qs.num as u16 {
+                match read_used_ring_entry(memory, ram_base, qs.used_addr, s, qs.num) {
                     Some((id, len)) => {
                         entries.push_str(&format!("{id}:{len},"));
                         used_ids.push(id as u16);
@@ -566,85 +842,66 @@ impl VirtioConsoleDevice {
                 }
             }
             crate::vmm_trace::write_console_io(format_args!(
-                "VRING {name} USED_ENTRIES(id:len per slot 0..num): {entries}"
+                "VRING q={q} USED_ENTRIES(id:len per slot 0..num): {entries}"
             ));
 
             // Descriptor table entries for the ids the used ring references.
             used_ids.sort_unstable();
             used_ids.dedup();
             for id in used_ids.iter() {
-                match read_descriptor(memory, ram_base, q.desc_addr, *id) {
+                match read_descriptor(memory, ram_base, qs.desc_addr, *id) {
                     Some((addr, len, flags, next)) => {
                         crate::vmm_trace::write_console_io(format_args!(
-                            "VRING {name} DESC[{id}] addr={addr:#x} len={len} flags={flags:#x} next={next}"
+                            "VRING q={q} DESC[{id}] addr={addr:#x} len={len} flags={flags:#x} next={next}"
                         ));
                     }
                     None => {
                         crate::vmm_trace::write_console_io(format_args!(
-                            "VRING {name} DESC[{id}] unreadable"
+                            "VRING q={q} DESC[{id}] unreadable"
                         ));
                     }
                 }
             }
         }
-    }
-
-    /// Inject a prefix of `data` into the RX queue. Returns **how many bytes** from the start of
-    /// `data` were copied into guest memory and **completed** on the used ring (possibly across
-    /// multiple avail heads). `0` means no progress (no buffers, stale ring, or not ready).
-    /// Maximum host bytes moved into the guest per call.
-    ///
-    /// The guest virtio-console driver pushes each injected buffer into its
-    /// tty in one call and requeues the buffer when the tty will not take
-    /// it all: a chunk larger than the tty's per-push acceptance deadlocks
-    /// the input at the accepted prefix (the receiveq ring never advances
-    /// past the requeued buffer). One byte per call always fits what the
-    /// tty will accept, so the ring advances on every push and delivery
-    /// flows at the guest's true acceptance rate — and stalls only while
-    /// the guest genuinely stops accepting, which is the correct
-    /// backpressure. The rest stays in `rx_backlog`, retried on the
-    /// guest's next buffer post.
-    const MAX_RX_CHUNK: usize = 4096;
-
-    pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, data: &[u8]) -> usize {
+pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, q: usize, data: &[u8]) -> usize {
         if data.is_empty() {
             return 0;
         }
         let data = &data[..data.len().min(Self::MAX_RX_CHUNK)];
 
-        let q = self.queues[RX_QUEUE].clone();
-        if !q.ready || q.num == 0 {
+        let qs = self.queues[q].clone();
+        if !qs.ready || qs.num == 0 {
             crate::vmm_trace::write_console_io(format_args!(
-                "INJECT_RX_SKIP in_len={} reason=queue_not_ready ready={} num={}",
+                "INJECT_RX_SKIP q={q} in_len={} reason=queue_not_ready ready={} num={}",
                 data.len(),
-                q.ready,
-                q.num
+                qs.ready,
+                qs.num
             ));
             return 0;
         }
 
-        let avail_idx = match read_avail_idx(memory, ram_base, q.avail_addr) {
+        let avail_idx = match read_avail_idx(memory, ram_base, qs.avail_addr) {
             Some(idx) => idx,
             None => {
                 crate::vmm_trace::write_console_io(format_args!(
-                    "INJECT_RX_SKIP in_len={} reason=bad_avail_ring",
+                    "INJECT_RX_SKIP q={q} in_len={} reason=bad_avail_ring",
                     data.len()
                 ));
                 return 0;
             }
         };
 
-        let mut last_avail = self.queues[RX_QUEUE].last_avail_idx;
+        let mut last_avail = self.queues[q].last_avail_idx;
 
         // Overtake guard, mirroring `process_tx`: if the driver posted a full
         // ring of RX buffers past `last_avail`, the older slots now hold
         // newer heads and draining them would complete phantom descriptors
         // (BAD_RING in the guest kills the queue permanently). Only trust
         // the last `num` posts.
-        let num16 = q.num as u16;
+        let num16 = qs.num as u16;
         if num16 != 0 && avail_idx.wrapping_sub(last_avail) > num16 {
             crate::vmm_trace::write_console_io(format_args!(
-                "RX_OVERTAKE last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
+                "RX_OVERTAKE q={q} last_avail={last_avail}->{} avail_idx={avail_idx} num={num16}",
                 avail_idx.wrapping_sub(num16)
             ));
             last_avail = avail_idx.wrapping_sub(num16);
@@ -652,24 +909,24 @@ impl VirtioConsoleDevice {
 
         if last_avail == avail_idx {
             crate::vmm_trace::write_console_io(format_args!(
-                "INJECT_RX_SKIP in_len={} reason=no_avail_buffers avail_idx={last_avail}",
+                "INJECT_RX_SKIP q={q} in_len={} reason=no_avail_buffers avail_idx={last_avail}",
                 data.len()
             ));
             return 0;
         }
 
-        let used_idx_start = read_used_idx(memory, ram_base, q.used_addr).unwrap_or(0);
+        let used_idx_start = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
         let mut used_count = 0u16;
         let mut data_offset = 0usize;
         let last_avail_start = last_avail;
         // Cap heads per call so the used ring and `last_avail_idx` stay consistent under load.
-        let max_rx_heads: u16 = (q.num as u16).clamp(1, 64);
+        let max_rx_heads: u16 = (qs.num as u16).clamp(1, 64);
 
         while data_offset < data.len() && last_avail != avail_idx {
             if used_count >= max_rx_heads {
                 break;
             }
-            let desc_head = match read_avail_ring(memory, ram_base, q.avail_addr, last_avail, q.num)
+            let desc_head = match read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num)
             {
                 Some(d) => d,
                 None => break,
@@ -679,7 +936,7 @@ impl VirtioConsoleDevice {
             let mut idx = desc_head;
             let mut chain_written = 0u32;
             while let Some((addr, len, flags, next)) =
-                read_descriptor(memory, ram_base, q.desc_addr, idx)
+                read_descriptor(memory, ram_base, qs.desc_addr, idx)
             {
                 if flags & VIRTQ_DESC_F_WRITE != 0 && data_offset < data.len() {
                     if let Some(offset) = addr.checked_sub(ram_base) {
@@ -710,9 +967,9 @@ impl VirtioConsoleDevice {
             if write_used_ring(
                 memory,
                 ram_base,
-                q.used_addr,
+                qs.used_addr,
                 used_idx_start.wrapping_add(used_count),
-                q.num,
+                qs.num,
                 desc_head as u32,
                 chain_written,
             )
@@ -724,30 +981,30 @@ impl VirtioConsoleDevice {
             last_avail = last_avail.wrapping_add(1);
         }
 
-        self.queues[RX_QUEUE].last_avail_idx = last_avail;
+        self.queues[q].last_avail_idx = last_avail;
 
         if used_count > 0 {
             let _ = write_used_idx(
                 memory,
                 ram_base,
-                q.used_addr,
+                qs.used_addr,
                 used_idx_start.wrapping_add(used_count),
             );
             self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
             self.work_gen += 1;
         }
 
-        let last_avail_end = self.queues[RX_QUEUE].last_avail_idx;
+        let last_avail_end = self.queues[q].last_avail_idx;
         let irq = self.interrupt_status != 0;
         if used_count > 0 {
             crate::vmm_trace::write_console_io(format_args!(
-                "RX_SET_IRQ in_len={} heads={used_count} irq_status={}",
+                "RX_SET_IRQ q={q} in_len={} heads={used_count} irq_status={}",
                 data.len(),
                 self.interrupt_status,
             ));
         }
         crate::vmm_trace::write_console_io(format_args!(
-            "INJECT_RX in_len={} consumed={} heads={} avail={} last_avail {}->{} irq={}",
+            "INJECT_RX q={q} in_len={} consumed={} heads={} avail={} last_avail {}->{} irq={}",
             data.len(),
             data_offset,
             used_count,
@@ -783,5 +1040,13 @@ mod tests {
     fn mmio_config_halfword_rows() {
         let mut c = VirtioConsoleDevice::new(80, 25);
         assert_eq!(c.mmio_read(REG_CONFIG_BASE + 2, 1), 25);
+    }
+
+    #[test]
+    fn mmio_config_word_max_nr_ports() {
+        // The multiport port count: the guest driver reads this to decide how
+        // many ports (and queues) to instantiate.
+        let mut c = VirtioConsoleDevice::new(80, 25);
+        assert_eq!(c.mmio_read(REG_CONFIG_BASE + 4, 2), MAX_NR_PORTS as u64);
     }
 }

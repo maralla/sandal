@@ -2505,7 +2505,23 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "bin/ctty",
-        initramfs::ctty_helper(),
+        initramfs::tools::x86_64::ctty::ctty_helper(),
+        0o755,
+    )?;
+
+    // Session agent: /bin/portagent moves the interactive session onto the
+    // virtio-console host device port (a pty bridged to the port — real
+    // tty semantics at port throughput). Freestanding C built by build.rs
+    // (see portagent.c); the cfg is only emitted when that build succeeded.
+    // The init script falls back to ctty when the helper is missing.
+    #[cfg(sandal_portagent_helper)]
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        &mut alloc,
+        "bin/portagent",
+        initramfs::tools::x86_64::portagent::portagent_helper(),
         0o755,
     )?;
 
@@ -2518,7 +2534,7 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "usr/sbin/sandal-export-resize",
-        &initramfs::export_resize_helper(mmio_base),
+        &initramfs::tools::export_resize_helper(mmio_base),
         0o755,
     )?;
     inject_file(
@@ -2527,7 +2543,7 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "usr/sbin/sandal-export-done",
-        &initramfs::export_done_helper(mmio_base),
+        &initramfs::tools::export_done_helper(mmio_base),
         0o755,
     )?;
     let export_script = initramfs::generate_export_script();
