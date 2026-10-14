@@ -227,6 +227,23 @@ impl GuestRam {
 
         let ptr = ptr as *mut u8;
 
+        // Opt the guest RAM into transparent huge pages. MEASURED (the
+        // host's THP policy is `madvise`, so this is what opts in): the
+        // whole KVM mmu — the EPT behind the guest — works at 4 KB
+        // granularity without it, and that granularity is what made
+        // BOTH ends slow: kvm_destroy_vm walked 65K pages to free 256 MB
+        // (close(vmfd): ~87 ms, the single largest term of the teardown),
+        // and every guest page fault built page tables one page at a time.
+        // With 2 MB huge pages behind it, the mmu works 512x coarser.
+        // On `never` hosts this is a no-op (the old behavior).
+        unsafe {
+            libc::madvise(
+                ptr.cast(),
+                len,
+                libc::MADV_HUGEPAGE,
+            );
+        }
+
         // MAP_ANONYMOUS memory is already zero-filled by the kernel (lazy
         // zero pages until first write) — no explicit memset needed.
         GuestRam { ptr, len }
@@ -244,6 +261,27 @@ impl GuestRam {
     #[allow(clippy::mut_from_ref)]
     pub(crate) fn as_shared_slice(&self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Tear the mapping down NOW, before the process exit path would.
+    ///
+    /// MEASURED: the Drop's munmap never runs — an Arc clone leaks in a
+    /// guest-thread handle, the refcount never reaches zero, and the
+    /// 256 MB mapping falls to the kernel's exit_mm teardown — which
+    /// cost 50-100 ms of wall time AFTER the last userspace byte
+    /// (exit_group). An explicit munmap here is fast (MEASURED:
+    /// munmap of a 67 MB image region: <1 ms), the Drop's own munmap
+    /// of the then-empty range is a no-op, and the exit path has
+    /// nothing left to tear down.
+    pub(crate) fn force_teardown(&self) {
+        #[cfg(not(target_os = "windows"))]
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: VirtualFree in the Drop; nothing to force here.
+        }
     }
 }
 
@@ -944,7 +982,18 @@ pub fn run(args: Args) -> Result<i32> {
 
     #[cfg(target_os = "linux")]
     {
-        vmm.run_loop_kvm(&args)
+        let code = vmm.run_loop_kvm(&args);
+        if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "BOOT_TIMING pre_teardown: {:?}",
+                BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
+            );
+        }
+        // The guest RAM's explicit teardown (see force_teardown): the Arc
+        // refcount never reaches zero (a leaked thread clone), so the
+        // Drop's munmap never runs and the kernel's exit path pays.
+        vmm.memory.force_teardown();
+        code
     }
 
     #[cfg(target_os = "macos")]
@@ -956,6 +1005,7 @@ pub fn run(args: Args) -> Result<i32> {
     {
         vmm.run_loop_whp(&args)
     }
+    // The Vmm drops here (scope end): guest RAM munmap, device teardown.
 }
 
 /// Build the writable overlay data disk (vdb).
@@ -964,20 +1014,35 @@ pub fn run(args: Args) -> Result<i32> {
 /// `ext2::inject_tar_entries`), which the guest init mounts as the overlayfs
 /// upperdir. The image is sized to fit the layer's uncompressed data with
 /// headroom (2× + 16 MB), at least `--disk-size`.
-fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
+fn build_data_disk(args: &Args) -> Result<(Vec<u8>, Vec<crate::virtio::blk::SparseRegion>)> {
     if args.layers.is_empty() {
         let mb = args.disk_size.unwrap_or(1);
-        return crate::ext2::create_empty_ext2(mb * 1024 * 1024);
+        let img = crate::ext2::create_empty_ext2(mb * 1024 * 1024)?;
+        return Ok((img, Vec::new()));
     }
 
     let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
     let t = std::time::Instant::now();
 
+    // The zero-copy pipeline: each layer's decompressed archive stays
+    // one buffer, and the entries span it (crate::tar::TarEntryRef).
+    // The data blocks are RECORDED as sparse regions — served from the
+    // archive by the block device, COW on the first guest write — and
+    // never copied into the image: the copy pass was the load path's
+    // dominant cost (measured ~90 ms for a 148 MB layer, fault-bound:
+    // neither run-coalescing nor a parallel copy moved it, and the
+    // parallel copy thrashed 9x worse — see inject_file_sparse).
+    let mut all_tars: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
     let mut all_entries = Vec::new();
     for layer in &args.layers {
-        let layer_data = fs::read(layer)
-            .map_err(|e| anyhow!("failed to read layer {}: {e}", layer.display()))?;
-        let entries = crate::tar::read_tar_zst(&layer_data)?;
+        // The file-based load path: no serial read of the compressed
+        // file (see read_tar_zst_ref_file) — the chunked container's
+        // workers pread their own chunks.
+        let (tar, mut entries) = crate::tar::read_tar_zst_ref_file(layer)?;
+        for e in &mut entries {
+            e.tar = all_tars.len();
+        }
+        all_tars.push(std::sync::Arc::new(tar));
         all_entries.extend(entries);
     }
 
@@ -1000,13 +1065,28 @@ fn build_data_disk(args: &Args) -> Result<Vec<u8>> {
     }
 
     let t = std::time::Instant::now();
-    crate::ext2::inject_tar_entries(&mut img, &all_entries)?;
+    let mut regions = Vec::new();
+    crate::ext2::inject_tar_entries_ref(
+        &mut img,
+        &all_tars,
+        &all_entries,
+        &mut regions,
+    )?;
+    drop(all_tars); // the regions own their sources now
 
     if timing {
-        eprintln!("BOOT_TIMING   ext2_inject: {:?}", t.elapsed());
+        eprintln!(
+            "BOOT_TIMING   ext2_inject: {:?} ({} sparse regions, {} MB recorded)",
+            t.elapsed(),
+            regions.len(),
+            regions.iter().map(|r| r.len).sum::<usize>() / (1024 * 1024)
+        );
     }
 
-    Ok(img)
+    // The image and its sparse overlays travel together: the caller wires
+    // the regions into the device (the image alone serves zeros where
+    // the regions map).
+    Ok((img, regions))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1237,7 +1317,7 @@ impl Vmm {
         };
 
         #[cfg(target_os = "linux")]
-        let host = {
+        let mut host = {
             let irq_lock = Arc::new(Mutex::new(()));
             let irq_levels = linux::new_irq_levels();
             let (stdin_thread, stdin_stop_w) = linux::spawn_stdin_poller(
@@ -1251,6 +1331,8 @@ impl Vmm {
                 irq_lock,
                 stdin_stop_w,
                 stdin_thread: Some(stdin_thread),
+                stop_fd: -1,
+                net_thread: None,
                 irq_levels,
             }
         };
@@ -1280,17 +1362,25 @@ impl Vmm {
         )));
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        linux::spawn_net_kicker(
-            vm.clone(),
-            net.clone(),
-            console.clone(),
-            memory.clone(),
-            console_tx_filter.clone(),
-            port_tx_filter.clone(),
-            host.irq_lock.clone(),
-            host.irq_levels.clone(),
-            net_kick_stop.clone(),
-        );
+        {
+            // The net kicker's shutdown wake (see spawn_net_kicker): an
+            // eventfd in its epoll set, written once at shutdown.
+            let stop_fd = unsafe { libc::eventfd(0, 0) };
+            let net_thread = linux::spawn_net_kicker(
+                vm.clone(),
+                net.clone(),
+                console.clone(),
+                memory.clone(),
+                console_tx_filter.clone(),
+                port_tx_filter.clone(),
+                host.irq_lock.clone(),
+                host.irq_levels.clone(),
+                net_kick_stop.clone(),
+                stop_fd,
+            );
+            host.stop_fd = stop_fd;
+            host.net_thread = Some(net_thread);
+        }
 
         #[cfg(not(target_os = "windows"))]
         let mut virtiofs = Vec::new();
@@ -1385,7 +1475,10 @@ impl Vmm {
         // writes its tar onto (the VMM reads it back). Without it, a default
         // tmpfs-mode guest could never export a layer.
         let disk_backed_upper = args.disk_size.is_some() || !args.layers.is_empty();
-        self.data_blk = Some(VirtioBlkDevice::new(build_data_disk(args)?));
+        let (img, regions) = build_data_disk(args)?;
+        let mut blk = VirtioBlkDevice::new(img);
+        blk.add_sparse(regions);
+        self.data_blk = Some(blk);
 
         if timing {
             eprintln!("BOOT_TIMING data_disk: {:?}", t0.elapsed());
@@ -1842,10 +1935,16 @@ impl Vmm {
             "export: DONE hypercall, save_path={:?}",
             self.export_save_path
         );
-        let Some(dev) = self.data_blk.as_ref() else {
+        let Some(dev) = self.data_blk.as_mut() else {
             log::warn!("export done: no data disk");
             return;
         };
+        // Flatten the sparse overlays first: the export reads the image
+        // directly, and the layer's data blocks live in the overlays
+        // (see virtio::blk::SparseRegion). The export is an explicit,
+        // already-expensive operation — the one-time copy is fine here
+        // (it is exactly the copy the boot path skipped).
+        dev.flatten_sparse();
 
         let tar_data = match crate::ext2::read_upper_tar_entries(&dev.disk_image).map(|entries| {
             // Shell history is session state, not guest data: the
@@ -1879,7 +1978,9 @@ impl Vmm {
             }
         };
 
-        let layer_data = match zstd::bulk::compress(&tar_data, 3) {
+        // The chunked container: compression parallelizes across cores
+        // too (see crate::zchunk) — the export's slow direction.
+        let layer_data = match crate::zchunk::compress_chunked(&tar_data, 3) {
             Ok(data) => data,
             Err(e) => {
                 console_eprintln(&format!("sandal: export failed to compress layer: {e}"));

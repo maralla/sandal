@@ -37,7 +37,24 @@ const SIZE_MAX_BYTES: u32 = 32768;
 /// `-ENOSPC` forever and the guest's block queue is stopped permanently.
 const SEG_MAX: u32 = QUEUE_SIZE - 2;
 
-/// Virtio-blk device backed by an in-memory image.
+/// One sparse region: an image byte range served from a source buffer
+/// (the decompressed layer archive) instead of the image — the layer
+/// load path never copies the data blocks into the image (see
+/// ext2::inject_tar_entries_ref). COW on the first guest write: the
+/// region copies into the image and the mapping drops.
+#[derive(Clone)]
+pub struct SparseRegion {
+    /// The image byte offset this region serves.
+    pub image_off: usize,
+    /// The served length.
+    pub len: usize,
+    /// The source buffer (kept alive here — the mapping owns it).
+    pub src: std::sync::Arc<Vec<u8>>,
+    /// The source byte offset.
+    pub src_off: usize,
+}
+
+/// Virtio-blk device backed by an in-memory image plus sparse overlays.
 pub struct VirtioBlkDevice {
     // MMIO state (same pattern as virtio-net)
     pub device_features_sel: u32,
@@ -51,6 +68,8 @@ pub struct VirtioBlkDevice {
 
     // Block device backing store
     pub disk_image: Vec<u8>,
+    /// Sparse overlays, sorted by `image_off` (see [`SparseRegion`]).
+    pub sparse: Vec<SparseRegion>,
     pub capacity_sectors: u64,
 
     /// Monotonically increments each time the VMM completes a request.
@@ -73,9 +92,139 @@ impl VirtioBlkDevice {
             interrupt_status: 0,
             config_generation: 0,
             disk_image,
+            sparse: Vec::new(),
             capacity_sectors,
             work_gen: 0,
             work_gen_at_read: 0,
+        }
+    }
+
+    /// Add sparse regions (sorted by image offset). The layer load path
+    /// records its data runs here instead of copying them into the image.
+    ///
+    /// The regions must be pairwise DISJOINT (the load path records one
+    /// region per allocated block run, and the allocator never hands out
+    /// the same blocks twice). Disjointness is what makes
+    /// `image_off + len` monotonic in the sorted list — the serving
+    /// path's binary search depends on it, so it is checked here, not
+    /// assumed.
+    pub fn add_sparse(&mut self, regions: Vec<SparseRegion>) {
+        self.sparse.extend(regions);
+        self.sparse.sort_by_key(|r| r.image_off);
+        for w in self.sparse.windows(2) {
+            let a_end = w[0].image_off + w[0].len;
+            assert!(
+                a_end <= w[1].image_off,
+                "sparse regions overlap: [{:#x},{:#x}) vs {:#x}",
+                w[0].image_off,
+                a_end,
+                w[1].image_off
+            );
+        }
+    }
+
+    /// The index of the first sparse region that could overlap a byte
+    /// range starting at `off` — a binary search (the regions are
+    /// sorted and disjoint, so `image_off + len` is monotonic: every
+    /// region before this one ends at or before `off`).
+    ///
+    /// MEASURED: the serving path used to walk the whole list per
+    /// request — 6817 regions on a real layer — a linear scan per
+    /// guest read. This is the load path's own list; the guest should
+    /// not pay for its length on every request.
+    fn sparse_start(&self, off: usize) -> usize {
+        self.sparse
+            .partition_point(|r| r.image_off + r.len <= off)
+    }
+
+    /// Flatten every sparse region into the image (the export path: it
+    /// reads the image directly, and the export is an explicit,
+    /// already-expensive operation — the one-time copy is fine there).
+    pub fn flatten_sparse(&mut self) {
+        for r in self.sparse.drain(..) {
+            let end = r.image_off + r.len;
+            if end <= self.disk_image.len() {
+                self.disk_image[r.image_off..end]
+                    .copy_from_slice(&r.src[r.src_off..r.src_off + r.len]);
+            }
+        }
+    }
+
+    /// Serve a read of `dst.len()` bytes at image offset `off`: the
+    /// overlapping sparse regions from their sources, the rest from the
+    /// image. Both are zero where untouched (the image is calloc-backed;
+    /// the source spans only what the layer decoded).
+    fn serve_read(&self, dst: &mut [u8], off: usize) {
+        let end = off + dst.len();
+        let mut done = 0usize;
+        // The regions are sorted and disjoint; the first candidate is at
+        // `sparse_start(off)` and the walk stops at the first region past
+        // the request — O(log n + the few regions a request spans), not a
+        // walk of the whole list.
+        for r in &self.sparse[self.sparse_start(off)..] {
+            let r_end = r.image_off + r.len;
+            if r.image_off >= end {
+                break;
+            }
+            if r_end <= off {
+                continue;
+            }
+            // The image part before this region.
+            let pre = r.image_off.saturating_sub(off + done);
+            if pre > 0 {
+                let p = off + done;
+                let take = pre.min(dst.len() - done);
+                let src = &self.disk_image[p..p + take];
+                dst[done..done + take].copy_from_slice(src);
+                done += take;
+            }
+            // The region's overlapping part, from the source.
+            let ro = (off + done).max(r.image_off);
+            let rlen = r_end.min(end).saturating_sub(ro);
+            if rlen > 0 {
+                let s = r.src_off + (ro - r.image_off);
+                dst[done..done + rlen]
+                    .copy_from_slice(&r.src[s..s + rlen]);
+                done += rlen;
+            }
+            if done >= dst.len() {
+                return;
+            }
+        }
+        // The image part after the last region.
+        if done < dst.len() {
+            let p = off + done;
+            let src = &self.disk_image[p..p + (dst.len() - done)];
+            dst[done..].copy_from_slice(src);
+        }
+    }
+
+    /// COW a write at image offset `off`: every region overlapping
+    /// [off, off+len) copies into the image and drops — whole-region
+    /// (partial overlaps included: the region is at most one file's run,
+    /// and this is a rare, explicit guest write).
+    fn cow_write(&mut self, off: usize, len: usize) {
+        let end = off + len;
+        // The first candidate is at `sparse_start(off)` (see
+        // `sparse_start`); the walk stops at the first region past the
+        // write.
+        let mut i = self.sparse_start(off);
+        while i < self.sparse.len() {
+            let r = &self.sparse[i];
+            let r_end = r.image_off + r.len;
+            if r.image_off >= end {
+                break;
+            }
+            if r_end <= off {
+                i += 1;
+                continue;
+            }
+            let r = self.sparse.remove(i);
+            let dst_end = r.image_off + r.len;
+            if dst_end <= self.disk_image.len() {
+                self.disk_image[r.image_off..dst_end]
+                    .copy_from_slice(&r.src[r.src_off..r.src_off + r.len]);
+            }
         }
     }
 
@@ -370,16 +519,23 @@ impl VirtioBlkDevice {
                         // Read past end — zero-fill
                         let avail = self.disk_image.len().saturating_sub(disk_offset);
                         if avail > 0 {
-                            memory[guest_off..guest_off + avail].copy_from_slice(
-                                &self.disk_image[disk_offset..disk_offset + avail],
-                            );
+                            let mut tmp = vec![0u8; avail];
+                            self.serve_read(&mut tmp, disk_offset);
+                            memory[guest_off..guest_off + avail].copy_from_slice(&tmp);
                         }
                         if avail < len {
                             memory[guest_off + avail..guest_off + len].fill(0);
                         }
-                    } else {
+                    } else if self.sparse.is_empty() {
                         memory[guest_off..guest_off + len]
                             .copy_from_slice(&self.disk_image[disk_offset..disk_offset + len]);
+                    } else {
+                        // The composite view: sparse regions from their
+                        // sources, the rest from the image (see
+                        // SparseRegion).
+                        let mut tmp = vec![0u8; len];
+                        self.serve_read(&mut tmp, disk_offset);
+                        memory[guest_off..guest_off + len].copy_from_slice(&tmp);
                     }
                     disk_offset += len;
                     total_written += len as u32;
@@ -415,6 +571,13 @@ impl VirtioBlkDevice {
                     let needed = disk_offset + len;
                     if needed > self.disk_image.len() {
                         self.disk_image.resize(needed, 0);
+                    }
+
+                    // COW any sparse region this write touches (see
+                    // SparseRegion): the region copies into the image
+                    // and drops, then the write lands in the image.
+                    if !self.sparse.is_empty() {
+                        self.cow_write(disk_offset, len);
                     }
 
                     self.disk_image[disk_offset..disk_offset + len]

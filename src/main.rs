@@ -32,6 +32,7 @@ pub mod unet;
 mod virtio;
 mod vm;
 mod vmm_trace;
+mod zchunk;
 
 use anyhow::Result;
 use clap::Parser;
@@ -87,6 +88,12 @@ fn run_vm(args: Args) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let code = vm::run(args)?;
+        if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "BOOT_TIMING teardown_done: {:?}",
+                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
+            );
+        }
         std::process::exit(code);
     }
 

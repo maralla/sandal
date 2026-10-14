@@ -25,15 +25,109 @@ pub struct TarEntry {
     pub data: Vec<u8>,
 }
 
+/// A borrowed tar entry: the small fields owned, the DATA a span into the
+/// decompressed archive — the load path's zero-copy pipeline. The data
+/// crosses from the decompressor straight into the ext2 image, never
+/// materialized as a per-entry buffer: the old owned path cost a full
+/// extra pass (allocation + fault-zeroing + copy) over the archive.
+#[derive(Debug, Clone)]
+pub struct TarEntryRef {
+    pub path: String,
+    pub mode: u16,
+    pub entry_type: TarEntryType,
+    pub link_target: String,
+    /// The archive this entry's data spans (an index into the load
+    /// path's per-layer archive list).
+    pub tar: usize,
+    /// The data span: `tars[tar][data]`. Empty for non-file entries.
+    pub data: std::ops::Range<usize>,
+}
+
 /// Read a zstd-compressed tar archive (.layer file) and return parsed entries.
 ///
 /// Decompresses the zstd layer, then parses each tar header to extract
 /// files, directories, and symlinks.  Used by the host to inject layer
 /// contents into an ext2 disk image.
-pub fn read_tar_zst(zst_data: &[u8]) -> Result<Vec<TarEntry>> {
-    let tar_data = zstd::decode_all(zst_data).context("Failed to decompress .layer zstd data")?;
+/// Read a zstd-compressed tar archive (.layer FILE) into borrowed
+/// entries — the load path's entry point.
+///
+/// MEASURED: reading the whole compressed file into a buffer first (one
+/// core, page by faulting page) was the load path's dominant cost
+/// (~200 ms of a 310 ms data-disk phase for a 520 MB layer). Here the
+/// file is never read serially: the chunked container's workers `pread`
+/// their own chunks and decode straight out of them (see
+/// [`crate::zchunk::decompress_chunked_file`]); a legacy single-frame
+/// .layer has no parallel path and falls back to the sequential read.
+pub fn read_tar_zst_ref_file(
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, Vec<TarEntryRef>)> {
+    use std::os::unix::fs::FileExt;
 
-    parse_tar(&tar_data)
+    // The magic decides the path — four bytes, no full read.
+    let mut magic = [0u8; 4];
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open layer {}", path.display()))?;
+    file.read_at(&mut magic, 0)?;
+    if magic == crate::zchunk::MAGIC {
+        let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+        let t = std::time::Instant::now();
+        let comp_len = file
+            .metadata()
+            .with_context(|| format!("failed to stat layer {}", path.display()))?
+            .len() as usize;
+        let tar_data = crate::zchunk::decompress_chunked_file(path)?;
+        if timing {
+            eprintln!(
+                "BOOT_TIMING   zstd_decode: {:?} ({} MB compressed → {} MB)",
+                t.elapsed(),
+                comp_len / (1024 * 1024),
+                tar_data.len() / (1024 * 1024)
+            );
+        }
+        let t = std::time::Instant::now();
+        let entries = parse_tar_ref(&tar_data)?;
+        if timing {
+            eprintln!("BOOT_TIMING   tar_parse: {:?}", t.elapsed());
+        }
+        Ok((tar_data, entries))
+    } else {
+        // A legacy single-frame .layer: sequential, no parallel path.
+        let zst_data = std::fs::read(path)
+            .with_context(|| format!("failed to read layer {}", path.display()))?;
+        read_tar_zst_ref(&zst_data)
+    }
+}
+
+/// Read a zstd-compressed tar archive (.layer file, in memory) into
+/// borrowed entries. Decompresses the archive (the caller keeps it
+/// alive — the entries span it) and parses the headers; the data is
+/// NEVER copied out of the archive (see [`TarEntryRef`]).
+pub fn read_tar_zst_ref(zst_data: &[u8]) -> Result<(Vec<u8>, Vec<TarEntryRef>)> {
+    let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
+    let t = std::time::Instant::now();
+    // The chunked container decodes across cores (see crate::zchunk);
+    // a legacy single-frame .layer (the zstd magic) has no parallel path
+    // — no multi-threaded zstd decompression exists — and decodes
+    // sequentially, for files made before the container existed.
+    let tar_data = if crate::zchunk::is_chunked(zst_data) {
+        crate::zchunk::decompress_chunked(zst_data)?
+    } else {
+        zstd::decode_all(zst_data).context("Failed to decompress .layer zstd data")?
+    };
+    if timing {
+        eprintln!(
+            "BOOT_TIMING   zstd_decode: {:?} ({} MB compressed → {} MB)",
+            t.elapsed(),
+            zst_data.len() / (1024 * 1024),
+            tar_data.len() / (1024 * 1024)
+        );
+    }
+    let t = std::time::Instant::now();
+    let entries = parse_tar_ref(&tar_data)?;
+    if timing {
+        eprintln!("BOOT_TIMING   tar_parse: {:?}", t.elapsed());
+    }
+    Ok((tar_data, entries))
 }
 
 /// Parse an uncompressed tar archive into entries.
@@ -45,9 +139,16 @@ pub fn read_tar(tar_data: &[u8]) -> Result<Vec<TarEntry>> {
     parse_tar(tar_data)
 }
 
+/// Parse an uncompressed tar archive into BORROWED entries (see
+/// [`TarEntryRef`]): the entries span `tar_data`, never copied out.
+pub fn read_tar_ref(tar_data: &[u8]) -> Result<Vec<TarEntryRef>> {
+    parse_tar_ref(tar_data)
+}
+
 /// Return the total uncompressed data size of all file entries.
 /// Used to estimate the ext2 disk size needed to hold all layer content.
-pub fn total_data_size(entries: &[TarEntry]) -> usize {
+/// The refs' spans sum to exactly what the owned entries' buffers did.
+pub fn total_data_size(entries: &[TarEntryRef]) -> usize {
     entries.iter().map(|e| e.data.len()).sum()
 }
 
@@ -187,6 +288,24 @@ fn write_octal(field: &mut [u8], value: u64) {
 
 /// Parse an uncompressed tar archive into a list of entries.
 fn parse_tar(data: &[u8]) -> Result<Vec<TarEntry>> {
+    // The owned wrapper: the export path (reading the guest's exported
+    // tar back off the scratch disk) wants owned buffers to re-serialize;
+    // the load path uses parse_tar_ref directly and never pays this copy.
+    Ok(parse_tar_ref(data)?
+        .into_iter()
+        .map(|r| TarEntry {
+            path: r.path,
+            mode: r.mode,
+            entry_type: r.entry_type,
+            link_target: r.link_target,
+            data: data[r.data].to_vec(),
+        })
+        .collect())
+}
+
+/// Parse an uncompressed tar archive into borrowed entries (see
+/// [`TarEntryRef`]). The load path's scanner: header walking only.
+fn parse_tar_ref(data: &[u8]) -> Result<Vec<TarEntryRef>> {
     let block = 512;
     let zero_block = [0u8; 512];
     let mut entries = Vec::new();
@@ -263,23 +382,26 @@ fn parse_tar(data: &[u8]) -> Result<Vec<TarEntry>> {
             String::new()
         };
 
-        // Read file data
+        // The data span: never copied out of the archive (the load path
+        // injects straight from it; the owned wrapper copies for the
+        // export path only).
         let file_data = if entry_type == TarEntryType::File && size > 0 {
             let data_start = pos + block;
             let data_end = data_start + size;
             if data_end > data.len() {
                 break; // Truncated archive
             }
-            data[data_start..data_end].to_vec()
+            data_start..data_end
         } else {
-            Vec::new()
+            0..0
         };
 
-        entries.push(TarEntry {
+        entries.push(TarEntryRef {
             path,
             mode,
             entry_type,
             link_target,
+            tar: 0,
             data: file_data,
         });
 
@@ -411,8 +533,8 @@ mod tests {
 
     #[test]
     fn zstd_layer_roundtrip() {
-        // `read_tar_zst` (host layer loader) must accept what `write_tar`
-        // produces after zstd compression.
+        // `read_tar_zst_ref` (host layer loader) must accept what
+        // `write_tar` produces after zstd compression.
         use std::io::Write;
 
         let entries = vec![dir("bin"), file("bin/tool", b"#!/bin/sh\n", 0o755)];
@@ -421,10 +543,11 @@ mod tests {
         enc.write_all(&tar).unwrap();
         let zst = enc.finish().unwrap();
 
-        let parsed = read_tar_zst(&zst).expect("read generated .layer");
+        let (tar, parsed) = read_tar_zst_ref(&zst).expect("read generated .layer");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].path, "bin");
         assert_eq!(parsed[1].path, "bin/tool");
-        assert_eq!(parsed[1].data, b"#!/bin/sh\n");
+        // The ref path never copies: the entry's span reads the archive.
+        assert_eq!(&tar[parsed[1].data.clone()], b"#!/bin/sh\n");
     }
 }

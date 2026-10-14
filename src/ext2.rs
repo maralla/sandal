@@ -292,6 +292,10 @@ pub fn create_empty_ext2(size_bytes: usize) -> Result<Vec<u8>> {
     let total_free_inodes = num_inodes - (FIRST_FREE_INO as usize - 1);
 
     let mut image = vec![0u8; total_blocks * BLOCK_SIZE];
+    // NOTE: no MADV_HUGEPAGE here — measured twice: no effect on the
+    // sequential injection (this host never delivers the huge pages), and
+    // a 9x REGRESSION on the parallel copy (the fault path thrashes in
+    // THP allocation failure and defrag instead of copying).
 
     // --- Superblock (at byte 1024) ---
     {
@@ -1400,6 +1404,26 @@ fn walk_ext2(image: &[u8], sb: &Ext2Superblock, bgdt: &Ext2BgdTable) -> Result<V
 pub struct Ext2Alloc {
     next_block: usize,
     next_inode: usize,
+    /// The per-SESSION injection caches. The load path injects thousands
+    /// of entries into a fresh image, and every uncached walk is
+    /// O(directory size) PER ENTRY — MEASURED: ~46 ms of metadata pass
+    /// for a 3000-file layer, all of it three re-walks per entry (the
+    /// parent-path walk, the duplicate check, the append walk). Each
+    /// cache has exactly one writer:
+    ///
+    /// * `dir_cache` — `ensure_dir_path`: a resolved path → inode. The
+    ///   load path resolves the same parent path for every file in a
+    ///   directory; one resolution per path.
+    /// * `seen_names` — `add_dir_entry`: every name it has appended. A
+    ///   fresh image can only contain what an earlier entry created, so
+    ///   the first sight of a name cannot exist — the duplicate checks
+    ///   consult this instead of walking the directory.
+    /// * `dir_tails` — `add_dir_entry`: the append tail (block, offset
+    ///   of the last entry) per directory. The append walk is O(entries
+    ///   already injected); the cursor jumps straight to the tail.
+    dir_cache: std::collections::HashMap<String, u32>,
+    seen_names: std::collections::HashSet<(u32, String)>,
+    dir_tails: std::collections::HashMap<u32, (u32, usize)>,
 }
 
 /// Find and mark the first free block at or after global block `from`.
@@ -1696,27 +1720,34 @@ fn try_append_dir_entry_to_block(
     child_ino: u32,
     child_name: &str,
     child_ft: u8,
-) -> Result<bool> {
+    start_at: Option<usize>,
+) -> Result<(bool, usize)> {
     let bs = dir_block.len();
     let new_name_len = child_name.len();
     let new_entry_size = (8 + new_name_len + 3) & !3;
 
-    // Walk to the last entry in this block
-    let mut off = 0usize;
-    let mut last_off: Option<usize> = None;
-    while off + 8 <= bs {
-        let rec_len = u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
-        if rec_len == 0 {
-            break;
+    // Walk to the last entry in this block — or jump straight to a known
+    // tail (`start_at`, the load path's cursor; see add_dir_entry): the
+    // walk is O(entries already injected), and the load path injects
+    // thousands of entries into one directory.
+    let mut last_off: Option<usize> = start_at;
+    if start_at.is_none() {
+        let mut off = 0usize;
+        while off + 8 <= bs {
+            let rec_len = u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
+            if rec_len == 0 {
+                break;
+            }
+            if off + rec_len > bs {
+                anyhow::bail!("Corrupt directory block: entry overruns block boundary");
+            }
+            last_off = Some(off);
+            off += rec_len;
         }
-        if off + rec_len > bs {
-            anyhow::bail!("Corrupt directory block: entry overruns block boundary");
-        }
-        last_off = Some(off);
-        off += rec_len;
     }
 
     // Empty block: place entry at offset 0, consuming the whole block.
+    // The entry at 0 IS the tail — the cursor lands on it.
     let Some(last_off) = last_off else {
         if new_entry_size > bs {
             anyhow::bail!(
@@ -1730,7 +1761,7 @@ fn try_append_dir_entry_to_block(
         dir_block[6] = new_name_len as u8;
         dir_block[7] = child_ft;
         dir_block[8..8 + new_name_len].copy_from_slice(child_name.as_bytes());
-        return Ok(true);
+        return Ok((true, 0));
     };
 
     // Calculate free slack at the end of the last entry.
@@ -1743,7 +1774,10 @@ fn try_append_dir_entry_to_block(
     }
     let free_space = last_rec_len - last_actual;
     if free_space < new_entry_size {
-        return Ok(false);
+        // The tail offset is returned either way: a shorter entry may
+        // still fit in this slack, and the caller's cursor must not
+        // skip a viable insert.
+        return Ok((false, last_off));
     }
 
     // Shrink last entry and append the new one into the reclaimed space.
@@ -1756,7 +1790,8 @@ fn try_append_dir_entry_to_block(
     dir_block[new_off + 7] = child_ft;
     dir_block[new_off + 8..new_off + 8 + new_name_len].copy_from_slice(child_name.as_bytes());
 
-    Ok(true)
+    // The appended entry IS the tail.
+    Ok((true, new_off))
 }
 
 /// Append a new data block to an inode and update inode metadata.
@@ -1848,18 +1883,46 @@ fn add_dir_entry(
     child_name: &str,
     child_ft: u8,
 ) -> Result<()> {
-    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
-    if !inode.is_dir() {
-        anyhow::bail!("add_dir_entry: inode {} is not a directory", dir_ino);
-    }
     if child_name.len() > u8::MAX as usize {
         anyhow::bail!(
             "Directory entry name '{}' exceeds ext2 name length limit",
             child_name
         );
     }
-
     let bs = sb.block_size;
+
+    // The tail cursor: jump straight to the directory's append tail —
+    // O(1) per entry (see Ext2Alloc::dir_tails).
+    if let Some(&(tail_blk, tail_off)) = alloc.dir_tails.get(&dir_ino) {
+        let block_off = tail_blk as usize * bs;
+        let dir_block = &mut image[block_off..block_off + bs];
+        let (inserted, after) = try_append_dir_entry_to_block(
+            dir_block,
+            child_ino,
+            child_name,
+            child_ft,
+            Some(tail_off),
+        )?;
+        if inserted {
+            alloc.dir_tails.insert(dir_ino, (tail_blk, after));
+            alloc.seen_names.insert((dir_ino, child_name.to_string()));
+            return Ok(());
+        }
+        // The tail block is full: a fresh block, no re-walk of the
+        // directory (the rare path — once per block-fill).
+        return append_fresh_dir_block(
+            image, sb, bgdt, alloc, dir_ino, child_ino, child_name, child_ft,
+        );
+    }
+
+    // No cursor: a directory the load path has not appended to yet. A
+    // FRESH directory holds one block with `.` and `..` — the walk
+    // below is over that one block, and the cursor it populates makes
+    // every later entry O(1).
+    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
+    if !inode.is_dir() {
+        anyhow::bail!("add_dir_entry: inode {} is not a directory", dir_ino);
+    }
     let dir_blocks = inode_data_block_numbers(image, sb, &inode)?;
     if dir_blocks.is_empty() {
         anyhow::bail!(
@@ -1868,16 +1931,50 @@ fn add_dir_entry(
         );
     }
 
-    // First try to append in existing blocks.
+    let mut tail = (dir_blocks[0], 0usize);
     for blk in dir_blocks {
         let block_off = blk as usize * bs;
         let dir_block = &mut image[block_off..block_off + bs];
-        if try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft)? {
+        let (inserted, after) = try_append_dir_entry_to_block(
+            dir_block,
+            child_ino,
+            child_name,
+            child_ft,
+            None,
+        )?;
+        tail = (blk, after);
+        if inserted {
+            alloc.dir_tails.insert(dir_ino, tail);
+            alloc.seen_names.insert((dir_ino, child_name.to_string()));
             return Ok(());
         }
     }
+    // Every block is full: the cursor points at the last tail — the
+    // next entry skips this walk — and this one takes the fresh block.
+    alloc.dir_tails.insert(dir_ino, tail);
+    append_fresh_dir_block(
+        image, sb, bgdt, alloc, dir_ino, child_ino, child_name, child_ft,
+    )
+}
 
-    // No room in existing blocks: allocate and append a new directory block.
+/// Allocate a fresh directory block and append the entry at its start
+/// (the tail-block-full path; see add_dir_entry).
+#[allow(clippy::too_many_arguments)]
+fn append_fresh_dir_block(
+    image: &mut [u8],
+    sb: &Ext2Superblock,
+    bgdt: &Ext2BgdTable,
+    alloc: &mut Ext2Alloc,
+    dir_ino: u32,
+    child_ino: u32,
+    child_name: &str,
+    child_ft: u8,
+) -> Result<()> {
+    let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
+    if !inode.is_dir() {
+        anyhow::bail!("append_fresh_dir_block: inode {} is not a directory", dir_ino);
+    }
+    let bs = sb.block_size;
     let new_blk = alloc_block(image, sb, bgdt, alloc)?;
     append_inode_data_block(image, sb, bgdt, alloc, dir_ino, &inode, new_blk)?;
 
@@ -1886,14 +1983,23 @@ fn add_dir_entry(
         *b = 0;
     }
     let dir_block = &mut image[block_off..block_off + bs];
-    let inserted = try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft)?;
+    let (inserted, after) = try_append_dir_entry_to_block(
+        dir_block,
+        child_ino,
+        child_name,
+        child_ft,
+        None,
+    )?;
     if !inserted {
         anyhow::bail!(
             "Not enough space in fresh directory block for entry '{}'",
             child_name
         );
     }
-
+    // The fresh block's entry IS the tail (offset 0): the cursor lands
+    // here and the next entry is O(1).
+    alloc.dir_tails.insert(dir_ino, (new_blk, after));
+    alloc.seen_names.insert((dir_ino, child_name.to_string()));
     Ok(())
 }
 
@@ -1906,6 +2012,15 @@ fn ensure_dir_path(
     alloc: &mut Ext2Alloc,
     path: &str,
 ) -> Result<u32> {
+    // The path cache: the load path resolves the same parent path for
+    // every file in a directory (thousands of files under a handful of
+    // directories) — one resolution per path. A miss is a path the
+    // load path has not created yet; it takes the full walk below,
+    // which for a fresh image only ever resolves paths the load path
+    // itself created (every directory is small and freshly created).
+    if let Some(&ino) = alloc.dir_cache.get(path) {
+        return Ok(ino);
+    }
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_ino = ROOT_INO;
 
@@ -1982,6 +2097,7 @@ fn ensure_dir_path(
         }
     }
 
+    alloc.dir_cache.insert(path.to_string(), current_ino);
     Ok(current_ino)
 }
 
@@ -2000,6 +2116,57 @@ pub fn inject_file(
     data: &[u8],
     perm: u16,
 ) -> Result<()> {
+    inject_file_inner(image, sb, bgdt, alloc, path, data, perm, None)
+}
+
+/// The sparse mode: the data blocks are RECORDED as sparse regions
+/// (served from `src` by the block device, COW on the first guest
+/// write) instead of copied into the image — the layer load path's
+/// composite disk (see virtio::blk::SparseRegion). The metadata
+/// (inode, indirect pointers, directory entry) is written exactly as
+/// the copying path.
+#[allow(clippy::too_many_arguments)]
+pub fn inject_file_sparse(
+    image: &mut [u8],
+    sb: &Ext2Superblock,
+    bgdt: &Ext2BgdTable,
+    alloc: &mut Ext2Alloc,
+    path: &str,
+    src: &std::sync::Arc<Vec<u8>>,
+    src_off: usize,
+    data_len: usize,
+    perm: u16,
+    regions: &mut Vec<crate::virtio::blk::SparseRegion>,
+) -> Result<()> {
+    // The data is a span of the source; validate it once.
+    let data: &[u8] = &src[src_off..src_off + data_len];
+    inject_file_inner(
+        image,
+        sb,
+        bgdt,
+        alloc,
+        path,
+        data,
+        perm,
+        Some((src.clone(), src_off, regions)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inject_file_inner(
+    image: &mut [u8],
+    sb: &Ext2Superblock,
+    bgdt: &Ext2BgdTable,
+    alloc: &mut Ext2Alloc,
+    path: &str,
+    data: &[u8],
+    perm: u16,
+    sparse: Option<(
+        std::sync::Arc<Vec<u8>>,
+        usize,
+        &mut Vec<crate::virtio::blk::SparseRegion>,
+    )>,
+) -> Result<()> {
     let parts: Vec<&str> = path.split('/').collect();
     let (dir_parts, file_name) = parts.split_at(parts.len() - 1);
     let file_name = file_name[0];
@@ -2012,12 +2179,24 @@ pub fn inject_file(
         ensure_dir_path(image, sb, bgdt, alloc, &dir_path)?
     };
 
-    // Check if file already exists
-    let existing = dir_lookup(image, sb, bgdt, dir_ino, file_name)?;
-    if existing.is_some() {
-        // Remove existing entry from directory and rewrite the new one.
-        // For simplicity, we don't reclaim old blocks. Just allocate a new inode.
-        remove_dir_entry(image, sb, bgdt, dir_ino, file_name)?;
+    // A fresh image can only contain what an earlier entry created: the
+    // first sight of a name cannot exist, and a name `add_dir_entry` has
+    // appended is a real duplicate that takes the full walk (remove and
+    // replace). MEASURED: the walk re-scanned the parent directory per
+    // file.
+    if alloc.seen_names.contains(&(dir_ino, file_name.to_string())) {
+        let existing = dir_lookup(image, sb, bgdt, dir_ino, file_name)?;
+        if existing.is_some() {
+            // Remove existing entry from directory and rewrite the new one.
+            // For simplicity, we don't reclaim old blocks. Just allocate a new inode.
+            remove_dir_entry(image, sb, bgdt, dir_ino, file_name)?;
+            // The removal merges the entry's span into its predecessor:
+            // the append cursor may point at the removed entry, and the
+            // entry it points at is now dead (the chain skips past it).
+            // Drop the cursor — the next append takes the full walk and
+            // repopulates it at the true tail.
+            alloc.dir_tails.remove(&dir_ino);
+        }
     }
 
     // Allocate inode
@@ -2035,19 +2214,62 @@ pub fn inject_file(
         block_nums.push(alloc_block(image, sb, bgdt, alloc)?);
     }
 
-    // Write data to blocks
-    let mut remaining = data;
-    for &blk in &block_nums {
-        let off = blk as usize * bs;
-        let to_write = remaining.len().min(bs);
-        // Zero the block first
-        for b in &mut image[off..off + bs] {
-            *b = 0;
+    // Write data to blocks. NO zero pass: the image is calloc-backed
+    // (zero pages on first touch — see create_empty_ext2), so the
+    // untouched remainder of every block already reads zero; the old
+    // byte-at-a-time zero loop was a full extra pass over the data.
+    //
+    // The blocks COALESCE into contiguous runs first: the allocator
+    // scans forward, so a file's blocks (usually) land as one run.
+    // The copying path is one memcpy per run (MEASURED: the per-block
+    // loop cost ~90 ms for a 148 MB layer — the per-call fault churn
+    // dominates — and a parallel per-block copy thrashed 9x WORSE: the
+    // fault path serializes; it is not core-bound). The SPARSE path —
+    // the layer load's composite disk — records the runs instead: the
+    // block device serves them from the decompressed archive and COWs
+    // on the first guest write, so the layer's data NEVER faults the
+    // image pages (measured: the whole injection dropped to the
+    // metadata pass).
+    let runs: Vec<(usize, usize, usize)> = {
+        // (image offset, source offset, length) per block, then merged.
+        let mut blocks: Vec<(usize, usize, usize)> =
+            Vec::with_capacity(block_nums.len());
+        let mut src_off = 0usize;
+        for &blk in &block_nums {
+            let len = (data.len() - src_off).min(bs);
+            blocks.push((blk as usize * bs, src_off, len));
+            src_off += len;
         }
-        image[off..off + to_write].copy_from_slice(&remaining[..to_write]);
-        remaining = &remaining[to_write..];
+        let mut runs: Vec<(usize, usize, usize)> = Vec::with_capacity(blocks.len());
+        for (off, s, l) in blocks {
+            match runs.last_mut() {
+                // Adjacent in BOTH the image and the source: extend.
+                Some((ro, rs, rl)) if *ro + *rl == off && *rs + *rl == s => {
+                    *rl += l;
+                }
+                _ => runs.push((off, s, l)),
+            }
+        }
+        runs
+    };
+    match sparse {
+        Some((src, src_base, regions)) => {
+            for &(off, src_off, len) in &runs {
+                regions.push(crate::virtio::blk::SparseRegion {
+                    image_off: off,
+                    len,
+                    src: src.clone(),
+                    src_off: src_base + src_off,
+                });
+            }
+        }
+        None => {
+            for &(off, src_off, len) in &runs {
+                image[off..off + len]
+                    .copy_from_slice(&data[src_off..src_off + len]);
+            }
+        }
     }
-
     // Handle indirect blocks if needed
     let mut inode_block_ptrs = [0u32; 15];
     let ptrs_per_block = bs / 4;
@@ -2065,30 +2287,24 @@ pub fn inject_file(
         let ind_blk = alloc_block(image, sb, bgdt, alloc)?;
         inode_block_ptrs[12] = ind_blk;
         let ind_off = ind_blk as usize * bs;
-        for b in &mut image[ind_off..ind_off + bs] {
-            *b = 0;
-        }
+        // No zero pass: calloc-backed image (see inject_file's data loop).
         let single_end = num_blocks.min(12 + ptrs_per_block);
         for (i, &blk) in block_nums[12..single_end].iter().enumerate() {
             write_le32(image, ind_off + i * 4, blk);
         }
 
         if num_blocks > 12 + ptrs_per_block {
-            // Double indirect
+            // Double indirect. No zero passes: the image is calloc-backed
+            // (see the data-block loop above) — the untouched remainder of
+            // every indirect block already reads zero (free pointers).
             let dind_blk = alloc_block(image, sb, bgdt, alloc)?;
             inode_block_ptrs[13] = dind_blk;
             let dind_off = dind_blk as usize * bs;
-            for b in &mut image[dind_off..dind_off + bs] {
-                *b = 0;
-            }
             let remain_blocks = &block_nums[12 + ptrs_per_block..];
             for (ci, chunk) in remain_blocks.chunks(ptrs_per_block).enumerate() {
                 let l1_blk = alloc_block(image, sb, bgdt, alloc)?;
                 write_le32(image, dind_off + ci * 4, l1_blk);
                 let l1_off = l1_blk as usize * bs;
-                for b in &mut image[l1_off..l1_off + bs] {
-                    *b = 0;
-                }
                 for (j, &blk) in chunk.iter().enumerate() {
                     write_le32(image, l1_off + j * 4, blk);
                 }
@@ -2157,8 +2373,11 @@ fn inject_chardev(
         ensure_dir_path(image, sb, bgdt, alloc, &dir_path)?
     };
 
-    // Skip if already exists
-    if dir_lookup(image, sb, bgdt, dir_ino, dev_name)?.is_some() {
+    // Skip if already exists — but consult the append record instead of
+    // walking the directory: a fresh image can only contain what an
+    // earlier entry created, and the first sight of a name cannot exist
+    // (see inject_file_inner).
+    if alloc.seen_names.contains(&(dir_ino, dev_name.to_string())) {
         return Ok(());
     }
 
@@ -2212,8 +2431,11 @@ fn inject_symlink(
         ensure_dir_path(image, sb, bgdt, alloc, &dir_path)?
     };
 
-    // Skip if already exists
-    if dir_lookup(image, sb, bgdt, dir_ino, link_name)?.is_some() {
+    // Skip if already exists — but consult the append record instead of
+    // walking the directory: a fresh image can only contain what an
+    // earlier entry created, and the first sight of a name cannot exist
+    // (see inject_file_inner).
+    if alloc.seen_names.contains(&(dir_ino, link_name.to_string())) {
         return Ok(());
     }
 
@@ -2276,7 +2498,12 @@ fn inject_symlink(
 /// Creates directories, writes files, and creates symlinks as needed.
 /// All entry paths are placed under `upper/` to match the overlayfs
 /// directory layout expected by the guest init script.
-pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> {
+pub fn inject_tar_entries_ref(
+    image: &mut [u8],
+    tars: &[std::sync::Arc<Vec<u8>>],
+    entries: &[crate::tar::TarEntryRef],
+    regions: &mut Vec<crate::virtio::blk::SparseRegion>,
+) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
     let mut alloc = Ext2Alloc::default();
@@ -2302,7 +2529,24 @@ pub fn inject_tar_entries(image: &mut [u8], entries: &[TarEntry]) -> Result<()> 
                 } else {
                     0o644
                 };
-                inject_file(image, &sb, &bgdt, &mut alloc, &path, &entry.data, perm)?;
+                // The composite disk: the file's data blocks are
+                // RECORDED as sparse regions — served from the
+                // decompressed archive by the block device, COW on the
+                // first guest write — and never copied into the image
+                // (the copy pass was the layer load's dominant cost;
+                // see inject_file_sparse).
+                inject_file_sparse(
+                    image,
+                    &sb,
+                    &bgdt,
+                    &mut alloc,
+                    &path,
+                    &tars[entry.tar],
+                    entry.data.start,
+                    entry.data.len(),
+                    perm,
+                    regions,
+                )?;
             }
             TarEntryType::Symlink => {
                 inject_symlink(image, &sb, &bgdt, &mut alloc, &path, &entry.link_target)?;
@@ -2621,8 +2865,22 @@ mod tests {
             data: Vec::new(),
         });
 
-        inject_tar_entries(&mut img, &entries).unwrap();
-
+        // The ref pipeline, exactly as the load path uses it: the owned
+        // test entries serialize into a tar, parse back as borrowed
+        // entries, and inject as sparse regions — then FLATTEN, exactly
+        // as the export path does, before reading back through the
+        // image (the round-trip must prove the composite serves the
+        // same bytes the copy would have).
+        let tar = crate::tar::write_tar(&entries);
+        let refs = crate::tar::read_tar_ref(&tar).unwrap();
+        let tar = std::sync::Arc::new(tar);
+        let mut regions = Vec::new();
+        inject_tar_entries_ref(&mut img, &[tar.clone()], &refs, &mut regions).unwrap();
+        for r in &regions {
+            // The flatten, as the device does it (the export path).
+            img[r.image_off..r.image_off + r.len]
+                .copy_from_slice(&r.src[r.src_off..r.src_off + r.len]);
+        }
         let out = read_upper_tar_entries(&img).unwrap();
         let find = |path: &str| {
             out.iter()

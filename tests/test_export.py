@@ -59,9 +59,12 @@ def phase_export(
 
 
 def validate_layer(layer: pathlib.Path, guest_path: str, marker: bytes) -> None:
-    # The layer is zstd-compressed; decompress it for tarfile.
+    # The layer is compressed (the chunked zstd container or a legacy
+    # single frame); decompress either for tarfile (tests/layer_ref.py).
+    import layer_ref
+
     raw = layer.with_suffix(".tar")
-    subprocess.run(["zstd", "-d", "-f", str(layer), "-o", str(raw)], check=True)
+    raw.write_bytes(layer_ref.decompress_layer(layer))
     # tmpfs mode tars with a `./` prefix; normalize before lookup.
     member_name = guest_path.lstrip("/")
     with tarfile.open(raw, "r:") as tf:

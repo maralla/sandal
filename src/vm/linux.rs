@@ -44,6 +44,10 @@ pub(super) struct KvmHost {
     /// Write end of the pipe used to stop the stdin poller thread.
     pub(super) stdin_stop_w: RawFd,
     pub(super) stdin_thread: Option<JoinHandle<()>>,
+    /// The eventfd that wakes the net kicker's epoll (its stop flag alone
+    /// cannot return the 100 ms wait; see spawn_net_kicker).
+    pub(super) stop_fd: libc::c_int,
+    pub(super) net_thread: Option<JoinHandle<()>>,
     /// Last level issued for each tracked line (index: INTID - 32).
     /// Shared with the poller threads (see [`IrqLevels`]).
     pub(super) irq_levels: IrqLevels,
@@ -257,6 +261,41 @@ impl Vmm {
                 break;
             }
         }
+        if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "BOOT_TIMING run_loop_end: {:?} (exit_code={})",
+                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default(),
+                self.guest_exit_code.unwrap_or(0)
+            );
+        }
+        // Stop the helper threads BEFORE anything returns. MEASURED: the
+        // stdin poller blocks in poll(stop_pipe, -1) and the net kicker
+        // in epoll_wait(100 ms), and exit_group's SIGKILL took ~70 ms to
+        // reap one of them — the process was reaped only after the
+        // laggard, and that was the whole "teardown" cost past the last
+        // userspace byte. The stop byte/flag is each thread's designed
+        // exit; joining them here means exit_group has no one to kill.
+        self.net_kick_stop.store(true, Ordering::Relaxed);
+        let wake = 1u64.to_ne_bytes();
+        let _ = unsafe {
+            libc::write(self.host.stop_fd, wake.as_ptr().cast(), wake.len())
+        };
+        if let Some(h) = self.host.net_thread.take() {
+            let _ = h.join();
+        }
+        let wake = [1u8];
+        let _ = unsafe {
+            libc::write(self.host.stdin_stop_w, wake.as_ptr().cast(), wake.len())
+        };
+        if let Some(h) = self.host.stdin_thread.take() {
+            let _ = h.join();
+        }
+        if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "BOOT_TIMING threads_stopped: {:?}",
+                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
+            );
+        }
         Ok(self.guest_exit_code.unwrap_or(0))
     }
 
@@ -338,6 +377,7 @@ pub(super) fn spawn_net_kicker(
     irq_lock: Arc<Mutex<()>>,
     irq_levels: IrqLevels,
     stop: Arc<AtomicBool>,
+    stop_fd: libc::c_int,
 ) -> JoinHandle<()> {
     #![allow(clippy::too_many_arguments)] // thread bootstrap; each arg is a distinct handle
     use std::collections::HashSet;
@@ -352,6 +392,17 @@ pub(super) fn spawn_net_kicker(
             return; // no net pump this boot; the run loop still polls per exit
         }
         let mut registered: HashSet<RawFd> = HashSet::new();
+        // The shutdown wake: the stop flag alone cannot return the
+        // epoll_wait below (only its 100 ms timeout or a signal could),
+        // so the stop fd is part of the watch set — the shutdown writes
+        // one byte and the loop top's flag check exits.
+        unsafe {
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: stop_fd as u64,
+            };
+            libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, stop_fd, &mut ev);
+        }
         let mut wedged_empty_drains: u32 = 0;
         // Only start counting empty drains after the guest produced console
         // output once: the first TX proves the queue is live, so a subsequent
