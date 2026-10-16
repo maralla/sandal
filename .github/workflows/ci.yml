@@ -93,13 +93,14 @@ jobs:
         run: |
           sw_vers
           sysctl hw.memsize hw.model
-          # The SDK's own answer to "is 0xFAE9400F named": dump every HV_
-          # define. The first attempt grepped a wrong path and printed
-          # nothing — silence read as "undocumented" it never checked.
+          # The SDK's own answer to "is 0xFAE9400F named": dump the HV_
+          # constants, however declared (no #defines in this header —
+          # that grep matched nothing and failed the step before the
+          # probe ran).
           HDR="$(find "$(xcrun --show-sdk-path)" /System/Library/Frameworks \
                 -name Hypervisor.h 2>/dev/null | head -1)"
           echo "header: ${HDR:-not found}"
-          [ -n "$HDR" ] && grep -n "define HV_" "$HDR"
+          grep -nE "HV_[A-Z_]+ *=|fae940" "$HDR" || echo "no HV constants found"
           cat > /tmp/hvfprobe.c <<'EOF'
           #include <Hypervisor/Hypervisor.h>
           #include <stdio.h>
