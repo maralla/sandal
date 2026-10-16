@@ -13,11 +13,6 @@ use crate::elf::aarch64::*;
 #[cfg(target_arch = "aarch64")]
 use crate::elf::ElfBuilder;
 
-/// Marker printed by the init binary before shutdown.
-/// The VM run loop looks for this to extract the exit code.
-#[cfg(target_arch = "aarch64")]
-pub const EXIT_MARKER: &str = "SANDAL_EXIT:";
-
 /// Mount point and device path constants.
 #[cfg(target_arch = "aarch64")]
 pub const MNT_LOWER: &str = "/mnt/lower"; // bind-mount of the original root
@@ -59,9 +54,12 @@ pub const EXPORT_RESIZE_IMM: u32 = 0x5D2; // "SanDal 2"
 #[cfg(target_arch = "aarch64")]
 pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
 
-/// UART marker prefix for the export save path: the guest echoes
-/// `SANDAL_EXPORT_PATH:<path>` to the console and the VMM intercepts it.
-pub const EXPORT_PATH_MARKER: &str = "SANDAL_EXPORT_PATH:";
+/// Exit protocol signal: the crafted init BRKs with the session's exit
+/// code in x15; the VMM reads the register at the trap (the marker-free
+/// exit protocol — the old fixed `SANDAL_EXIT:<code>` stdout marker is
+/// gone).
+#[cfg(target_arch = "aarch64")]
+pub const EXIT_IMM: u32 = 0x5D5; // "SanDal 5"
 
 /// Init config signal: guest requests VM configuration (disk mode,
 /// virtiofs mounts, command argv, network flag, timestamp).
@@ -84,7 +82,6 @@ pub fn build_init_config_text(
     clock_secs: u64,
     console_cols: u16,
     console_rows: u16,
-    exit_token: &str,
     host_term: &str,
 ) -> Vec<u8> {
     let mut out = String::new();
@@ -105,7 +102,6 @@ pub fn build_init_config_text(
     if !host_term.is_empty() {
         out.push_str(&format!("TERM={host_term}\n"));
     }
-    out.push_str(&format!("EXIT={}\n", exit_token));
     for arg in command {
         out.push_str(&format!("ARG={arg}\n"));
     }
@@ -172,7 +168,8 @@ pub fn build_init_config(
 ///
 /// Usage: sandal-export [path]
 ///
-/// 1. Optionally sends the export save path to the VMM via a console marker.
+/// 1. Optionally sends the export save path to the VMM via the export path
+///    port (a dedicated virtio-console port whose whole stream IS the path).
 /// 2. Disk mode (ext2 overlay upper): signals EXPORT_DONE directly; the VMM
 ///    extracts the ext2 `upper/` subtree into a `.layer` file.
 /// 3. Tmpfs mode: signals EXPORT_RESIZE to grow /dev/vdb, tars the overlay
@@ -181,7 +178,6 @@ pub fn generate_export_script() -> String {
     let data_dev_name = DATA_DEV.strip_prefix("/dev/").unwrap_or(DATA_DEV);
     format!(
         include_str!("export.sh"),
-        EXPORT_PATH_MARKER = EXPORT_PATH_MARKER,
         MNT_DISK = MNT_DISK,
         MNT_TMP = MNT_TMP,
         DATA_DEV = DATA_DEV,

@@ -169,11 +169,20 @@ impl Vmm {
             // interrupt lands through the pending-interrupt update above.
             // The captured control replies (parsed by the pump for the
             // PORT_READY processing proof).
-            let control_tx = self.console.lock().unwrap().process_tx(
-                self.memory.as_shared_slice(),
-                RAM_BASE,
-                crate::virtio::console::CONTROL_TX,
-            );
+            // The control replies carry the session signal (PORT_OPEN(1) —
+            // see process_control_tx; the marker-free session routing).
+            let control_tx = self
+                .console
+                .lock()
+                .unwrap()
+                .process_control_tx(self.memory.as_shared_slice(), RAM_BASE);
+            // The export path port: the whole stream is the export path
+            // (marker-free; stored on the device, handle_export_done takes
+            // it).
+            self.console
+                .lock()
+                .unwrap()
+                .process_export_tx(self.memory.as_shared_slice(), RAM_BASE);
             self.console
                 .lock()
                 .unwrap()

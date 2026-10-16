@@ -111,39 +111,25 @@ endif
 kernel:
 	@bash scripts/fetch-kernel.sh
 
-# Test suites:
-#   - cargo unit tests (incl. the ustar layer round-trips and the KVM backend
-#     UAPI layout tests)
-#   - device/feature test: virtio IDs, block queue geometry, rng (tests/test_devices.py)
-#   - multi-segment block I/O integrity (tests/test_blk.py)
-#   - export/load integration test (tests/test_export.py)
-#   - shared-directory (virtiofs) test (tests/test_share.py)
-#   - interactive console input: echo latency, backspace erase, line edit
-#     (tests/test_console_input.py)
-#   - guest package management over TLS (tests/test_packages.py)
-#   - uv + CPython install and the interactive python REPL
-#     (tests/test_python_repl.py)
-#   - tmux in the guest (devpts / PTY support) (tests/test_tmux.py)
-#   - user-space network/curl test (tests/test_curl_hang.sh)
-#   - interactive console hang gate (tests/test_interactive_gate.sh)
+# Test suites — tests/run_suite.sh owns the full inventory and order:
+#   - cargo unit tests (incl. the ustar layer round-trips and the KVM
+#     backend UAPI layout tests)
+#   - every tests/test_*.py: devices, blk, boot-time (timing-sensitive:
+#     runs early, on the quietest host the suite sees), exit codes,
+#     console input, marker passthrough, export, layer, share, geometry,
+#     tmux (+attached), python REPL, packages
+#   - the hang gates last: the curl stress (a local HTTP server on 18199
+#     drives tests/test_fetch_hang.exp from tests/test_curl_hang.sh) and
+#     the interactive gate, both under a wall-clock cap — a wedged VM
+#     must fail the suite, not stall it.
 #
-# The guest is a Linux VM (arch matches the host): the integration/gate
-# tests need its kernel — fetched from the sandal-assets release above —
-# and run on macOS on Apple Silicon (HVF) or Linux with /dev/kvm. On
-# other hosts they print SKIP and pass — the unit tests above still run
-# everywhere.
+# `make test TESTS="export exit-codes"` runs a subset by name; TEST_TIMEOUT
+# (default 600 s) caps each test. The guest is a Linux VM (arch matches
+# the host): the integration tests need its kernel — fetched from the
+# sandal-assets release above — and run on macOS on Apple Silicon (HVF)
+# or Linux with /dev/kvm. On other hosts they print SKIP and pass.
 test: build kernel
-	cargo test --release
-	$(PYTHON) tests/test_devices.py
-	$(PYTHON) tests/test_blk.py
-	$(PYTHON) tests/test_export.py
-	$(PYTHON) tests/test_share.py
-	$(PYTHON) tests/test_console_input.py
-	$(PYTHON) tests/test_packages.py
-	$(PYTHON) tests/test_python_repl.py
-	$(PYTHON) tests/test_tmux.py
-	tests/test_curl_hang.sh 1 128
-	$(TIMEOUT) $(if $(TIMEOUT),60,) env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_interactive_gate.sh --fail-fast --exit-cycle
+	bash tests/run_suite.sh $(TESTS)
 
 lint:
 	cargo fmt --all

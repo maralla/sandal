@@ -29,14 +29,17 @@ pub fn init_binary(_tty_device: &str) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn init_script_has_shebang_and_marker() {
+    fn init_script_has_shebang_and_exit_helper() {
         let s = super::init_binary("/dev/hvc0");
         assert!(s.starts_with(b"#!/bin/sh\n"));
         let s = std::str::from_utf8(s).unwrap();
-        // The exit protocol uses the per-boot token from the config — the
-        // script must not contain a fixed marker string that workload
-        // output could echo back.
-        assert!(s.contains("EXIT_TOKEN"));
+        // The exit protocol is the `sandal-exit` hypercall helper — the
+        // script must not carry any marker string that workload output
+        // could echo back (the whole console protocol is gone: no
+        // EXIT_TOKEN, no SESSION echo, no SANDAL_EXIT).
+        assert!(s.contains("sandal-exit"));
+        assert!(!s.contains("EXIT_TOKEN"));
+        assert!(!s.contains("SESSION:port"));
         assert!(!s.contains("SANDAL_EXIT:"));
         assert!(s.contains("pivot_root"));
         assert!(s.contains("/etc/sandal.conf"));

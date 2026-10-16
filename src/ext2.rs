@@ -2778,6 +2778,20 @@ pub fn inject_runtime_files(
         &initramfs::tools::export_done_helper(mmio_base),
         0o755,
     )?;
+    // The exit protocol helper: the init script runs `sandal-exit <status>`
+    // once the session is reaped — a /dev/mem MMIO store of
+    // `EXIT_PORT | (code << 16)` to the hypercall page (marker-free exit
+    // code delivery; the old console marker is gone).
+    #[cfg(target_arch = "x86_64")]
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        &mut alloc,
+        "usr/sbin/sandal-exit",
+        &initramfs::tools::x86_64::exit::exit_helper(mmio_base),
+        0o755,
+    )?;
     let export_script = initramfs::generate_export_script();
     inject_file(
         image,

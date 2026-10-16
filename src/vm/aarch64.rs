@@ -203,6 +203,13 @@ impl Vmm {
             }
             initramfs::EXPORT_RESIZE_IMM => self.handle_export_resize(),
             initramfs::EXPORT_DONE_IMM => self.handle_export_done(),
+            // The exit protocol: the code rides x15 (marker-free — the old
+            // fixed `SANDAL_EXIT:<code>` stdout marker is gone).
+            initramfs::EXIT_IMM => {
+                let code = self.vcpu.read_register(Reg::X15)? as u32 as i32;
+                self.guest_exit_code = Some(code);
+                self.guest_shutdown = true;
+            }
             // Unknown BRKs are resumed; the init protocol has no other
             // immediate values.
             _ => {}

@@ -199,30 +199,15 @@ impl Vmm {
             // through its own SHARED filter (the same instances the
             // net-kick thread uses — two independent trackers per stream
             // would tear escape sequences apart at drain boundaries).
+            // The drain also applies the control replies (the session
+            // routing) and stores the export path on the device; the exit
+            // code comes from the EXIT hypercall in handle_kvm_exit.
             let (pending, _) = drain_console_streams(
                 &self.console,
                 &self.memory,
                 &self.console_tx_filter,
                 &self.port_tx_filter,
             );
-            // The shutdown/export protocol: whichever drain matched the
-            // marker left it set in the shared filter — take it here (the
-            // only place with a shutdown path).
-            let (exit_code, export_path) = {
-                let mut f = self.console_tx_filter.lock().unwrap();
-                let mut g = self.port_tx_filter.lock().unwrap();
-                (
-                    f.exit_code.take().or(g.exit_code.take()),
-                    f.export_path.take().or(g.export_path.take()),
-                )
-            };
-            if let Some(code) = exit_code {
-                self.guest_exit_code = Some(code);
-                self.guest_shutdown = true;
-            }
-            if let Some(path) = export_path {
-                self.export_save_path = Some(path);
-            }
             if pending {
                 // The control sequence was delivered or a filter answered a
                 // terminal query: the reply went into an RX queue. Raise the
@@ -650,12 +635,13 @@ fn drain_console_streams(
 
     // The control replies FIRST: complete the driver's pending post — its
     // control path spins until the completion lands, exactly like the
-    // console TX. The payload is the driver's own bookkeeping — logged,
-    // emitted nowhere.
-    let control_tx = console.lock().unwrap().process_tx(
+    // console TX. The payload carries the session signal (PORT_OPEN(1) —
+    // the marker-free session routing; see process_control_tx), applied
+    // inside; the rest is the driver's own bookkeeping — logged, emitted
+    // nowhere.
+    let control_tx = console.lock().unwrap().process_control_tx(
         memory.as_shared_slice(),
         RAM_BASE,
-        crate::virtio::console::CONTROL_TX,
     );
     if !control_tx.is_empty() {
         progressed = true;
@@ -665,6 +651,14 @@ fn drain_console_streams(
             crate::vmm_trace::bytes_preview(&control_tx, 32)
         ));
     }
+
+    // The export path port: the whole stream is the export path (see
+    // process_export_tx — the marker-free export protocol). Stored on the
+    // device; handle_export_done takes it.
+    console
+        .lock()
+        .unwrap()
+        .process_export_tx(memory.as_shared_slice(), RAM_BASE);
 
     // The control handshake LAST, in the same pump call: the driver reads
     // the control buffer at get_buf time, so message k must be written in

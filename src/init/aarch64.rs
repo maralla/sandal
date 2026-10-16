@@ -82,7 +82,6 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
         s_env_path = ENV_PATH_VAR,
         s_env_term = "TERM=linux",
         s_env_ssl = "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
-        s_exit_marker = initramfs::EXIT_MARKER,
         s_cmd_not_found = CMD_NOT_FOUND_SUFFIX,
     );
 
@@ -356,38 +355,11 @@ const fn build_init(tty_device: &str) -> ([u8; ElfBuilder::MAX_ELF], usize) {
     add!(e, SP, SP, 16);
     mov!(e, x15, x0); // x15 = exit code
 
-    // Write "SANDAL_EXIT:<code>\n" to stdout
-    sub!(e, SP, SP, 32);
-    add!(e, x0, SP, 0); // x0 = buffer start (ADD reads SP correctly)
-    adr!(e, x1, s_exit_marker);
-    let marker_copy = e.offset();
-    ldrb_post!(e, x2, x1);
-    strb_post!(e, x2, x0);
-    b_back!(e, cbnz, x2, marker_copy);
-    sub!(e, x0, x0, 1); // back up over null
-
-    // Convert exit code to decimal ASCII (hundreds, tens, ones)
-    movz!(e, x9, 100);
-    udiv!(e, x2, x15, x9);
-    msub!(e, x15, x2, x9, x15);
-    add!(e, x2, x2, 48);
-    strb_post!(e, x2, x0);
-    movz!(e, x9, 10);
-    udiv!(e, x2, x15, x9);
-    msub!(e, x15, x2, x9, x15);
-    add!(e, x2, x2, 48);
-    strb_post!(e, x2, x0);
-    add!(e, x15, x15, 48);
-    strb_post!(e, x15, x0);
-    movz!(e, x2, 10); // '\n'
-    strb_post!(e, x2, x0);
-
-    // write(stdout, buf, len)
-    add!(e, x1, SP, 0); // x1 = buffer start (ADD reads SP correctly)
-    sub_reg!(e, x2, x0, x1); // x2 = length
-    movz!(e, x0, 1); // fd = stdout
-    syscall!(e, nr::WRITE);
-    add!(e, SP, SP, 32);
+    // BRK #EXIT_IMM — the exit protocol, marker-free: the VMM reads x15
+    // (the code) at the trap. The old path hand-wrote "SANDAL_EXIT:<code>"
+    // to stdout and the VMM scanned the console stream for it — a string
+    // any output could accidentally act as.
+    brk!(e, initramfs::EXIT_IMM);
 
     reboot!(e);
     exit!(e, 0); // fallback

@@ -23,7 +23,6 @@ CLOCK=0
 SHARES_TEXT=
 COLS=80
 ROWS=24
-EXIT_TOKEN=
 while IFS= read -r line; do
     case $line in
         ARG=*) set -- "$@" "${line#ARG=}" ;;
@@ -34,7 +33,6 @@ while IFS= read -r line; do
         TERM=*) TERM=${line#TERM=} ;;
         COLS=*) COLS=${line#COLS=} ;;
         ROWS=*) ROWS=${line#ROWS=} ;;
-        EXIT=*) EXIT_TOKEN=${line#EXIT=} ;;
     esac
 done < /etc/sandal.conf
 
@@ -145,35 +143,28 @@ if [ -n "$PORT" ] && [ -x /bin/portagent ]; then
     # on the port: the control sequence is BATCHED (one message per posted
     # head, one pulse — see src/virtio/console.rs), so the port opened
     # during kernel boot, deterministically, BEFORE this script runs — the
-    # device node above exists iff that happened.
-    echo "${EXIT_TOKEN}SESSION:port" > "$PORT" 2>/dev/null
+    # device node above exists iff that happened. The session routing is
+    # marker-free: opening the port is the signal (the kernel driver sends
+    # PORT_OPEN(1) on the control queue; the VMM reads it there).
     /bin/portagent "$PORT" "$ROWS" "$COLS" "$CMD" "$@"
     STATUS=$?
 else
     # No session transport (the port never opened, or the helper is
     # missing): NO session — no console-session fallback, ever. The
-    # exit marker forwards the status; the VMM tears the VM down.
+    # exit helper below forwards the status; the VMM tears the VM down.
     STATUS=126
 fi
 
 # The session child was a session leader on a real tty: its death
 # disassociates the controlling terminal and vhangups it — every
-# inherited fd on that tty is hung up with it, so the exit-marker
+# inherited fd on that tty is hung up with it, so a console-marker
 # echo would fast-fail (EIO) and the boot would sail into `poweroff
-# -f` with the marker never delivered. Reopen fresh.
-exec >/dev/console 2>&1
-
-# Exit protocol: the VMM matches `<per-boot token><status>` — a random
-# token delivered in the config, so workload output can never act as the
-# protocol by echoing script text or fixed strings. BOTH transports
-# carry the marker (each stream's own filter suppresses its copy):
-# whichever side is alive captures the code — the port (the session
-# transport), the console (the boot protocol's completion redundancy:
-# with no console session there is nothing to fall back TO, but the code
-# itself must still reach the VMM). A failed open is just a lost copy;
-# the other still delivers.
-[ -n "$PORT" ] && echo "${EXIT_TOKEN}${STATUS}" > "$PORT" 2>/dev/null
-echo "${EXIT_TOKEN}${STATUS}" >/dev/console 2>/dev/null
+# -f` with the status never delivered. The exit protocol needs no
+# console anymore: sandal-exit is a /dev/mem MMIO store to the VMM's
+# hypercall page (marker-free — no string can ever act as the
+# protocol; the low half of the store selects EXIT_PORT, the high
+# half carries the code). A missing helper just loses the code.
+[ -x /usr/sbin/sandal-exit ] && /usr/sbin/sandal-exit "$STATUS"
 poweroff -f
 # Fallback if poweroff is not serviced.
 sleep 5

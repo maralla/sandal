@@ -5,15 +5,20 @@
 /// terminal I/O, batching characters through virtqueues instead of trapping
 /// per-byte.
 ///
-/// Two ports, six queues (virtio-console "multiport"; see
+/// Three ports, eight queues (virtio-console "multiport"; see
 /// [`VirtioConsoleDevice::pump_control_sequence`]):
-///   - port 0 — the console port (hvc0): kernel printk, the guest init, and
-///     the VMM's shutdown/export protocol.
-///   - port 1 — a host device port (/dev/virtio-ports/vport0p1): the
+///   - port 0 — the console port (hvc0): kernel printk and the guest init.
+///   - port 1 — a host device port (/dev/virtio-ports/vport1p1): the
 ///     interactive session rides a guest pty bridged to this port by the
 ///     guest-side agent, because the console port's tty path spends one full
 ///     hypervisor round trip per output LINE (measured ~150 KB/s) while the
 ///     host port moves whole buffers per round trip.
+///   - port 2 — the export path port (/dev/virtio-ports/vport1p2): the
+///     export script writes the host-side layer path there; the VMM reads
+///     it from the port's TX queue (see
+///     [`VirtioConsoleDevice::process_export_tx`]). A dedicated channel —
+///     the whole stream IS the path — so no string matching happens
+///     anywhere (the old `SANDAL_EXPORT_PATH:` console marker is gone).
 ///
 /// Queues (two per port, plus one control pair — the order the guest driver
 /// requests them in, see its init_vqs):
@@ -23,6 +28,8 @@
 ///   - queue 3: control TX (guest → host control replies)
 ///   - queue 4: port RX (host → guest)
 ///   - queue 5: port TX (guest → host)
+///   - queue 6: export RX (host → guest; unused — nothing to inject)
+///   - queue 7: export TX (guest → host: the export path)
 use std::mem;
 
 use super::*;
@@ -31,7 +38,7 @@ use super::*;
 const VIRTIO_ID_CONSOLE: u32 = 3;
 
 const QUEUE_SIZE: u32 = 128;
-const NUM_QUEUES: usize = 6;
+const NUM_QUEUES: usize = 8;
 
 /// Queue roles (the guest driver's own ordering; see the module docs).
 pub const CONSOLE_RX: usize = 0;
@@ -40,16 +47,18 @@ pub const CONTROL_RX: usize = 2;
 pub const CONTROL_TX: usize = 3;
 pub const PORT_RX: usize = 4;
 pub const PORT_TX: usize = 5;
+pub const EXPORT_RX: usize = 6;
+pub const EXPORT_TX: usize = 7;
 
 /// Feature bit: console size (cols, rows) is available in config space.
 const VIRTIO_CONSOLE_F_SIZE: u64 = 1 << 0;
 /// Feature bit: multiple ports (the host device port).
 const VIRTIO_CONSOLE_F_MULTIPORT: u64 = 1 << 1;
 
-/// How many ports the device offers (the console port + the host port). The
-/// guest driver validates this against its own maximum (0x8000) and requests
-/// (ports + 1) * 2 queues.
-const MAX_NR_PORTS: u32 = 2;
+/// How many ports the device offers (the console port, the host port, and
+/// the export path port). The guest driver validates this against its own
+/// maximum (0x8000) and requests (ports + 1) * 2 queues.
+const MAX_NR_PORTS: u32 = 3;
 
 /// Control message events (the guest driver's uapi numbering).
 const CTRL_PORT_ADD: u16 = 1;
@@ -69,6 +78,28 @@ fn control_message(id: u32, event: u16, value: u16) -> [u8; 8] {
     m[4..6].copy_from_slice(&event.to_le_bytes());
     m[6..8].copy_from_slice(&value.to_le_bytes());
     m
+}
+
+/// Parse a CONTROL_TX stream (8-byte `{ u32 id, u16 event, u16 value }`
+/// messages, possibly batched) for the session signal: the last
+/// `PORT_OPEN(1, guest_connected)` wins — Some(true) = the guest agent
+/// opened the host device port (session on the port), Some(false) = it
+/// closed it. MEASURED in the guest driver (kernel-build/linux-7.2.10/
+/// drivers/char/virtio_console.c): port_fops_open sends
+/// `send_control_msg(port, VIRTIO_CONSOLE_PORT_OPEN, 1)` and
+/// port_fops_release sends value 0 — every open/release, nothing else
+/// carries the session state.
+fn parse_control_session(bytes: &[u8]) -> Option<bool> {
+    let mut session = None;
+    for m in bytes.chunks_exact(8) {
+        let id = u32::from_le_bytes(m[0..4].try_into().unwrap());
+        let event = u16::from_le_bytes(m[4..6].try_into().unwrap());
+        let value = u16::from_le_bytes(m[6..8].try_into().unwrap());
+        if id == 1 && event == CTRL_PORT_OPEN {
+            session = Some(value == 1);
+        }
+    }
+    session
 }
 
 /// ARM64 Data Abort ISS `SAS` field: access size for the faulting load/store.
@@ -162,10 +193,19 @@ pub struct VirtioConsoleDevice {
 
     /// True once the guest's init signaled `SESSION:port`: the interactive
     /// session moved onto the host device port, so host stdin is injected
-    /// into the port RX queue instead of the console RX queue. Set from
-    /// the session marker (token-authenticated like the exit marker) and
-    /// read by the stdin poller under this lock.
+    /// into the port RX queue instead of the console RX queue.
+    ///
+    /// Marker-free since the control channel carries it: the guest driver
+    /// sends `PORT_OPEN(1, guest_connected=1/0)` on every open/release of
+    /// the port device (see [`VirtioConsoleDevice::process_control_tx`]) —
+    /// the old `<token>SESSION:port` echo is gone.
     pub session_input_on_port: bool,
+
+    /// The export path, read from the export port's TX stream (see
+    /// [`VirtioConsoleDevice::process_export_tx`]). Either drainer — the
+    /// run loop or the net-kick thread — may be the one pumping when the
+    /// export script writes it; `handle_export_done` takes it.
+    pub export_path: Option<String>,
 
     /// Monotonically increments each time the VMM delivers RX data or processes TX.
     /// Used to detect work that arrives between the guest's ISR read of INTERRUPT_STATUS
@@ -214,8 +254,9 @@ impl VirtioConsoleDevice {
             rows,
             console_rx: RxChannel::new(),
             port_rx: RxChannel::new(),
-            control_seq_pending: 0b11111,
+            control_seq_pending: 0b111_1111,
             session_input_on_port: false,
+            export_path: None,
             work_gen: 0,
             work_gen_at_read: 0,
         }
@@ -245,13 +286,6 @@ impl VirtioConsoleDevice {
         self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
         self.work_gen += 1;
         true
-    }
-
-    /// The number of queues the guest set up (the port queues exist only
-    /// in the multiport device; single-port guests keep the session on the
-    /// console queues).
-    pub fn queue_count(&self) -> usize {
-        self.queues.len()
     }
 
     /// True once the control handshake's whole sequence has been DELIVERED
@@ -411,8 +445,9 @@ impl VirtioConsoleDevice {
         self.driver_features = 0;
         self.console_rx.reset();
         self.port_rx.reset();
-        self.control_seq_pending = 0b11111;
+        self.control_seq_pending = 0b111_1111;
         self.session_input_on_port = false;
+        self.export_path = None;
         self.work_gen = 0;
         self.work_gen_at_read = 0;
         for q in &mut self.queues {
@@ -720,9 +755,12 @@ impl VirtioConsoleDevice {
     ///   - PORT_ADD(0)      → the console port (its RX buffers are posted
     ///                        by the driver itself, exactly as before)
     ///   - PORT_ADD(1)      → the host device port
+    ///   - PORT_ADD(2)      → the export path port
     ///   - CONSOLE_PORT(0)  → instantiate hvc0 on port 0
     ///   - PORT_OPEN(1)     → mark the host port connected (its file
     ///                        operations refuse I/O until this)
+    ///   - PORT_OPEN(2)     → mark the export port connected (same)
+    ///   - PORT_OPEN(0)     → mark the console port connected
     ///
     /// Returns true if the sequence was delivered this call (the caller must
     /// raise the device interrupt so the driver's control work runs).
@@ -749,11 +787,13 @@ impl VirtioConsoleDevice {
     /// console device (the init script's 121 path) — the same end state
     /// the watchdog's give-up produced, without the 20 s of re-delivery.
     pub fn pump_control_sequence(&mut self, memory: &mut [u8], ram_base: u64) -> bool {
-        const SEQ: [(u32, u16, u16); 5] = [
+        const SEQ: [(u32, u16, u16); 7] = [
             (0, CTRL_PORT_ADD, 0),
             (1, CTRL_PORT_ADD, 0),
+            (2, CTRL_PORT_ADD, 0),
             (0, CTRL_CONSOLE_PORT, 1),
             (1, CTRL_PORT_OPEN, 1),
+            (2, CTRL_PORT_OPEN, 1),
             (0, CTRL_PORT_OPEN, 1),
         ];
         if self.control_seq_pending == 0 {
@@ -782,6 +822,44 @@ impl VirtioConsoleDevice {
             }
         }
         delivered_any
+    }
+
+    /// Drain the control replies (queue CONTROL_TX) and apply them:
+    /// `PORT_OPEN(1, guest_connected)` — the kernel driver's own message on
+    /// every open/release of the host device port — is the session signal:
+    /// the guest agent opening the port moves host stdin onto the port RX
+    /// queue; closing it moves stdin back. This is the marker-free session
+    /// routing: the old `<token>SESSION:port`/`SESSION:console` echoes
+    /// reinvented a signal the bus already provides. Returns the drained
+    /// bytes (the caller traces them / passes them on).
+    pub fn process_control_tx(&mut self, memory: &mut [u8], ram_base: u64) -> Vec<u8> {
+        let tx = self.process_tx(memory, ram_base, CONTROL_TX);
+        if let Some(on_port) = parse_control_session(&tx) {
+            self.session_input_on_port = on_port;
+        }
+        tx
+    }
+
+    /// Drain the export path port (queue EXPORT_TX): the whole stream is
+    /// the export path — one write from the export script (`printf '%s\n'`),
+    /// guest → host, no framing, no matching. Stored on the device (either
+    /// drainer may be the one pumping when it arrives); `handle_export_done`
+    /// takes it. The protocol always carries an absolute host path; a
+    /// non-path stream is ignored.
+    pub fn process_export_tx(&mut self, memory: &mut [u8], ram_base: u64) {
+        let tx = self.process_tx(memory, ram_base, EXPORT_TX);
+        if tx.is_empty() {
+            return;
+        }
+        let path = String::from_utf8_lossy(&tx);
+        let path = path.trim_matches(['\n', '\r', ' ', '\t']);
+        if path.starts_with('/') {
+            self.export_path = Some(path.to_string());
+            crate::vmm_trace::write_console_io(format_args!(
+                "EXPORT_PATH bytes={} path={path:?}",
+                tx.len()
+            ));
+        }
     }
 
     /// Dump the raw vring state of every queue from guest RAM (wedge

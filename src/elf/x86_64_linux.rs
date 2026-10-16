@@ -87,3 +87,5 @@ pub const CLOCK_REALTIME: u32 = 0;
 pub const INIT_CONFIG_PORT: u16 = 0x5D4;
 pub const EXPORT_RESIZE_PORT: u16 = 0x5D2;
 pub const EXPORT_DONE_PORT: u16 = 0x5D3;
+pub const EXIT_PORT: u16 = 0x5D5; // "SanDal 5": the low half selects the
+                                 // signal; the high half carries the code.

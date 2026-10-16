@@ -312,27 +312,27 @@ impl Drop for GuestRam {
     }
 }
 
-/// The console TX pipeline: escape-sequence tracking (DSR/DA query replies),
-/// protocol-marker filtering, and the line/cursor state. Owned by the
-/// net-kick thread that drains the console TX virtqueue (Linux).
+/// The console TX pipeline: escape-sequence tracking and terminal-query
+/// (DSR/DA) replies. Owned by the net-kick thread that drains the console
+/// TX virtqueue (Linux).
 ///
 /// One instance per stream: the console port's stream (the guest init and
 /// kernel output; query replies go back through the CONSOLE RX queue) and
 /// the host device port's stream (the interactive session; replies go back
 /// through the PORT RX queue so the guest agent can read them).
+///
+/// The protocol markers are GONE — the exit code rides the hypercall page
+/// (`sandal-exit`), the session routing rides the control queue
+/// (`PORT_OPEN(1)`), the export path rides its own port. Every byte of
+/// guest output streams through here verbatim: nothing is scanned for
+/// strings, so no user content can ever act as a protocol (the class of
+/// the vim screen-desync bug: a marker matched mid-redraw swallowed the
+/// rest of a newline-less TUI burst).
 #[cfg(target_os = "linux")]
 pub(crate) struct ConsoleTxFilter {
-    /// The per-boot exit-protocol token.
-    pub exit_marker: String,
     /// Which RX queue (host → guest) this stream's terminal-query replies
     /// are injected through: the stream's own port's RX queue.
     pub rx_queue: usize,
-    /// Console TX line buffer used to intercept protocol markers.
-    tx_line: Vec<u8>,
-    /// Bytes held back because they may start a protocol marker.
-    tx_hold: Vec<u8>,
-    /// True while the current TX line is a suppressed marker line.
-    tx_suppress_line: bool,
     /// Escape-sequence tracking state (see the module docs).
     vt_esc: bool,
     vt_csi: u8,
@@ -342,10 +342,6 @@ pub(crate) struct ConsoleTxFilter {
     vt_dsr: bool,
     vt_row: u32,
     vt_col: u32,
-    /// Set by feed(): the guest's exit code from the exit marker.
-    pub exit_code: Option<i32>,
-    /// Set by feed(): the export save path from the export marker.
-    pub export_path: Option<String>,
     /// Set by feed(): true when a query reply was injected into the console
     /// RX (the caller must pulse the console IRQ so the guest reads it).
     pub replied: bool,
@@ -371,13 +367,9 @@ pub(crate) struct ConsoleTxFilter {
 
 #[cfg(target_os = "linux")]
 impl ConsoleTxFilter {
-    pub(crate) fn new(exit_marker: String, rx_queue: usize) -> Self {
+    pub(crate) fn new(rx_queue: usize) -> Self {
         ConsoleTxFilter {
-            exit_marker,
             rx_queue,
-            tx_line: Vec::new(),
-            tx_hold: Vec::new(),
-            tx_suppress_line: false,
             vt_esc: false,
             vt_csi: 0,
             vt_seq: Vec::new(),
@@ -386,8 +378,6 @@ impl ConsoleTxFilter {
             vt_dsr: false,
             vt_row: 1,
             vt_col: 1,
-            exit_code: None,
-            export_path: None,
             replied: false,
             da1_answered: false,
             da2_answered: false,
@@ -396,8 +386,8 @@ impl ConsoleTxFilter {
     }
 
     /// Feed guest console TX bytes: track the escape state, answer terminal
-    /// queries (into the console RX), filter protocol markers, and append
-    /// the visible bytes to `out`.
+    /// queries (into the console RX), and append the visible bytes to `out`
+    /// verbatim — every byte streams through (see the struct docs).
     pub(crate) fn feed(
         &mut self,
         data: &[u8],
@@ -409,11 +399,6 @@ impl ConsoleTxFilter {
         let mut replies: Vec<Vec<u8>> = Vec::new();
 
         for &ch in data {
-            if self.exit_code.is_some() {
-                // The guest is shutting down; drop trailing output.
-                break;
-            }
-
             // ── Virtual-terminal escape handling ──────────────────────
             // The guest's line editor probes the terminal with `ESC [ 6 n`
             // and reads the reply from its input; tmux also probes with
@@ -469,14 +454,7 @@ impl ConsoleTxFilter {
                 self.vt_row += 1;
             }
 
-            self.emit_tx_byte(ch, out);
-
-            if ch == b'\n' {
-                self.tx_suppress_line = false;
-                self.tx_hold.clear();
-                let line = std::mem::take(&mut self.tx_line);
-                self.process_console_line(&line, console);
-            }
+            out.push(ch);
         }
 
         // Inject query replies into the console RX.
@@ -582,101 +560,10 @@ impl ConsoleTxFilter {
         }
 
         // Forward the sequence to the user's terminal verbatim.
-        for b in seq {
-            self.emit_tx_byte(b, out);
-        }
-    }
-
-    fn emit_tx_byte(&mut self, ch: u8, out: &mut Vec<u8>) {
-        self.tx_line.push(ch);
-
-        if self.tx_suppress_line {
-            return;
-        }
-
-        let markers: [&[u8]; 2] = [
-            self.exit_marker.as_bytes(),
-            initramfs::EXPORT_PATH_MARKER.as_bytes(),
-        ];
-
-        self.tx_hold.push(ch);
-
-        if markers.iter().any(|m| self.tx_hold.ends_with(m)) {
-            self.tx_hold.clear();
-            self.tx_suppress_line = true;
-        } else {
-            let hold = &self.tx_hold;
-
-            let keep = if markers.iter().any(|m| m.starts_with(hold)) {
-                hold.len()
-            } else {
-                (1..hold.len())
-                    .rev()
-                    .find(|&k| {
-                        markers
-                            .iter()
-                            .any(|m| m.starts_with(&hold[hold.len() - k..]))
-                    })
-                    .unwrap_or(0)
-            };
-
-            let flush_len = self.tx_hold.len() - keep;
-
-            if flush_len > 0 {
-                out.extend_from_slice(&self.tx_hold[..flush_len]);
-                self.tx_hold.drain(..flush_len);
-            }
-        }
-    }
-
-    /// Handle one complete guest console line (marker side effects only —
-    /// visible output has already been streamed).
-    fn process_console_line(
-        &mut self,
-        line: &[u8],
-        console: &Arc<Mutex<VirtioConsoleDevice>>,
-    ) {
-        let Ok(line) = std::str::from_utf8(line) else {
-            return;
-        };
-
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-
-        if let Some(pos) = trimmed.find(&self.exit_marker) {
-            let tail = trimmed[pos + self.exit_marker.len()..].trim();
-            // Session routing: the guest init moves the interactive session
-            // onto the host device port (the portagent) or keeps it on the
-            // console. Token-authenticated like the exit protocol —
-            // workload output can never act as the protocol.
-            if tail == "SESSION:port" {
-                let mut dev = console.lock().unwrap();
-                if crate::virtio::console::PORT_RX < dev.queue_count() {
-                    dev.session_input_on_port = true;
-                }
-                return;
-            }
-            if tail == "SESSION:console" {
-                console.lock().unwrap().session_input_on_port = false;
-                return;
-            }
-            let code = tail;
-            // Only a real integer is the exit protocol. Commands like
-            // `cat /init` surface the script's unexpanded placeholder —
-            // that must not shut the VM down.
-            if let Ok(code) = code.parse::<i32>() {
-                self.exit_code = Some(code);
-                return;
-            }
-        }
-
-        if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
-            let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
-            if path.starts_with('/') {
-                self.export_path = Some(path.to_string());
-            }
-        }
+        out.extend_from_slice(&seq);
     }
 }
+
 
 // ── The virtual machine monitor ──────────────────────────────────────────
 
@@ -758,16 +645,10 @@ struct Vmm {
     tty_out_saved: Option<u32>,
     guest_shutdown: bool,
     verbose_uart: bool,
-    /// Per-boot exit-protocol token (x86_64): the init script echoes
-    /// `<token><status>`; the VMM only treats that as the protocol, so
-    /// user output containing the old fixed `SANDAL_EXIT:0` string is
-    /// just output. The arm64 crafted init binary keeps the fixed marker.
-    #[allow(dead_code)]
-    // read only by the macOS-only console path (process_console_tx); dead on Linux
-    exit_marker: String,
-    /// Save path from the guest's `SANDAL_EXPORT_PATH:` console marker.
-    export_save_path: Option<String>,
-    /// Guest command exit status from the exit marker.
+    /// Guest command exit status: set by the exit hypercall (x86_64:
+    /// `sandal-exit`'s MMIO store) or the exit BRK (aarch64: the crafted
+    /// init, the code in x15) — marker-free since the console protocol is
+    /// gone.
     guest_exit_code: Option<i32>,
     /// Virtual-terminal escape tracking for the macOS run loop (on Linux
     /// this state lives in the shared `console_tx_filter` instead): the
@@ -779,12 +660,6 @@ struct Vmm {
     /// long input lines. Every OTHER escape sequence (erase, colors, cursor
     /// movement) is forwarded to the user's terminal untouched — swallowing
     /// those breaks guest-side erases like the backspace path's `ESC [ J`.
-    #[cfg(target_os = "macos")]
-    tx_line: Vec<u8>,
-    #[cfg(target_os = "macos")]
-    tx_hold: Vec<u8>,
-    #[cfg(target_os = "macos")]
-    tx_suppress_line: bool,
     #[cfg(target_os = "macos")]
     vt_esc: bool,
     #[cfg(target_os = "macos")]
@@ -1320,29 +1195,6 @@ impl Vmm {
             eprintln!("BOOT_TIMING   net: {:?}", tp.elapsed());
         }
 
-        // Per-boot exit-protocol token (x86_64): the init script echoes
-        // `<token><status>`; the VMM only treats that as the protocol, so
-        // user output containing the old fixed `SANDAL_EXIT:0` string is
-        // just output.
-        let exit_marker = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                (nanos, std::process::id(), args.command.first()).hash(&mut h);
-                format!("{:08x}", h.finish() as u32)
-            }
-
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                initramfs::EXIT_MARKER.trim_end_matches(':').to_string()
-            }
-        };
-
         #[cfg(target_os = "linux")]
         let mut host = {
             let irq_lock = Arc::new(Mutex::new(()));
@@ -1375,11 +1227,9 @@ impl Vmm {
         // stream (the interactive session). Replies go back through each
         // stream's own port RX queue.
         let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
-            exit_marker.trim_end_matches(':').to_string(),
             crate::virtio::console::CONSOLE_RX,
         )));
         let port_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
-            exit_marker.trim_end_matches(':').to_string(),
             // The port stream's query replies (ESC[6n etc. written by the
             // session to its own stdout) must come back through the PORT
             // input: the session's stdin is the port (the session agent
@@ -1463,14 +1313,6 @@ impl Vmm {
             // THR writes to stderr — a diagnostics channel that bypasses
             // the guest tty stack entirely (see tests/test_tmux_attached.py).
             verbose_uart: args.verbose || std::env::var_os("SANDAL_VERBOSE_UART").is_some(),
-            exit_marker,
-            export_save_path: None,
-            #[cfg(target_os = "macos")]
-            tx_line: Vec::new(),
-            #[cfg(target_os = "macos")]
-            tx_hold: Vec::new(),
-            #[cfg(target_os = "macos")]
-            tx_suppress_line: false,
             guest_exit_code: None,
             #[cfg(target_os = "macos")]
             vt_esc: false,
@@ -1565,7 +1407,6 @@ impl Vmm {
                 clock_secs,
                 cols,
                 rows,
-                &self.exit_marker,
                 &host_term,
             );
         }
@@ -1823,11 +1664,12 @@ impl Vmm {
                     crate::virtio::console::CONTROL_RX => {
                         // The control queue: retry the port-instantiation
                         // sequence (a no-op once delivered). Its interrupt
-                        // lands through the next line update.
-                        let control_tx = console.process_tx(
+                        // lands through the next line update. The drained
+                        // replies carry the session signal (PORT_OPEN(1) —
+                        // see process_control_tx) and are applied there.
+                        let control_tx = console.process_control_tx(
                             self.memory.as_shared_slice(),
                             RAM_BASE,
-                            crate::virtio::console::CONTROL_TX,
                         );
                         if !control_tx.is_empty() {
                             crate::vmm_trace::write_console_io(format_args!(
@@ -1921,6 +1763,13 @@ impl Vmm {
                 match val as u16 {
                     crate::elf::x86_64_linux::EXPORT_RESIZE_PORT => self.handle_export_resize(),
                     crate::elf::x86_64_linux::EXPORT_DONE_PORT => self.handle_export_done(),
+                    // The exit protocol: the low half selects the signal,
+                    // the high half carries the session's exit code (the
+                    // init script's `sandal-exit <status>` helper).
+                    crate::elf::x86_64_linux::EXIT_PORT => {
+                        self.guest_exit_code = Some((val >> 16) as i32);
+                        self.guest_shutdown = true;
+                    }
                     other => log::warn!("unknown hypercall {other:#x}"),
                 }
                 return;
@@ -1960,7 +1809,7 @@ impl Vmm {
     fn handle_export_done(&mut self) {
         log::info!(
             "export: DONE hypercall, save_path={:?}",
-            self.export_save_path
+            self.console.lock().unwrap().export_path
         );
         let Some(dev) = self.data_blk.as_mut() else {
             log::warn!("export done: no data disk");
@@ -2015,7 +1864,7 @@ impl Vmm {
             }
         };
 
-        let save_path = match self.export_save_path.take() {
+        let save_path = match self.console.lock().unwrap().export_path.take() {
             Some(path) if !path.is_empty() => PathBuf::from(path),
             _ => {
                 let mut hasher = DefaultHasher::new();
@@ -2030,21 +1879,17 @@ impl Vmm {
         }
     }
 
-    /// Feed guest console TX bytes to stdout while intercepting the VMM
-    /// protocol markers (the per-boot exit token and
-    /// `SANDAL_EXPORT_PATH:`), which are consumed here instead of being
-    /// shown to the user. macOS only: on Linux the run loop and the
-    /// net-kick thread share `console_tx_filter` instead (a singular
-    /// escape/marker state — two trackers would tear sequences apart at
-    /// drain boundaries).
+    /// Feed guest console TX bytes to stdout, answering terminal queries
+    /// (DSR/DA) and streaming every byte verbatim. macOS only: on Linux
+    /// the run loop and the net-kick thread share `console_tx_filter`
+    /// instead (a singular escape state — two trackers would tear
+    /// sequences apart at drain boundaries). The protocol markers are
+    /// GONE (see the Linux twin): the exit code rides the hypercall
+    /// page/BRK, the session routing rides the control queue, the export
+    /// path rides its own port.
     #[cfg(target_os = "macos")]
     fn process_console_tx(&mut self, data: &[u8]) {
         let mut replies: Vec<Vec<u8>> = Vec::new();
-        let exit_marker = self.exit_marker.clone();
-        let markers: [&[u8]; 2] = [
-            exit_marker.as_bytes(),
-            initramfs::EXPORT_PATH_MARKER.as_bytes(),
-        ];
         let mut stdout = std::io::stdout();
 
         for &ch in data {
@@ -2113,14 +1958,7 @@ impl Vmm {
                 self.vt_row += 1;
             }
 
-            self.emit_tx_byte(ch, &mut stdout, &markers);
-
-            if ch == b'\n' {
-                self.tx_suppress_line = false;
-                self.tx_hold.clear();
-                let line = std::mem::take(&mut self.tx_line);
-                self.process_console_line(&line);
-            }
+            let _ = stdout.write_all(&[ch]);
         }
 
         let _ = stdout.flush();
@@ -2243,91 +2081,7 @@ impl Vmm {
         }
 
         // Forward the sequence to the user's terminal verbatim.
-        let exit_marker = self.exit_marker.clone();
-        let markers: [&[u8]; 2] = [
-            exit_marker.as_bytes(),
-            initramfs::EXPORT_PATH_MARKER.as_bytes(),
-        ];
-        let mut stdout = std::io::stdout();
-        for b in seq {
-            self.emit_tx_byte(b, &mut stdout, &markers);
-        }
-    }
-
-    /// Emit one visible TX byte: track the current line for marker
-    /// detection, hold back bytes that could start a protocol marker, and
-    /// stream everything else to the user's terminal.
-    #[cfg(target_os = "macos")]
-    fn emit_tx_byte(&mut self, ch: u8, stdout: &mut std::io::Stdout, markers: &[&[u8]]) {
-        self.tx_line.push(ch);
-
-        if self.tx_suppress_line {
-            // Swallow the rest of the marker line.
-            return;
-        }
-
-        self.tx_hold.push(ch);
-
-        if markers.iter().any(|m| self.tx_hold.ends_with(m)) {
-            // Full marker: discard it and swallow the rest of the line.
-            self.tx_hold.clear();
-            self.tx_suppress_line = true;
-        } else {
-            // Hold back only the longest suffix that could still become
-            // a marker; everything before it is safe to print.
-            let hold = &self.tx_hold;
-            let keep = if markers.iter().any(|m| m.starts_with(hold)) {
-                hold.len()
-            } else {
-                (1..hold.len())
-                    .rev()
-                    .find(|&k| {
-                        markers
-                            .iter()
-                            .any(|m| m.starts_with(&hold[hold.len() - k..]))
-                    })
-                    .unwrap_or(0)
-            };
-
-            let flush_len = self.tx_hold.len() - keep;
-
-            if flush_len > 0 {
-                let _ = stdout.write_all(&self.tx_hold[..flush_len]);
-                self.tx_hold.drain(..flush_len);
-            }
-        }
-    }
-
-    /// Handle one complete guest console line (marker side effects only —
-    /// visible output has already been streamed to stdout).
-    #[cfg(target_os = "macos")]
-    fn process_console_line(&mut self, line: &[u8]) {
-        let Ok(line) = std::str::from_utf8(line) else {
-            return;
-        };
-
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-
-        if let Some(pos) = trimmed.find(&self.exit_marker) {
-            let code = trimmed[pos + self.exit_marker.len()..].trim();
-            // Only a real integer is the exit protocol. Commands like
-            // `cat /init` surface the script's *unexpanded* placeholder —
-            // that must not shut the VM down.
-            if let Ok(code) = code.parse::<i32>() {
-                self.guest_exit_code = Some(code);
-                self.guest_shutdown = true;
-                return;
-            }
-            // Not the protocol — fall through to the export marker.
-        }
-
-        if let Some(pos) = trimmed.find(initramfs::EXPORT_PATH_MARKER) {
-            let path = trimmed[pos + initramfs::EXPORT_PATH_MARKER.len()..].trim();
-            // The protocol always carries an absolute host path; ignore
-            // garbage from e.g. dumping a helper binary.
-            if path.starts_with('/') {
-                self.export_save_path = Some(path.to_string());
-            }
-        }
+        let _ = std::io::stdout().write_all(&seq);
     }
 }
+

@@ -42,24 +42,25 @@ impl Vmm {
                 .process_tx(self.memory.as_shared_slice(), RAM_BASE);
             if !tx.is_empty() {
                 let mut out = Vec::new();
-                let (replied, exit_code, export_path) = {
+                let replied = {
                     let mut f = self.console_tx_filter.lock().unwrap();
                     f.feed(&tx, &self.console, &self.memory, RAM_BASE, &mut out);
                     let replied = f.replied;
                     f.replied = false;
-                    (replied, f.exit_code.take(), f.export_path.take())
+                    replied
                 };
                 if !out.is_empty() {
                     let _ = std::io::stdout().write_all(&out);
                     let _ = std::io::stdout().flush();
                 }
-                if let Some(code) = exit_code {
-                    self.guest_exit_code = Some(code);
-                    self.guest_shutdown = true;
-                }
-                if let Some(path) = export_path {
-                    self.export_save_path = Some(path);
-                }
+                // The exit code comes from the EXIT hypercall in the shared
+                // mmio_write; the export path and the session routing ride
+                // their own channels (see process_export_tx /
+                // process_control_tx).
+                self.console
+                    .lock()
+                    .unwrap()
+                    .process_export_tx(self.memory.as_shared_slice(), RAM_BASE);
                 if replied {
                     // The filter answered a terminal query: the reply is in
                     // the console RX — raise the console IRQ line.

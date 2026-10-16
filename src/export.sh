@@ -4,9 +4,18 @@
 
 EXPORT_PATH="${{1:-}}"
 
-# Send desired save path to VMM via UART marker (intercepted, not shown).
+# Send desired save path to VMM via the export path port — a dedicated
+# virtio-console port (vport*p2) whose whole stream IS the path. Marker-
+# free: no string matching anywhere on either side (the old
+# `SANDAL_EXPORT_PATH:` console marker is gone), so no output can ever
+# act as the protocol. The port is instantiated host-connected by the
+# VMM's control sequence; writes block until then.
 if [ -n "$EXPORT_PATH" ]; then
-    echo "{EXPORT_PATH_MARKER}$EXPORT_PATH" > /dev/console
+    EXPORT_PORT=
+    for p in /dev/vport*p2; do
+        [ -c "$p" ] && EXPORT_PORT=$p && break
+    done
+    [ -n "$EXPORT_PORT" ] && printf '%s\n' "$EXPORT_PATH" > "$EXPORT_PORT"
 fi
 
 # Find the overlay upper directory.

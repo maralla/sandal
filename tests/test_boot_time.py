@@ -88,6 +88,7 @@ def timed_boot(extra_args):
     out = subprocess.run(
         [str(SANDAL), *extra_args, "--", "uname", "-a"],
         env=env,
+        stdin=subprocess.DEVNULL,  # the VMM's stdin poller drains whatever it gets
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         timeout=120,
