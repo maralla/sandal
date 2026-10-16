@@ -20,7 +20,6 @@ mod devicetree;
 mod elf;
 mod ext2;
 mod hypervisor;
-mod init;
 mod initramfs;
 mod irqs;
 #[cfg(not(target_os = "windows"))]

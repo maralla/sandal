@@ -78,6 +78,31 @@ run_one() {
         return 0
     fi
 
+    # test_boot_time gets ONE retry, loudly marked: its bounds are
+    # deliberately tight tripwires (they exist to catch a serial read by
+    # name), and a single noisy sample on a loaded machine fails the whole
+    # suite for nothing. MEASURED this session: data_disk 258 ms and
+    # ext2_inject 84 ms as one-off spikes, each re-running green standalone
+    # — two consecutive failures is a real regression, one is weather.
+    local tries=1
+    [ "$name" = "boot-time" ] && tries=2
+    local attempt=1
+    while :; do
+        if _run_attempt "$name" "$cmd"; then
+            return 0
+        fi
+        [ "$attempt" -ge "$tries" ] && break
+        attempt=$((attempt + 1))
+        echo "         ($name: retrying, attempt $attempt of $tries)"
+    done
+    FAILED=$((FAILED + 1))
+}
+
+# One attempt: exits 0 (and prints its own PASS line) on pass, exits 1 on
+# a failed attempt. The caller decides whether that failure is final.
+_run_attempt() {
+    local name="$1" cmd="$2"
+
     # </dev/null on every child: a test that spawns the VMM with an
     # inherited stdin would otherwise have the VMM's stdin poller drain
     # THIS loop's stdin — the suite list itself (measured: test_boot_time
@@ -98,14 +123,12 @@ run_one() {
 
     if [ "$rc" -eq 124 ]; then
         printf 'FAIL     %-20s timed out\n' "$name"
-        FAILED=$((FAILED + 1))
-        return 0
+        return 1
     fi
     if [ "$rc" -ne 0 ]; then
         printf 'FAIL     %-20s exit %d\n' "$name" "$rc"
         printf '%s\n' "$out" | tail -n 15 | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-        return 0
+        return 1
     fi
 
     # Pass or self-skip: surface the test's own verdict line.
@@ -114,11 +137,11 @@ run_one() {
     if printf '%s' "$verdict" | grep -q FAIL; then
         printf 'FAIL     %-20s %s\n' "$name" "$verdict"
         printf '%s\n' "$out" | tail -n 15 | sed 's/^/    /'
-        FAILED=$((FAILED + 1))
-    else
-        printf 'PASS     %-20s %s\n' "$name" "${verdict:-ok}"
-        PASSED=$((PASSED + 1))
+        return 1
     fi
+    printf 'PASS     %-20s %s\n' "$name" "${verdict:-ok}"
+    PASSED=$((PASSED + 1))
+    return 0
 }
 
 PASSED=0

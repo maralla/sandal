@@ -2,12 +2,12 @@
 //!
 //! The guest rootfs ships busybox (applet symlinks included), so a POSIX
 //! script is simpler and far more maintainable than generated machine code.
-//! The script lives in `init/x86_64.sh` next to this module and is embedded
+//! The script lives in `init.sh` next to this module and is embedded
 //! at compile time with `include_str!`. The VMM injects the run configuration
 //! as `/etc/sandal.conf` (key=value lines, see
 //! [`crate::initramfs::build_init_config_text`]).
 //!
-//! Flow (mirrors the ARM64 init in [`super::aarch64`]):
+//! Flow (mirrors the ARM64 init in [`crate::initramfs::tools::aarch64::init`]):
 //!   1. mount proc/sys/tmpfs (devtmpfs is moved across pivot_root)
 //!   2. parse the config (disk mode, network, clock, shares, argv)
 //!   3. set the wall clock; bring up the network (static 10.0.2.15 NAT)
@@ -17,7 +17,7 @@
 //!      `SANDAL_EXIT:<code>` marker, power off.
 
 /// The guest init script (injected as `/init`, mode 0755).
-const SCRIPT: &str = include_str!("x86_64.sh");
+const SCRIPT: &str = include_str!("init.sh");
 
 /// Return the x86_64 guest `/init` script for the given TTY device
 /// (the console device is fixed for this guest; the argument matches the

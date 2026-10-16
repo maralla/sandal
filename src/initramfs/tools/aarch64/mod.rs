@@ -4,3 +4,4 @@
 //! now: the aarch64 session stays on the console device.
 
 pub mod export;
+pub mod init;

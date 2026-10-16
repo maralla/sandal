@@ -2,4 +2,5 @@
 
 pub mod exit;
 pub mod export;
+pub mod init;
 pub mod portagent;

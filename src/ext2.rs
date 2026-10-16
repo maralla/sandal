@@ -2804,7 +2804,7 @@ pub fn inject_runtime_files(
     )?;
 
     // /init binary (compiled ARM64 ELF)
-    let init_binary = crate::init::init_binary("/dev/hvc0");
+    let init_binary = crate::initramfs::tools::init_binary("/dev/hvc0");
     inject_file(image, &sb, &bgdt, &mut alloc, "init", init_binary, 0o755)?;
 
     Ok(())
