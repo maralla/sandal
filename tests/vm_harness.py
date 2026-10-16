@@ -40,7 +40,16 @@ class Vm:
     @staticmethod
     def _claim_ctty():
         os.setsid()
-        fcntl.ioctl(0, 0x540E, 0)  # TIOCSCTTY: fd 0 = this session's ctty
+        # TIOCSCTTY is per-OS (Linux 0x540E; darwin 0x20007405). The claim
+        # is best-effort: without it the VMM loses live SIGWINCH resizes
+        # (the boot geometry stands) but nothing else — a failing ioctl
+        # must not take the preexec down with it (Python 3.15 propagates
+        # preexec exceptions straight into SubprocessError).
+        tiocsctty = 0x20007405 if sys.platform == "darwin" else 0x540E
+        try:
+            fcntl.ioctl(0, tiocsctty, 0)  # fd 0 = this session's ctty
+        except OSError:
+            pass
 
     def __init__(self, extra_args=(), command=("sh",),
                  verbose_env="SANDAL_TEST_VERBOSE"):

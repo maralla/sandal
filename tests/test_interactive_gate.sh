@@ -33,7 +33,8 @@ case "$(uname -m)" in
 		exit 0
 		;;
 esac
-if ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+# /dev/kvm is a Linux device; darwin runs the guest on HVF.
+if [ "$(uname -s)" = "Linux" ] && ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
 	echo "test_interactive_gate: SKIP: no accessible /dev/kvm (no nested virtualization)"
 	exit 0
 fi
