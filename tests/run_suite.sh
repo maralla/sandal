@@ -168,6 +168,7 @@ if [ "$(uname -s)" = "Darwin" ] && [ -x target/release/sandal ]; then
     wait "$probe_pid"
     probe_rc=$?
     kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
     if [ "$probe_rc" -ne 0 ]; then
         export SANDAL_HVF_UNUSABLE=1
         echo "HVF probe FAILED (exit $probe_rc; hv_vm_create unusable or stalled):"
