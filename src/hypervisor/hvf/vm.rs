@@ -22,6 +22,10 @@ impl Vm {
             if ret == HV_SUCCESS {
                 break;
             }
+            // Every failed attempt logs its code: the bail below prints only
+            // the last one, and "same code ten times" vs "different codes"
+            // is the difference between a deterministic bug and a busy host.
+            eprintln!("hv_vm_create attempt {}: {ret:#010x}", attempt + 1);
             std::thread::sleep(std::time::Duration::from_millis(250 * (attempt + 1)));
         }
 

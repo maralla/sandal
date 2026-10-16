@@ -155,17 +155,26 @@ SKIPPED=0
 # a working probe runs the suite, a failing one skips every VM test
 # (SANDAL_HVF_UNUSABLE=1; vm_harness and the bash gates read it).
 if [ "$(uname -s)" = "Darwin" ] && [ -x target/release/sandal ]; then
-    probe_cmd="target/release/sandal -- true </dev/null >/dev/null 2>&1"
-    if [ -n "$TIMEOUT_BIN" ]; then
-        probe="$TIMEOUT_BIN 60 $probe_cmd"
-    else
-        probe="$probe_cmd"
-    fi
-    if ! bash -c "$probe"; then
+    # A portable 60 s cap (macOS runners ship no coreutils timeout): the
+    # probe runs in the background, a watchdog kills it, and the VMM's
+    # stderr (the per-attempt hv_vm_create codes) is kept and printed on
+    # failure — a stalled probe must hang nothing, and a failed one must
+    # not be a blind guess.
+    probe_log="$(mktemp)"
+    target/release/sandal -- true </dev/null >/dev/null 2>"$probe_log" &
+    probe_pid=$!
+    ( sleep 60; kill "$probe_pid" 2>/dev/null ) &
+    watchdog=$!
+    wait "$probe_pid"
+    probe_rc=$?
+    kill "$watchdog" 2>/dev/null
+    if [ "$probe_rc" -ne 0 ]; then
         export SANDAL_HVF_UNUSABLE=1
-        echo "HVF probe FAILED (hv_vm_create unusable on this host):"
+        echo "HVF probe FAILED (exit $probe_rc; hv_vm_create unusable or stalled):"
+        sed 's/^/  /' "$probe_log"
         echo "  the VM tests will SKIP; the unit tests still run."
     fi
+    rm -f "$probe_log"
 fi
 
 echo "sandal test suite (TEST_TIMEOUT=${TEST_TIMEOUT}s)"
