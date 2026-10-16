@@ -22,7 +22,12 @@ case "$(uname -m)" in
         exit 0
         ;;
 esac
-# /dev/kvm is a Linux device; darwin runs the guest on HVF.
+# /dev/kvm is a Linux device; darwin runs the guest on HVF (probed once
+# by run_suite.sh — a bad host skips the whole VM suite).
+if [ "${SANDAL_HVF_UNUSABLE:-}" = "1" ]; then
+    echo "test_curl_hang: SKIP: HVF probe failed (hv_vm_create unusable)"
+    exit 0
+fi
 if [ "$(uname -s)" = "Linux" ] && ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
     echo "test_curl_hang: SKIP: no accessible /dev/kvm (no nested virtualization)"
     exit 0

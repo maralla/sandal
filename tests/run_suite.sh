@@ -148,6 +148,26 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 
+# macOS: probe HVF ONCE before the suite. GitHub's ARM runners fail
+# hv_vm_create intermittently (0xFAE9400F, MEASURED 12 of 14 boots on a
+# fresh runner); on a bad host the whole VM suite would churn through
+# retries and prompt timeouts per test — unbounded. One boot decides:
+# a working probe runs the suite, a failing one skips every VM test
+# (SANDAL_HVF_UNUSABLE=1; vm_harness and the bash gates read it).
+if [ "$(uname -s)" = "Darwin" ] && [ -x target/release/sandal ]; then
+    probe_cmd="target/release/sandal -- true </dev/null >/dev/null 2>&1"
+    if [ -n "$TIMEOUT_BIN" ]; then
+        probe="$TIMEOUT_BIN 60 $probe_cmd"
+    else
+        probe="$probe_cmd"
+    fi
+    if ! bash -c "$probe"; then
+        export SANDAL_HVF_UNUSABLE=1
+        echo "HVF probe FAILED (hv_vm_create unusable on this host):"
+        echo "  the VM tests will SKIP; the unit tests still run."
+    fi
+fi
+
 echo "sandal test suite (TEST_TIMEOUT=${TEST_TIMEOUT}s)"
 echo "=================================================================="
 

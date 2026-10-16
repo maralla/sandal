@@ -170,17 +170,21 @@ class Vm:
 
 
 def host_can_run_vm() -> bool:
-    """True when this machine can actually execute the arm64 guest.
+    """True when this machine can actually execute the guest.
 
-    The sandal guest is an arm64 Linux VM, so integration tests need an
-    arm64 host: macOS on Apple Silicon (HVF), or Linux on arm64 with an
-    accessible /dev/kvm. On other hosts (e.g. x86_64 CI runners) the VM
-    cannot start, and tests skip instead of failing.
+    The sandal guest is a same-arch Linux VM: macOS on Apple Silicon
+    (HVF), or Linux with an accessible /dev/kvm. On other hosts the VM
+    cannot start, and tests skip instead of failing. On darwin,
+    tests/run_suite.sh probes HVF once (GitHub's ARM runners fail
+    hv_vm_create intermittently) and exports SANDAL_HVF_UNUSABLE=1 —
+    honored here so the whole suite skips on a bad host.
     """
     machine = platform.machine().lower()
     if machine not in ("aarch64", "arm64", "x86_64"):
         return False
     if sys.platform == "darwin":
+        if os.environ.get("SANDAL_HVF_UNUSABLE"):
+            return False
         return machine in ("aarch64", "arm64")
     if sys.platform.startswith("linux"):
         return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
@@ -188,6 +192,8 @@ def host_can_run_vm() -> bool:
 
 
 def skip_reason() -> str:
+    if os.environ.get("SANDAL_HVF_UNUSABLE"):
+        return "HVF probe failed (hv_vm_create unusable on this host)"
     machine = platform.machine().lower()
     return (
         "host cannot run the guest "
