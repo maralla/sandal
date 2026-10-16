@@ -50,10 +50,6 @@ pub fn is_chunked(data: &[u8]) -> bool {
     data.len() >= 24 && data[..4] == MAGIC
 }
 
-fn rd_u32(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-}
-
 fn wr_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -91,13 +87,12 @@ pub fn compress_chunked(data: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
             .map(|w| {
                 let lo = w * per;
                 let hi = ((w + 1) * per).min(chunks);
-                let data = data;
                 scope.spawn(move || -> anyhow::Result<Vec<Vec<u8>>> {
                     if lo >= hi {
                         return Ok(Vec::new());
                     }
-                    let mut comp = Compressor::new(level)
-                        .map_err(|e| anyhow::anyhow!("zstd init: {e}"))?;
+                    let mut comp =
+                        Compressor::new(level).map_err(|e| anyhow::anyhow!("zstd init: {e}"))?;
                     let mut out = Vec::with_capacity(hi - lo);
                     for i in lo..hi {
                         let src = &data[i * CHUNK..i * CHUNK + chunk_out_size(i, data.len())];
@@ -128,9 +123,7 @@ pub fn compress_chunked(data: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
     }
 
     // Assemble: header + per-chunk compressed sizes + the chunks.
-    let mut out = Vec::with_capacity(
-        24 + 4 * chunks + flat.iter().map(|c| c.len()).sum::<usize>(),
-    );
+    let mut out = Vec::with_capacity(24 + 4 * chunks + flat.iter().map(|c| c.len()).sum::<usize>());
     out.extend_from_slice(&MAGIC);
     wr_u32(&mut out, VERSION);
     wr_u32(&mut out, chunks as u32);
@@ -225,23 +218,22 @@ pub fn decompress_chunked(data: &[u8]) -> anyhow::Result<Vec<u8>> {
                 prev = b;
             }
         }
+        // Re-borrow once, above the loop: each `move` closure captures the
+        // shared reference (Copy), not the Vec itself.
+        let offsets = &offsets;
         let results: Vec<anyhow::Result<()>> = std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for (w, slice) in slices.iter_mut().enumerate() {
                 let lo = w * per;
                 let hi = ((w + 1) * per).min(chunks);
-                let data = data;
-                let offsets = &offsets;
-                let chunk_size = chunk_size;
-                let total = total;
                 handles.push(scope.spawn(move || -> anyhow::Result<()> {
                     if lo >= hi {
                         return Ok(());
                     }
                     // The decompressor context stays in the thread (see
                     // compress_chunked).
-                    let mut dec = Decompressor::new()
-                        .map_err(|e| anyhow::anyhow!("zstd init: {e}"))?;
+                    let mut dec =
+                        Decompressor::new().map_err(|e| anyhow::anyhow!("zstd init: {e}"))?;
                     for i in lo..hi {
                         let want = chunk_out_size(i, total);
                         let src = &data[offsets[i]..offsets[i + 1]];
@@ -285,8 +277,8 @@ pub fn decompress_chunked(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     let fd = file.as_raw_fd();
     let file_len = {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -369,15 +361,14 @@ pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>
             prev = b;
         }
     }
+    // Re-borrow once, above the loop: each `move` closure captures the
+    // shared reference (Copy), not the Vec itself.
+    let offsets = &offsets;
     let results: Vec<anyhow::Result<()>> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (w, slice) in slices.iter_mut().enumerate() {
             let lo = w * per;
             let hi = ((w + 1) * per).min(chunks);
-            let fd = fd;
-            let offsets = &offsets;
-            let chunk_size = chunk_size;
-            let total = total;
             handles.push(scope.spawn(move || -> anyhow::Result<()> {
                 if lo >= hi {
                     return Ok(());
@@ -446,7 +437,7 @@ fn pread_exact(fd: libc::c_int, off: usize, buf: &mut [u8]) -> anyhow::Result<()
         let n = unsafe {
             libc::pread(
                 fd,
-                unsafe { buf.as_mut_ptr().add(done) }.cast(),
+                buf.as_mut_ptr().add(done).cast(),
                 buf.len() - done,
                 (off + done) as libc::off_t,
             )
@@ -496,10 +487,7 @@ mod tests {
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
         let c = compress_chunked(&data, 3).expect("compress");
-        let dir = std::env::temp_dir().join(format!(
-            "zchunk-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("zchunk-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.layer");
         std::fs::write(&path, &c).unwrap();

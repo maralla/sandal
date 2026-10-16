@@ -237,11 +237,7 @@ impl GuestRam {
         // With 2 MB huge pages behind it, the mmu works 512x coarser.
         // On `never` hosts this is a no-op (the old behavior).
         unsafe {
-            libc::madvise(
-                ptr.cast(),
-                len,
-                libc::MADV_HUGEPAGE,
-            );
+            libc::madvise(ptr.cast(), len, libc::MADV_HUGEPAGE);
         }
 
         // MAP_ANONYMOUS memory is already zero-filled by the kernel (lazy
@@ -464,15 +460,12 @@ impl ConsoleTxFilter {
                 blob.extend_from_slice(r);
             }
 
-            let (_, dropped) = console
-                .lock()
-                .unwrap()
-                .push_rx_and_drain(
-                    memory.as_shared_slice(),
-                    ram_base,
-                    self.rx_queue,
-                    &blob,
-                );
+            let (_, dropped) = console.lock().unwrap().push_rx_and_drain(
+                memory.as_shared_slice(),
+                ram_base,
+                self.rx_queue,
+                &blob,
+            );
             if dropped > 0 {
                 console_eprintln(&format!(
                     "sandal: dropped {dropped} bytes of console input the guest refused \
@@ -563,7 +556,6 @@ impl ConsoleTxFilter {
         out.extend_from_slice(&seq);
     }
 }
-
 
 // ── The virtual machine monitor ──────────────────────────────────────────
 
@@ -968,12 +960,7 @@ fn build_data_disk(args: &Args) -> Result<(Vec<u8>, Vec<crate::virtio::blk::Spar
 
     let t = std::time::Instant::now();
     let mut regions = Vec::new();
-    crate::ext2::inject_tar_entries_ref(
-        &mut img,
-        &all_tars,
-        &all_entries,
-        &mut regions,
-    )?;
+    crate::ext2::inject_tar_entries_ref(&mut img, &all_tars, &all_entries, &mut regions)?;
     drop(all_tars); // the regions own their sources now
 
     if timing {
@@ -1196,6 +1183,9 @@ impl Vmm {
         }
 
         #[cfg(target_os = "linux")]
+        // The host is mutated later on x86_64 only (the aarch64 build
+        // never reassigns it); the allow keeps -D warnings green there.
+        #[cfg_attr(target_arch = "aarch64", allow(unused_mut))]
         let mut host = {
             let irq_lock = Arc::new(Mutex::new(()));
             let irq_levels = linux::new_irq_levels();
@@ -1645,8 +1635,7 @@ impl Vmm {
             }
             if let Some(qidx) = notify {
                 match qidx as usize {
-                    crate::virtio::console::CONSOLE_RX
-                    | crate::virtio::console::PORT_RX => {
+                    crate::virtio::console::CONSOLE_RX | crate::virtio::console::PORT_RX => {
                         // An RX queue: the guest posted buffers; drain any
                         // pending host input into them.
                         let (_, dropped) = console.drain_rx_backlog(
@@ -1667,10 +1656,8 @@ impl Vmm {
                         // lands through the next line update. The drained
                         // replies carry the session signal (PORT_OPEN(1) —
                         // see process_control_tx) and are applied there.
-                        let control_tx = console.process_control_tx(
-                            self.memory.as_shared_slice(),
-                            RAM_BASE,
-                        );
+                        let control_tx =
+                            console.process_control_tx(self.memory.as_shared_slice(), RAM_BASE);
                         if !control_tx.is_empty() {
                             crate::vmm_trace::write_console_io(format_args!(
                                 "CONTROL_TX bytes={} preview=\"{}\"",
@@ -1678,10 +1665,7 @@ impl Vmm {
                                 crate::vmm_trace::bytes_preview(&control_tx, 32)
                             ));
                         }
-                        console.pump_control_sequence(
-                            self.memory.as_shared_slice(),
-                            RAM_BASE,
-                        );
+                        console.pump_control_sequence(self.memory.as_shared_slice(), RAM_BASE);
                     }
                     _ => {}
                 }
@@ -2084,4 +2068,3 @@ impl Vmm {
         let _ = std::io::stdout().write_all(&seq);
     }
 }
-

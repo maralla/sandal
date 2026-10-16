@@ -23,7 +23,9 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
-# The guest is an arm64 VM: skip (do not fail) on hosts that cannot run it.
+# The guest is a same-arch Linux VM: skip (do not fail) on hosts that
+# cannot run it — wrong arch, or no accessible /dev/kvm (GitHub's ARM
+# runners ship no nested virtualization; see vm_harness.host_can_run_vm).
 case "$(uname -m)" in
 	aarch64 | arm64 | x86_64) ;;
 	*)
@@ -31,6 +33,10 @@ case "$(uname -m)" in
 		exit 0
 		;;
 esac
+if ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+	echo "test_interactive_gate: SKIP: no accessible /dev/kvm (no nested virtualization)"
+	exit 0
+fi
 
 : "${EX_SANDAL:=$REPO_ROOT/target/release/sandal}"
 : "${EX_DISK:=64}"

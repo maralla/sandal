@@ -58,9 +58,7 @@ pub struct TarEntryRef {
 /// their own chunks and decode straight out of them (see
 /// [`crate::zchunk::decompress_chunked_file`]); a legacy single-frame
 /// .layer has no parallel path and falls back to the sequential read.
-pub fn read_tar_zst_ref_file(
-    path: &std::path::Path,
-) -> Result<(Vec<u8>, Vec<TarEntryRef>)> {
+pub fn read_tar_zst_ref_file(path: &std::path::Path) -> Result<(Vec<u8>, Vec<TarEntryRef>)> {
     use std::os::unix::fs::FileExt;
 
     // The magic decides the path — four bytes, no full read.
@@ -141,6 +139,7 @@ pub fn read_tar(tar_data: &[u8]) -> Result<Vec<TarEntry>> {
 
 /// Parse an uncompressed tar archive into BORROWED entries (see
 /// [`TarEntryRef`]): the entries span `tar_data`, never copied out.
+#[cfg(test)]
 pub fn read_tar_ref(tar_data: &[u8]) -> Result<Vec<TarEntryRef>> {
     parse_tar_ref(tar_data)
 }

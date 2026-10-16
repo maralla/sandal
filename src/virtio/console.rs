@@ -47,6 +47,9 @@ pub const CONTROL_RX: usize = 2;
 pub const CONTROL_TX: usize = 3;
 pub const PORT_RX: usize = 4;
 pub const PORT_TX: usize = 5;
+/// The export port's RX half is unused (nothing is ever injected there —
+/// the path only flows guest → host), kept for the queue map's symmetry.
+#[allow(dead_code)]
 pub const EXPORT_RX: usize = 6;
 pub const EXPORT_TX: usize = 7;
 
@@ -91,7 +94,7 @@ fn control_message(id: u32, event: u16, value: u16) -> [u8; 8] {
 /// carries the session state.
 fn parse_control_session(bytes: &[u8]) -> Option<bool> {
     let mut session = None;
-    for m in bytes.chunks_exact(8) {
+    for m in bytes.as_chunks::<8>().0 {
         let id = u32::from_le_bytes(m[0..4].try_into().unwrap());
         let event = u16::from_le_bytes(m[4..6].try_into().unwrap());
         let value = u16::from_le_bytes(m[6..8].try_into().unwrap());
@@ -289,11 +292,6 @@ impl VirtioConsoleDevice {
     }
 
     /// True once the control handshake's whole sequence has been DELIVERED
-    /// (see [`VirtioConsoleDevice::pump_control_sequence`]). Delivery is
-    /// not processing: the guest driver's work may not have consumed the
-    /// last message yet, so the caller must keep pulsing the interrupt
-    /// until the guest's own behavior confirms it (the port writes flow).
-
     /// Handle an MMIO read at `offset` within the device's MMIO region.
     ///
     /// `sas` is the ARM64 Data Abort ISS access size (`0` byte … `3` doubleword). Required for
@@ -654,8 +652,13 @@ impl VirtioConsoleDevice {
                 break;
             }
 
-            let desc_head = match read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num)
-            {
+            let desc_head = match read_avail_ring(
+                memory,
+                ram_base,
+                qs.avail_addr,
+                last_avail,
+                qs.num,
+            ) {
                 Some(d) => d,
                 None => {
                     crate::vmm_trace::write_console_io(format_args!(
@@ -752,15 +755,15 @@ impl VirtioConsoleDevice {
     /// reply on CONTROL_TX is not waited for, so no platform has to drain
     /// the control queue to get its console.
     ///
-    ///   - PORT_ADD(0)      → the console port (its RX buffers are posted
-    ///                        by the driver itself, exactly as before)
-    ///   - PORT_ADD(1)      → the host device port
-    ///   - PORT_ADD(2)      → the export path port
-    ///   - CONSOLE_PORT(0)  → instantiate hvc0 on port 0
-    ///   - PORT_OPEN(1)     → mark the host port connected (its file
-    ///                        operations refuse I/O until this)
-    ///   - PORT_OPEN(2)     → mark the export port connected (same)
-    ///   - PORT_OPEN(0)     → mark the console port connected
+    ///   - PORT_ADD(0) → the console port (its RX buffers are posted
+    ///     by the driver itself, exactly as before)
+    ///   - PORT_ADD(1) → the host device port
+    ///   - PORT_ADD(2) → the export path port
+    ///   - CONSOLE_PORT(0) → instantiate hvc0 on port 0
+    ///   - PORT_OPEN(1) → mark the host port connected (its file
+    ///     operations refuse I/O until this)
+    ///   - PORT_OPEN(2) → mark the export port connected (same)
+    ///   - PORT_OPEN(0) → mark the console port connected
     ///
     /// Returns true if the sequence was delivered this call (the caller must
     /// raise the device interrupt so the driver's control work runs).
@@ -889,59 +892,58 @@ impl VirtioConsoleDevice {
             ));
             return;
         }
-            let avail_idx = read_avail_idx(memory, ram_base, qs.avail_addr).unwrap_or(0);
-            let used_idx = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
-            crate::vmm_trace::write_console_io(format_args!(
+        let avail_idx = read_avail_idx(memory, ram_base, qs.avail_addr).unwrap_or(0);
+        let used_idx = read_used_idx(memory, ram_base, qs.used_addr).unwrap_or(0);
+        crate::vmm_trace::write_console_io(format_args!(
                 "VRING q={q} num={} last_avail(dev)={} avail_idx(ring)={avail_idx} used_idx(ring)={used_idx} desc={:#x} avail={:#x} used={:#x}",
                 qs.num, qs.last_avail_idx, qs.desc_addr, qs.avail_addr, qs.used_addr,
             ));
 
-            // Avail ring: the head id in each of the `num` slots.
-            let mut slots = String::new();
-            for s in 0..qs.num as u16 {
-                let id =
-                    read_avail_ring(memory, ram_base, qs.avail_addr, s, qs.num).unwrap_or(0xffff);
-                slots.push_str(&format!("{id},"));
-            }
-            crate::vmm_trace::write_console_io(format_args!(
-                "VRING q={q} AVAIL_SLOTS(id per slot 0..num): {slots}"
-            ));
+        // Avail ring: the head id in each of the `num` slots.
+        let mut slots = String::new();
+        for s in 0..qs.num as u16 {
+            let id = read_avail_ring(memory, ram_base, qs.avail_addr, s, qs.num).unwrap_or(0xffff);
+            slots.push_str(&format!("{id},"));
+        }
+        crate::vmm_trace::write_console_io(format_args!(
+            "VRING q={q} AVAIL_SLOTS(id per slot 0..num): {slots}"
+        ));
 
-            // Used ring: every (id, len) entry in the window.
-            let mut entries = String::new();
-            let mut used_ids: Vec<u16> = Vec::new();
-            for s in 0..qs.num as u16 {
-                match read_used_ring_entry(memory, ram_base, qs.used_addr, s, qs.num) {
-                    Some((id, len)) => {
-                        entries.push_str(&format!("{id}:{len},"));
-                        used_ids.push(id as u16);
-                    }
-                    None => entries.push_str("?,"),
+        // Used ring: every (id, len) entry in the window.
+        let mut entries = String::new();
+        let mut used_ids: Vec<u16> = Vec::new();
+        for s in 0..qs.num as u16 {
+            match read_used_ring_entry(memory, ram_base, qs.used_addr, s, qs.num) {
+                Some((id, len)) => {
+                    entries.push_str(&format!("{id}:{len},"));
+                    used_ids.push(id as u16);
                 }
+                None => entries.push_str("?,"),
             }
-            crate::vmm_trace::write_console_io(format_args!(
-                "VRING q={q} USED_ENTRIES(id:len per slot 0..num): {entries}"
-            ));
+        }
+        crate::vmm_trace::write_console_io(format_args!(
+            "VRING q={q} USED_ENTRIES(id:len per slot 0..num): {entries}"
+        ));
 
-            // Descriptor table entries for the ids the used ring references.
-            used_ids.sort_unstable();
-            used_ids.dedup();
-            for id in used_ids.iter() {
-                match read_descriptor(memory, ram_base, qs.desc_addr, *id) {
-                    Some((addr, len, flags, next)) => {
-                        crate::vmm_trace::write_console_io(format_args!(
+        // Descriptor table entries for the ids the used ring references.
+        used_ids.sort_unstable();
+        used_ids.dedup();
+        for id in used_ids.iter() {
+            match read_descriptor(memory, ram_base, qs.desc_addr, *id) {
+                Some((addr, len, flags, next)) => {
+                    crate::vmm_trace::write_console_io(format_args!(
                             "VRING q={q} DESC[{id}] addr={addr:#x} len={len} flags={flags:#x} next={next}"
                         ));
-                    }
-                    None => {
-                        crate::vmm_trace::write_console_io(format_args!(
-                            "VRING q={q} DESC[{id}] unreadable"
-                        ));
-                    }
+                }
+                None => {
+                    crate::vmm_trace::write_console_io(format_args!(
+                        "VRING q={q} DESC[{id}] unreadable"
+                    ));
                 }
             }
         }
-pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, q: usize, data: &[u8]) -> usize {
+    }
+    pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, q: usize, data: &[u8]) -> usize {
         if data.is_empty() {
             return 0;
         }
@@ -1004,11 +1006,11 @@ pub fn inject_rx(&mut self, memory: &mut [u8], ram_base: u64, q: usize, data: &[
             if used_count >= max_rx_heads {
                 break;
             }
-            let desc_head = match read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num)
-            {
-                Some(d) => d,
-                None => break,
-            };
+            let desc_head =
+                match read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num) {
+                    Some(d) => d,
+                    None => break,
+                };
 
             // Walk the descriptor chain, filling writable (host→guest) buffers
             let mut idx = desc_head;

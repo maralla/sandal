@@ -39,20 +39,19 @@ pub fn exit_helper(mmio_base: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn build_exit_elf(mmio_base: u64) -> Vec<u8> {
     use crate::elf::x86_64::{
-        add_i, add_rr_, cmp_i, lea, load64, loadb_inc, mov_i, mov_mem_r, mov_r_imm32,
-        mov_r_imm64, mov_rr, mov_rr_, shl_r_imm, sub_i, sys, syscall_ins, zero, Branch, RAX,
-        RDI, RSI, X86ElfBuilder,
+        add_i, add_rr_, cmp_i, lea, load64, loadb_inc, mov_i, mov_mem_r, mov_r_imm32, mov_r_imm64,
+        mov_rr, mov_rr_, shl_r_imm, sub_i, sys, syscall_ins, zero, Branch, X86ElfBuilder, RAX, RDI,
+        RSI,
     };
     use crate::elf::x86_64_linux as lx;
-    use crate::elf::x86_64_linux::nr as nr;
+    use crate::elf::x86_64_linux::nr;
 
     // Forward branches: (placeholder offset, branch kind) pairs, patched
     // when their target block is emitted (see X86ElfBuilder::patch_branch).
     type Fwd = Vec<(usize, Branch)>;
     let mut e = X86ElfBuilder::new();
-    let fwd = |e: &mut X86ElfBuilder, br: Branch| -> (usize, Branch) {
-        (e.branch_placeholder(br), br)
-    };
+    let fwd =
+        |e: &mut X86ElfBuilder, br: Branch| -> (usize, Branch) { (e.branch_placeholder(br), br) };
     let patch = |e: &mut X86ElfBuilder, v: &mut Fwd| {
         for (at, br) in v.drain(..) {
             e.patch_branch(at, br);

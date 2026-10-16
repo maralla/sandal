@@ -133,8 +133,7 @@ impl VirtioBlkDevice {
     /// guest read. This is the load path's own list; the guest should
     /// not pay for its length on every request.
     fn sparse_start(&self, off: usize) -> usize {
-        self.sparse
-            .partition_point(|r| r.image_off + r.len <= off)
+        self.sparse.partition_point(|r| r.image_off + r.len <= off)
     }
 
     /// Flatten every sparse region into the image (the export path: it
@@ -183,8 +182,7 @@ impl VirtioBlkDevice {
             let rlen = r_end.min(end).saturating_sub(ro);
             if rlen > 0 {
                 let s = r.src_off + (ro - r.image_off);
-                dst[done..done + rlen]
-                    .copy_from_slice(&r.src[s..s + rlen]);
+                dst[done..done + rlen].copy_from_slice(&r.src[s..s + rlen]);
                 done += rlen;
             }
             if done >= dst.len() {

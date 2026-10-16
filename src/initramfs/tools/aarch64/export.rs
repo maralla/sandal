@@ -36,4 +36,3 @@ const EXPORT_DONE_HELPER: ([u8; ElfBuilder::MAX_ELF], usize) = {
 pub fn export_done_helper(_mmio_base: u64) -> Vec<u8> {
     EXPORT_DONE_HELPER.0[..EXPORT_DONE_HELPER.1].to_vec()
 }
-

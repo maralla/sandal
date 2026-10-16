@@ -90,7 +90,10 @@ fn run_vm(args: Args) -> Result<()> {
         if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
             eprintln!(
                 "BOOT_TIMING teardown_done: {:?}",
-                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
+                crate::vm::BOOT_T0
+                    .get()
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default()
             );
         }
         std::process::exit(code);

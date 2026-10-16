@@ -8,11 +8,6 @@ use std::fs;
 /// (ctty, portagent, the export signal helpers).
 pub mod tools;
 
-#[cfg(target_arch = "aarch64")]
-use crate::elf::aarch64::*;
-#[cfg(target_arch = "aarch64")]
-use crate::elf::ElfBuilder;
-
 /// Mount point and device path constants.
 #[cfg(target_arch = "aarch64")]
 pub const MNT_LOWER: &str = "/mnt/lower"; // bind-mount of the original root
@@ -184,4 +179,3 @@ pub fn generate_export_script() -> String {
         DATA_DEV_NAME = data_dev_name,
     )
 }
-

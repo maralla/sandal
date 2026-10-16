@@ -186,22 +186,14 @@ impl Vmm {
             self.console
                 .lock()
                 .unwrap()
-                .pump_control_sequence(
-                    self.memory.as_shared_slice(),
-                    RAM_BASE,
-                    &control_tx,
-                );
+                .pump_control_sequence(self.memory.as_shared_slice(), RAM_BASE);
 
             // Drain guest console TX → host stdout (intercepting protocol markers).
-            let tx = self
-                .console
-                .lock()
-                .unwrap()
-                .process_tx(
-                    self.memory.as_shared_slice(),
-                    RAM_BASE,
-                    crate::virtio::console::CONSOLE_TX,
-                );
+            let tx = self.console.lock().unwrap().process_tx(
+                self.memory.as_shared_slice(),
+                RAM_BASE,
+                crate::virtio::console::CONSOLE_TX,
+            );
             if !tx.is_empty() {
                 // The host terminal runs with output processing disabled, so
                 // the \n → \r\n translation happens here, once, for the

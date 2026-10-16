@@ -147,8 +147,8 @@ impl Vmm {
                     // leaks its magic into the input stream).
                     let mut record: [u8; 8] = [0; 8];
                     record[0..4].copy_from_slice(&0x315a_5352u32.to_le_bytes());
-                    record[4..6].copy_from_slice(&(cols as u16).to_le_bytes());
-                    record[6..8].copy_from_slice(&(rows as u16).to_le_bytes());
+                    record[4..6].copy_from_slice(&cols.to_le_bytes());
+                    record[6..8].copy_from_slice(&rows.to_le_bytes());
                     self.console
                         .lock()
                         .unwrap()
@@ -160,14 +160,11 @@ impl Vmm {
                     // prompt would otherwise resize nothing, for as long as
                     // the session stays idle — which is exactly when a
                     // user zooms). The pulse below covers the delivery.
-                    self.console
-                        .lock()
-                        .unwrap()
-                        .drain_resize_record(
-                            self.memory.as_shared_slice(),
-                            RAM_BASE,
-                            crate::virtio::console::PORT_RX,
-                        );
+                    self.console.lock().unwrap().drain_resize_record(
+                        self.memory.as_shared_slice(),
+                        RAM_BASE,
+                        crate::virtio::console::PORT_RX,
+                    );
                     let _guard = self.host.irq_lock.lock();
                     irq_pulse(
                         &self.host.irq_levels,
@@ -249,7 +246,10 @@ impl Vmm {
         if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
             eprintln!(
                 "BOOT_TIMING run_loop_end: {:?} (exit_code={})",
-                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default(),
+                crate::vm::BOOT_T0
+                    .get()
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default(),
                 self.guest_exit_code.unwrap_or(0)
             );
         }
@@ -262,23 +262,22 @@ impl Vmm {
         // exit; joining them here means exit_group has no one to kill.
         self.net_kick_stop.store(true, Ordering::Relaxed);
         let wake = 1u64.to_ne_bytes();
-        let _ = unsafe {
-            libc::write(self.host.stop_fd, wake.as_ptr().cast(), wake.len())
-        };
+        let _ = unsafe { libc::write(self.host.stop_fd, wake.as_ptr().cast(), wake.len()) };
         if let Some(h) = self.host.net_thread.take() {
             let _ = h.join();
         }
         let wake = [1u8];
-        let _ = unsafe {
-            libc::write(self.host.stdin_stop_w, wake.as_ptr().cast(), wake.len())
-        };
+        let _ = unsafe { libc::write(self.host.stdin_stop_w, wake.as_ptr().cast(), wake.len()) };
         if let Some(h) = self.host.stdin_thread.take() {
             let _ = h.join();
         }
         if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
             eprintln!(
                 "BOOT_TIMING threads_stopped: {:?}",
-                crate::vm::BOOT_T0.get().map(|t| t.elapsed()).unwrap_or_default()
+                crate::vm::BOOT_T0
+                    .get()
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default()
             );
         }
         // The session-failure codes get a diagnostic (see
@@ -528,7 +527,6 @@ pub(super) fn spawn_net_kicker(
     })
 }
 
-
 /// Drain every console stream and emit it (shared by the run loop and the
 /// net-kick thread — the only two places the console device is pumped on
 /// Linux). One filter instance per stream, shared between both callers:
@@ -639,10 +637,10 @@ fn drain_console_streams(
     // the marker-free session routing; see process_control_tx), applied
     // inside; the rest is the driver's own bookkeeping — logged, emitted
     // nowhere.
-    let control_tx = console.lock().unwrap().process_control_tx(
-        memory.as_shared_slice(),
-        RAM_BASE,
-    );
+    let control_tx = console
+        .lock()
+        .unwrap()
+        .process_control_tx(memory.as_shared_slice(), RAM_BASE);
     if !control_tx.is_empty() {
         progressed = true;
         crate::vmm_trace::write_console_io(format_args!(

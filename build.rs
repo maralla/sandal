@@ -9,7 +9,6 @@ fn main() {
         println!("cargo::rustc-cfg=sandal_embed_kernel");
     }
 
-
     #[cfg(target_os = "macos")]
     {
         // Link against Hypervisor framework on macOS
@@ -33,4 +32,3 @@ fn main() {
         panic!("This project supports macOS (Hypervisor.framework) and Linux (KVM)");
     }
 }
-

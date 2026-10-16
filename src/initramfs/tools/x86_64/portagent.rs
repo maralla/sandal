@@ -93,12 +93,11 @@ pub fn portagent_helper() -> &'static [u8] {
 fn build_portagent_elf() -> Vec<u8> {
     use crate::elf::x86_64::{
         add_i, add_rr_, and_r_imm, cmp_i, cmp_rr_, lea, load64, loadb_inc, loadzx16, loadzx32,
-        mov_i, mov_rr_, shl_r_imm, shr_r_imm, store64, storeb_inc, sub_i, sub_rr_, sys,
-        xclose, xdup3, xexit, xfork, xioctl_imm, xreg, xsetsid, xstrings, zero, Branch,
-        X86ElfBuilder,
+        mov_i, mov_rr_, shl_r_imm, shr_r_imm, store64, storeb_inc, sub_i, sub_rr_, sys, xclose,
+        xdup3, xexit, xfork, xioctl_imm, xreg, xsetsid, xstrings, zero, Branch, X86ElfBuilder,
     };
     use crate::elf::x86_64_linux as lx;
-    use crate::elf::x86_64_linux::nr as nr;
+    use crate::elf::x86_64_linux::nr;
 
     const FRAME: i32 = 8752;
     const WS: i32 = 16; // the winsize (TIOCSWINSZ's arg)
@@ -123,9 +122,8 @@ fn build_portagent_elf() -> Vec<u8> {
     // when their target block is emitted (see X86ElfBuilder::patch_branch).
     type Fwd = Vec<(usize, Branch)>;
     let mut e = X86ElfBuilder::new();
-    let fwd = |e: &mut X86ElfBuilder, br: Branch| -> (usize, Branch) {
-        (e.branch_placeholder(br), br)
-    };
+    let fwd =
+        |e: &mut X86ElfBuilder, br: Branch| -> (usize, Branch) { (e.branch_placeholder(br), br) };
     let patch = |e: &mut X86ElfBuilder, v: &mut Fwd| {
         for (at, br) in v.drain(..) {
             e.patch_branch(at, br);
@@ -134,10 +132,7 @@ fn build_portagent_elf() -> Vec<u8> {
 
     // The data section, addressed rip-relative (lea!): the ptmx path, the
     // forced "-i", the TIOCSPTLCK zero argument, the nanosleep timespec.
-    xstrings!(e,
-        s_ptmx = "/dev/ptmx",
-        s_mi = "-i",
-    );
+    xstrings!(e, s_ptmx = "/dev/ptmx", s_mi = "-i",);
     let s_zero = e.emit_data_bytes(&[0u8; 8]);
     let s_nap = e.emit_data_bytes(&{
         let mut b = [0u8; 16];
@@ -257,8 +252,8 @@ fn build_portagent_elf() -> Vec<u8> {
     mov_rr_!(e, rax, rbp); // cols
     e.emit(&shl_r_imm(xreg!(rax), 16));
     add_rr_!(e, rdx, rax); // ws_q
-    // Validity, 1..=4096 each: a zero value (Je) or an over-4096 value
-    // (after -1, Jg) skips the ioctl — the reference does the same.
+                           // Validity, 1..=4096 each: a zero value (Je) or an over-4096 value
+                           // (after -1, Jg) skips the ioctl — the reference does the same.
     let mut p_skip_geo: Fwd = vec![];
     cmp_i!(e, rbx, 0); // rows
     p_skip_geo.push(fwd(&mut e, Branch::Je));
@@ -306,7 +301,7 @@ fn build_portagent_elf() -> Vec<u8> {
     e.emit(&shl_r_imm(xreg!(rdx), 32));
     add_rr_!(e, rax, rdx);
     store64!(e, rsp, 8, rax); // pfds[1] = {master, POLLIN}
-    // poll(pfds, 2, -1) — block until one side is ready.
+                              // poll(pfds, 2, -1) — block until one side is ready.
     mov_rr_!(e, rdi, rsp);
     mov_i!(e, rsi, 2);
     mov_i!(e, rdx, -1);
@@ -347,10 +342,10 @@ fn build_portagent_elf() -> Vec<u8> {
     loadzx32!(e, rax, r14, 0); // the magic dword
     cmp_i!(e, rax, RESIZE_MAGIC);
     p_copy.push(fwd(&mut e, Branch::Jne)); // not a record → copy the byte
-    // The record's fields: cols at +4, rows at +6 (zero-extended loads).
+                                           // The record's fields: cols at +4, rows at +6 (zero-extended loads).
     loadzx16!(e, rax, r14, 4); // cols
     loadzx16!(e, rcx, r14, 6); // rows
-    // The winsize qword FIRST (parked in rdx — the checks mutate).
+                               // The winsize qword FIRST (parked in rdx — the checks mutate).
     mov_rr_!(e, rdx, rax); // cols
     e.emit(&shl_r_imm(xreg!(rdx), 16));
     mov_rr_!(e, rax, rcx); // rows
@@ -431,7 +426,7 @@ fn build_portagent_elf() -> Vec<u8> {
     sys!(e, nr::READ);
     cmp_i!(e, rax, 0);
     let mut p_reap = vec![fwd(&mut e, Branch::Jle)]; // ≤ 0 → the session is dead
-    // The write pump into the port (same shape as the input side).
+                                                     // The write pump into the port (same shape as the input side).
     mov_rr_!(e, r14, rsp);
     add_i!(e, r14, OUT_BUF);
     mov_rr_!(e, r15, rax);
@@ -466,9 +461,9 @@ fn build_portagent_elf() -> Vec<u8> {
     sys!(e, nr::WAIT4);
     load64!(e, rax, rsp, STATUS);
     mov_rr_!(e, rcx, rax); // rcx = the original status (the and below
-    // destroys rax — the normal path must re-read the ORIGINAL, exactly
-    // like the reference's `(status & 0xff) ? ... : (status >> 8)` reads
-    // `status` twice)
+                           // destroys rax — the normal path must re-read the ORIGINAL, exactly
+                           // like the reference's `(status & 0xff) ? ... : (status >> 8)` reads
+                           // `status` twice)
     e.emit(&and_r_imm(xreg!(rax), 0xFF)); // the signal half
     cmp_i!(e, rax, 0);
     let mut p_normal = vec![fwd(&mut e, Branch::Je)];

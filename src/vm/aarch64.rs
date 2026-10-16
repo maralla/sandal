@@ -198,6 +198,7 @@ impl Vmm {
                 self.console.lock().unwrap().push_rx_and_drain(
                     self.memory.as_shared_slice(),
                     RAM_BASE,
+                    crate::virtio::console::CONSOLE_RX,
                     &chunk,
                 );
             }

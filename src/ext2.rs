@@ -1734,7 +1734,8 @@ fn try_append_dir_entry_to_block(
     if start_at.is_none() {
         let mut off = 0usize;
         while off + 8 <= bs {
-            let rec_len = u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
+            let rec_len =
+                u16::from_le_bytes(dir_block[off + 4..off + 6].try_into().unwrap()) as usize;
             if rec_len == 0 {
                 break;
             }
@@ -1935,13 +1936,8 @@ fn add_dir_entry(
     for blk in dir_blocks {
         let block_off = blk as usize * bs;
         let dir_block = &mut image[block_off..block_off + bs];
-        let (inserted, after) = try_append_dir_entry_to_block(
-            dir_block,
-            child_ino,
-            child_name,
-            child_ft,
-            None,
-        )?;
+        let (inserted, after) =
+            try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft, None)?;
         tail = (blk, after);
         if inserted {
             alloc.dir_tails.insert(dir_ino, tail);
@@ -1972,7 +1968,10 @@ fn append_fresh_dir_block(
 ) -> Result<()> {
     let inode = Ext2Inode::parse(image, sb, bgdt, dir_ino)?;
     if !inode.is_dir() {
-        anyhow::bail!("append_fresh_dir_block: inode {} is not a directory", dir_ino);
+        anyhow::bail!(
+            "append_fresh_dir_block: inode {} is not a directory",
+            dir_ino
+        );
     }
     let bs = sb.block_size;
     let new_blk = alloc_block(image, sb, bgdt, alloc)?;
@@ -1983,13 +1982,8 @@ fn append_fresh_dir_block(
         *b = 0;
     }
     let dir_block = &mut image[block_off..block_off + bs];
-    let (inserted, after) = try_append_dir_entry_to_block(
-        dir_block,
-        child_ino,
-        child_name,
-        child_ft,
-        None,
-    )?;
+    let (inserted, after) =
+        try_append_dir_entry_to_block(dir_block, child_ino, child_name, child_ft, None)?;
     if !inserted {
         anyhow::bail!(
             "Not enough space in fresh directory block for entry '{}'",
@@ -2107,6 +2101,15 @@ fn ensure_dir_path(
 ///
 /// Blocks and inodes are allocated from `alloc`, so a batch of writes shares
 /// one monotonic cursor instead of rescanning the bitmaps from the start.
+/// The sparse-overlay context `inject_file` threads through: the layer
+/// image (Arc-shared with the test harness), the byte offset the sparse
+/// region starts at, and the region list the caller owns.
+pub type SparseOverlayCtx<'a> = (
+    std::sync::Arc<Vec<u8>>,
+    usize,
+    &'a mut Vec<crate::virtio::blk::SparseRegion>,
+);
+
 pub fn inject_file(
     image: &mut [u8],
     sb: &Ext2Superblock,
@@ -2161,11 +2164,7 @@ fn inject_file_inner(
     path: &str,
     data: &[u8],
     perm: u16,
-    sparse: Option<(
-        std::sync::Arc<Vec<u8>>,
-        usize,
-        &mut Vec<crate::virtio::blk::SparseRegion>,
-    )>,
+    sparse: Option<SparseOverlayCtx<'_>>,
 ) -> Result<()> {
     let parts: Vec<&str> = path.split('/').collect();
     let (dir_parts, file_name) = parts.split_at(parts.len() - 1);
@@ -2232,8 +2231,7 @@ fn inject_file_inner(
     // metadata pass).
     let runs: Vec<(usize, usize, usize)> = {
         // (image offset, source offset, length) per block, then merged.
-        let mut blocks: Vec<(usize, usize, usize)> =
-            Vec::with_capacity(block_nums.len());
+        let mut blocks: Vec<(usize, usize, usize)> = Vec::with_capacity(block_nums.len());
         let mut src_off = 0usize;
         for &blk in &block_nums {
             let len = (data.len() - src_off).min(bs);
@@ -2265,8 +2263,7 @@ fn inject_file_inner(
         }
         None => {
             for &(off, src_off, len) in &runs {
-                image[off..off + len]
-                    .copy_from_slice(&data[src_off..src_off + len]);
+                image[off..off + len].copy_from_slice(&data[src_off..src_off + len]);
             }
         }
     }
@@ -2889,7 +2886,7 @@ mod tests {
         let refs = crate::tar::read_tar_ref(&tar).unwrap();
         let tar = std::sync::Arc::new(tar);
         let mut regions = Vec::new();
-        inject_tar_entries_ref(&mut img, &[tar.clone()], &refs, &mut regions).unwrap();
+        inject_tar_entries_ref(&mut img, std::slice::from_ref(&tar), &refs, &mut regions).unwrap();
         for r in &regions {
             // The flatten, as the device does it (the export path).
             img[r.image_off..r.image_off + r.len]
