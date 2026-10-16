@@ -85,6 +85,34 @@ jobs:
 
       # Only where the runner actually ships it; the ARM runners do not
       # (the suite self-skips there instead of failing).
+      # The debugging branch's instrument: a bare C probe, no VMM, no guest
+      # RAM — if hv_vm_create fails identically here, the failure is the
+      # host's, not the VMM's. Also names 0xFAE9400F from the SDK header.
+      - name: HVF diagnostics (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers
+          sysctl hw.memsize hw.model
+          HDR="$(xcrun --show-sdk-path)/System/Library/Frameworks/Hypervisor.framework/Headers/Hypervisor.h"
+          grep -n "fae940" "$HDR" || true
+          cat > /tmp/hvfprobe.c <<'EOF'
+          #include <Hypervisor/Hypervisor.h>
+          #include <stdio.h>
+          #include <unistd.h>
+          int main(void) {
+              for (int i = 0; i < 12; i++) {
+                  hv_return_t r = hv_vm_create(NULL);
+                  printf("create %2d: %#010x\n", i, r);
+                  if (r == HV_SUCCESS) hv_vm_destroy();
+                  sleep(5);
+              }
+          }
+          EOF
+          cc /tmp/hvfprobe.c -o /tmp/hvfprobe -framework Hypervisor
+          printf '%s\n'             '<?xml version="1.0" encoding="UTF-8"?>'             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'             '<plist version="1.0"><dict><key>com.apple.vm.hypervisor</key><true/></dict></plist>'             > /tmp/ent.plist
+          codesign -s - --entitlements /tmp/ent.plist /tmp/hvfprobe
+          /tmp/hvfprobe
+
       - name: KVM permissions (Linux x86_64)
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
