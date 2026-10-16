@@ -108,6 +108,17 @@ def main() -> None:
     base_fields, base_wall, base_rc = timed_boot([])
     print(f"base boot:  rc={base_rc} wall={base_wall:.2f}s")
     if base_rc != 0:
+        import subprocess as _sp
+
+        out = _sp.run(
+            [str(SANDAL), "--", "uname", "-a"],
+            env=env,
+            stdin=_sp.DEVNULL,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.PIPE,
+            timeout=120,
+        )
+        print("VMM stderr:", out.stderr.decode("utf-8", "replace"))
         raise SystemExit(1)
 
     for name, layer, disk_bound in LAYERS:

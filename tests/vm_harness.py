@@ -144,7 +144,13 @@ class Vm:
 
     def boot(self, label: str = "boot") -> None:
         if not self.wait_for_any(PROMPTS, BOOT_TIMEOUT):
-            raise AssertionError(f"{label}: shell prompt did not appear")
+            # The VMM's own stderr rides the same pty: its exit message
+            # ("Error: ...") is in the buffer — show it, or every boot
+            # failure is a blind guess.
+            tail = self.buf[-2000:].decode("utf-8", "replace")
+            raise AssertionError(
+                f"{label}: shell prompt did not appear; output tail:\n{tail}"
+            )
         # Give the shell a moment to settle at the prompt.
         time.sleep(0.5)
 

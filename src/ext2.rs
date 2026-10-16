@@ -2743,7 +2743,7 @@ pub fn inject_runtime_files(
     // portagent or nothing). A crafted x86_64 ELF — pure machine code
     // built with the per-arch DSL (see portagent.rs) — no toolchain,
     // no sibling binary.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
     inject_file(
         image,
         &sb,
