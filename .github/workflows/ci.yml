@@ -24,15 +24,15 @@ jobs:
   # (KVM/HVF are same-arch). Each entry lints its arch NATIVELY, so every
   # cfg-gated module compiles somewhere: the x86_64 Linux entries cover the
   # KVM code, the macOS entry the aarch64 code (vm/aarch64.rs, the crafted
-  # ARM init, the ARM64 DSL) plus the HVF/macOS modules, the Windows entry
-  # the WHP module — the only place it compiles.
+  # ARM init, the ARM64 DSL) plus the HVF/macOS modules. Windows is not a
+  # supported host: build.rs refuses it outright (macOS/HVF or Linux/KVM).
   #
   # Nested virtualization decides the suite's shape per entry: Linux x86_64
   # (/dev/kvm) and macOS arm64 (HVF) run the FULL 17-entry suite; the ARM
-  # and Windows runners ship none, so there the suite self-skips (the
-  # python tests via vm_harness, the bash gates via their /dev/kvm check)
-  # and the unit tests are the real payload. `make test` IS the suite —
-  # the suite's own skips shape it per runner.
+  # runners ship no /dev/kvm, so there the suite self-skips (the python
+  # tests via vm_harness, the bash gates via their /dev/kvm check) and the
+  # unit tests are the real payload. `make test` IS the suite — the
+  # suite's own skips shape it per runner.
   #
   # Lint first (fastest failures first): format, then clippy — the crate
   # typechecks without the guest kernel or a hypervisor (the rootfs is
@@ -41,8 +41,7 @@ jobs:
   # 17-entry integration suite — boot-time, devices, blk, exit codes,
   # console input, marker passthrough, export, layer, share, geometry,
   # tmux (+attached), python REPL, packages, the curl-hang stress and the
-  # interactive hang gate); plain cargo on Windows, where there is no
-  # make and no nested virtualization — the unit tests are its payload.
+  # interactive hang gate).
   # ─────────────────────────────────────────────────────────────────────
   test:
     name: Test (${{ matrix.name }})
@@ -56,8 +55,6 @@ jobs:
             os: ubuntu-24.04-arm
           - name: macOS aarch64
             os: macos-latest
-          - name: Windows x86_64
-            os: windows-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -73,8 +70,7 @@ jobs:
 
       # The guest kernel is fetched per run (verified against the
       # sandal-assets release SHA256SUMS); caching it skips the download.
-      - name: Cache guest kernel (Unix)
-        if: runner.os != 'Windows'
+      - name: Cache guest kernel
         uses: actions/cache@v4
         with:
           path: vmlinux-sandal-*
@@ -100,13 +96,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build, fetch kernel, run the suite (Unix)
-        if: runner.os != 'Windows'
+      - name: Build, fetch kernel, run the suite
         run: make test
-
-      # No make, no nested virtualization, no bash suite on the Windows
-      # image: the unit tests are the payload (the VM tests would only
-      # self-skip — see vm_harness.host_can_run_vm).
-      - name: Unit tests (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --release

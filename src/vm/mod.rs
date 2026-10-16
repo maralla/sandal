@@ -235,7 +235,9 @@ impl GuestRam {
         // (close(vmfd): ~87 ms, the single largest term of the teardown),
         // and every guest page fault built page tables one page at a time.
         // With 2 MB huge pages behind it, the mmu works 512x coarser.
-        // On `never` hosts this is a no-op (the old behavior).
+        // On `never` hosts this is a no-op (the old behavior). MADV_HUGEPAGE
+        // is a Linux-only constant (macOS has no transparent hugepage advice).
+        #[cfg(target_os = "linux")]
         unsafe {
             libc::madvise(ptr.cast(), len, libc::MADV_HUGEPAGE);
         }
@@ -1219,6 +1221,7 @@ impl Vmm {
         let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
             crate::virtio::console::CONSOLE_RX,
         )));
+        #[cfg(not(target_os = "macos"))]
         let port_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
             // The port stream's query replies (ESC[6n etc. written by the
             // session to its own stdout) must come back through the PORT
