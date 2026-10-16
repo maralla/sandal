@@ -27,8 +27,6 @@ fn main() {
         // or extra libraries needed.
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        panic!("This project supports macOS (Hypervisor.framework) and Linux (KVM)");
-    }
+    // Windows links against the WHP backend (whp.dll) by name from the
+    // Rust side (see src/hypervisor/whp) — no build-script glue needed.
 }

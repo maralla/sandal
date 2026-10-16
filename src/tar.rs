@@ -59,13 +59,13 @@ pub struct TarEntryRef {
 /// [`crate::zchunk::decompress_chunked_file`]); a legacy single-frame
 /// .layer has no parallel path and falls back to the sequential read.
 pub fn read_tar_zst_ref_file(path: &std::path::Path) -> Result<(Vec<u8>, Vec<TarEntryRef>)> {
-    use std::os::unix::fs::FileExt;
-
-    // The magic decides the path — four bytes, no full read.
+    // The magic decides the path — four bytes, no full read. The
+    // positional read is zchunk's pread_exact (pread on Unix,
+    // seek_read on Windows).
     let mut magic = [0u8; 4];
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed to open layer {}", path.display()))?;
-    file.read_at(&mut magic, 0)?;
+    crate::zchunk::pread_exact(&file, 0, &mut magic)?;
     if magic == crate::zchunk::MAGIC {
         let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
         let t = std::time::Instant::now();

@@ -3,9 +3,12 @@
 //! the legacy ISA IRQ pool.
 
 use super::{
-    resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_CONSOLE, MMIO_OFF_DATA_BLK, MMIO_OFF_FS,
-    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG, VIRTIOFS_SIZE,
+    resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_CONSOLE, MMIO_OFF_DATA_BLK,
+    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG,
 };
+// The virtiofs MMIO window is Unix-only (no --share on Windows).
+#[cfg(not(target_os = "windows"))]
+use super::{MMIO_OFF_FS, VIRTIOFS_SIZE};
 use anyhow::{anyhow, Result};
 use std::fs;
 #[cfg(not(target_os = "windows"))]
@@ -216,6 +219,9 @@ impl Vmm {
             "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on",
         );
         let mb = self.mmio_base;
+        // The virtiofs pushes below are Unix-only; on Windows the vec
+        // never mutates past the literal.
+        #[cfg_attr(target_os = "windows", allow(unused_mut))]
         let mut devices: Vec<(u64, u32)> = vec![
             (mb + MMIO_OFF_NET, ISA_IRQ_POOL[0]),
             (mb + MMIO_OFF_CONSOLE, ISA_IRQ_POOL[1]),

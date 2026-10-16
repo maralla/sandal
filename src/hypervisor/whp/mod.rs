@@ -156,7 +156,7 @@ type FnSetVpRegisters = unsafe extern "system" fn(
 ) -> i32;
 
 #[derive(Clone, Copy)]
-struct WhvApi {
+pub(crate) struct WhvApi {
     create_partition: FnCreatePartition,
     setup_partition: FnSetupPartition,
     create_virtual_processor: FnCreateVirtualProcessor,
@@ -179,7 +179,7 @@ fn whv_api() -> Result<WhvApi> {
     static API: Mutex<Option<WhvApi>> = Mutex::new(None);
     let mut cached = API.lock().unwrap();
     if cached.is_some() {
-        return Ok(cached.clone().unwrap());
+        return Ok((*cached).unwrap());
     }
     let loaded = (|| unsafe {
         let lib_name: Vec<u16> = "WindowsHypervisorPlatform.dll\0".encode_utf16().collect();
@@ -230,7 +230,7 @@ fn whv_api() -> Result<WhvApi> {
         })
     })();
     let api = loaded?;
-    *cached = Some(api.clone());
+    *cached = Some(api);
     Ok(api)
 }
 
@@ -511,8 +511,8 @@ fn decode_x64_mmio(code: &[u8]) -> Option<DecodedMmio> {
     let modrm = *code.get(i)?;
     i += 1;
     let mode = modrm >> 6;
-    let reg = ((modrm >> 3) & 7) as u8;
-    let rm = (modrm & 7) as u8;
+    let reg = (modrm >> 3) & 7;
+    let rm = modrm & 7;
     if mode == 3 {
         // Register-to-register: not an MMIO access.
         return None;
@@ -590,6 +590,10 @@ impl Vm {
             partition,
             api,
             pic: Arc::new(Mutex::new(Pic::new(partition, api))),
+            // The raw mapping pointer never crosses threads (the WHP run
+            // loop owns it); the PIC does (its tick thread) and carries
+            // its own unsafe impl Send/Sync.
+            #[allow(clippy::arc_with_non_send_sync)]
             ram: Arc::new(Mutex::new(None)),
         })
     }
@@ -816,9 +820,9 @@ impl Vcpu {
 
                 if is_write {
                     let mut data = [0u8; 8];
-                    if decoded.gpr.is_some() {
+                    if let Some(gpr) = decoded.gpr {
                         // The store source register holds the value.
-                        let reg_name = WHV_X64_REGISTER_RAX + decoded.gpr.unwrap() as u32;
+                        let reg_name = WHV_X64_REGISTER_RAX + gpr as u32;
                         let mut buf = [0u8; 16];
                         let hr = unsafe {
                             (api.get_vp_registers)(

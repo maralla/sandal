@@ -35,11 +35,11 @@ impl Vmm {
             }
 
             // ── Guest console TX → host stdout ─────────────────────────
-            let tx = self
-                .console
-                .lock()
-                .unwrap()
-                .process_tx(self.memory.as_shared_slice(), RAM_BASE);
+            let tx = self.console.lock().unwrap().process_tx(
+                self.memory.as_shared_slice(),
+                RAM_BASE,
+                crate::virtio::console::CONSOLE_TX,
+            );
             if !tx.is_empty() {
                 let mut out = Vec::new();
                 let replied = {
@@ -206,7 +206,6 @@ pub(super) fn spawn_device_threads(vmm: &mut Vmm) -> DeviceThreads {
         let halt = vmm.halt_waker();
         #[cfg(not(target_os = "windows"))]
         let net = vmm.net.clone();
-        let memory = vmm.memory.clone();
 
         handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
@@ -265,6 +264,7 @@ pub(super) fn spawn_device_threads(vmm: &mut Vmm) -> DeviceThreads {
                     console.lock().unwrap().push_rx_and_drain(
                         memory.as_shared_slice(),
                         RAM_BASE,
+                        crate::virtio::console::CONSOLE_RX,
                         &chunk[..read as usize],
                     );
                     pic.lock().unwrap().raise(5); // the console IRQ line

@@ -275,22 +275,18 @@ pub fn decompress_chunked(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// file-to-buffer copy disappears: each worker reads its own compressed
 /// chunk into a small per-chunk buffer and decodes straight out of it.
 pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
-
     let file =
         std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-    let fd = file.as_raw_fd();
-    let file_len = {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } != 0 {
-            return Err(anyhow::anyhow!("fstat {}: failed", path.display()));
-        }
-        st.st_size as usize
-    };
+    let file_len = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
+        .len() as usize;
+    // The workers below read positionally through &file (see pread_exact).
+    let file = &file;
 
     // The header.
     let mut head = [0u8; 24];
-    pread_exact(fd, 0, &mut head)?;
+    pread_exact(file, 0, &mut head)?;
     if head[..4] != MAGIC {
         anyhow::bail!("not a chunked container");
     }
@@ -316,7 +312,7 @@ pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>
         anyhow::bail!("chunked container: truncated header");
     }
     let mut sizes = vec![0u8; 4 * chunks];
-    pread_exact(fd, 24, &mut sizes)?;
+    pread_exact(file, 24, &mut sizes)?;
     let mut offsets = Vec::with_capacity(chunks + 1);
     let mut acc = header_end;
     for i in 0..chunks {
@@ -403,7 +399,7 @@ pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>
                     // — the read rides the decode's parallelism instead
                     // of serializing ahead of it.
                     let comp = &mut comp[..comp_len];
-                    pread_exact(fd, offsets[i], comp)?;
+                    pread_exact(file, offsets[i], comp)?;
                     let base = (i - lo) * chunk_size;
                     let dst = &mut slice[base..base + want];
                     // Decode straight out of the buffer into the output
@@ -431,7 +427,13 @@ pub fn decompress_chunked_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>
 
 /// `pread` exactly `buf.len()` bytes at `off` (a helper for the
 /// per-worker chunk reads; every short read is an error).
-fn pread_exact(fd: libc::c_int, off: usize, buf: &mut [u8]) -> anyhow::Result<()> {
+/// Positional whole-buffer read at `off`: Unix `pread` on the raw fd;
+/// Windows `FileExt::read_at` (an OVERLAPPED ReadFile — no shared file
+/// pointer, safe to call from the decode workers).
+#[cfg(unix)]
+pub(crate) fn pread_exact(file: &std::fs::File, off: usize, buf: &mut [u8]) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
     let mut done = 0usize;
     while done < buf.len() {
         let n = unsafe {
@@ -446,6 +448,22 @@ fn pread_exact(fd: libc::c_int, off: usize, buf: &mut [u8]) -> anyhow::Result<()
             anyhow::bail!("pread at {off}: short read ({done}/{})", buf.len());
         }
         done += n as usize;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn pread_exact(file: &std::fs::File, off: usize, buf: &mut [u8]) -> anyhow::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file
+            .seek_read(&mut buf[done..], (off + done) as u64)
+            .map_err(|e| anyhow::anyhow!("seek_read at {off}: {e}"))?;
+        if n == 0 {
+            anyhow::bail!("read_at at {off}: short read ({done}/{})", buf.len());
+        }
+        done += n;
     }
     Ok(())
 }

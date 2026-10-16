@@ -11,6 +11,7 @@
 //!   architectures share.
 
 pub(crate) use crate::cli::Args;
+#[cfg(not(target_os = "windows"))]
 pub(crate) use crate::irqs::{SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG};
 
 use crate::hypervisor::{Vcpu, Vm};
@@ -200,10 +201,7 @@ impl GuestRam {
             panic!("failed to VirtualAlloc {len} bytes of guest RAM");
         }
 
-        GuestRam {
-            ptr: ptr as *mut u8,
-            len,
-        }
+        GuestRam { ptr, len }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -326,7 +324,7 @@ impl Drop for GuestRam {
 /// strings, so no user content can ever act as a protocol (the class of
 /// the vim screen-desync bug: a marker matched mid-redraw swallowed the
 /// rest of a newline-less TUI burst).
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 pub(crate) struct ConsoleTxFilter {
     /// Which RX queue (host → guest) this stream's terminal-query replies
     /// are injected through: the stream's own port's RX queue.
@@ -363,7 +361,7 @@ pub(crate) struct ConsoleTxFilter {
     alt_screen: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 impl ConsoleTxFilter {
     pub(crate) fn new(rx_queue: usize) -> Self {
         ConsoleTxFilter {
@@ -807,6 +805,7 @@ impl Vmm {
     }
 
     /// Map a guest physical address to a virtiofs device index, if in range.
+    #[cfg(not(target_os = "windows"))]
     fn virtiofs_index(&self, addr: u64) -> Option<usize> {
         let start = self.mmio_window() + MMIO_OFF_FS;
         let end = start + MAX_FS_DEVICES as u64 * VIRTIOFS_SIZE;
@@ -986,8 +985,8 @@ fn build_data_disk(args: &Args) -> Result<(Vec<u8>, Vec<crate::virtio::blk::Spar
 impl Vmm {
     fn new(args: &Args) -> Result<Self> {
         #[cfg(target_os = "windows")]
-        let args_no_network = true; // the user-space netstack is unix-only for now
-                                    //
+        let _args_no_network = true; // the user-space netstack is unix-only for now
+                                     //
         #[cfg(not(target_os = "windows"))]
         let args_no_network = args.no_network;
 
@@ -1088,9 +1087,9 @@ impl Vmm {
             // output OFF (the guest's CRLF is authoritative; the host-side
             // console_eprintln carries its own CR).
             unsafe extern "system" {
-                fn GetStdHandle(which: u32) -> *mut u8;
-                fn GetConsoleMode(handle: *mut u8, mode: *mut u32) -> i32;
-                fn SetConsoleMode(handle: *mut u8, mode: u32) -> i32;
+                fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+                fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+                fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
             }
 
             const STD_INPUT_HANDLE: u32 = 0xFFFF_FFD6;
@@ -1145,7 +1144,10 @@ impl Vmm {
 
         // Track host terminal resizes: the SIGWINCH handler only sets a
         // flag; the run loop applies the new geometry (and interrupts the
-        // guest) on its next iteration.
+        // guest) on its next iteration. Unix only — Windows has no
+        // SIGWINCH (a console resize arrives as an input event); there
+        // the boot geometry stands.
+        #[cfg(not(target_os = "windows"))]
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = winch_handler as extern "C" fn(i32) as usize;
@@ -1488,8 +1490,8 @@ impl Drop for Vmm {
         // line/echo/processed; output re-enables processed output).
         #[cfg(target_os = "windows")]
         unsafe extern "system" {
-            fn GetStdHandle(which: u32) -> *mut u8;
-            fn SetConsoleMode(handle: *mut u8, mode: u32) -> i32;
+            fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+            fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
         }
 
         #[cfg(target_os = "windows")]
@@ -1569,8 +1571,8 @@ impl Vmm {
             }
         }
 
+        #[cfg(not(target_os = "windows"))]
         if let Some(idx) = self.virtiofs_index(addr) {
-            #[cfg(not(target_os = "windows"))]
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 return dev.mmio_read(addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE) as u64;
             }
@@ -1724,8 +1726,8 @@ impl Vmm {
             }
         }
 
+        #[cfg(not(target_os = "windows"))]
         if let Some(idx) = self.virtiofs_index(addr) {
-            #[cfg(not(target_os = "windows"))]
             if let Some(dev) = self.virtiofs.get_mut(idx) {
                 let off = addr - mw - MMIO_OFF_FS - idx as u64 * VIRTIOFS_SIZE;
                 if let Some(qidx) = dev.mmio_write(off, val as u32) {

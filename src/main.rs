@@ -1,3 +1,10 @@
+// The Windows backend is a port in progress: the shared device model and
+// the guest helpers compile everywhere, but their Unix-only call sites
+// (the SPI layout, portagent, the winch machinery, the port session) are
+// unreachable there. Allow dead code on Windows only — every other host
+// keeps the lint, so real dead code still gets caught.
+#![cfg_attr(target_os = "windows", allow(dead_code))]
+
 // The VMM runs the host terminal with output processing disabled (guest
 // escape sequences must pass verbatim), which also stops the terminal from
 // translating `\n` to `\r\n` — so the VMM's own diagnostics would print as

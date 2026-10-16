@@ -24,8 +24,10 @@ jobs:
   # (KVM/HVF are same-arch). Each entry lints its arch NATIVELY, so every
   # cfg-gated module compiles somewhere: the x86_64 Linux entries cover the
   # KVM code, the macOS entry the aarch64 code (vm/aarch64.rs, the crafted
-  # ARM init, the ARM64 DSL) plus the HVF/macOS modules. Windows is not a
-  # supported host: build.rs refuses it outright (macOS/HVF or Linux/KVM).
+  # ARM init, the ARM64 DSL) plus the HVF/macOS modules, and the Windows
+  # entry the WHP backend — build.rs links whp.dll by name and the crate
+  # compiles clean there (verified from WSL against the MSVC toolchain:
+  # clippy -D warnings and the unit tests pass natively).
   #
   # Nested virtualization decides the suite's shape per entry: Linux x86_64
   # (/dev/kvm) and macOS arm64 (HVF) run the FULL 17-entry suite; the ARM
@@ -41,7 +43,9 @@ jobs:
   # 17-entry integration suite — boot-time, devices, blk, exit codes,
   # console input, marker passthrough, export, layer, share, geometry,
   # tmux (+attached), python REPL, packages, the curl-hang stress and the
-  # interactive hang gate).
+  # interactive hang gate); plain cargo on Windows, which has no make and
+  # no nested virtualization on GitHub runners — its payload is the unit
+  # tests (the VM tests would only self-skip: vm_harness.host_can_run_vm).
   # ─────────────────────────────────────────────────────────────────────
   test:
     name: Test (${{ matrix.name }})
@@ -55,6 +59,8 @@ jobs:
             os: ubuntu-24.04-arm
           - name: macOS aarch64
             os: macos-latest
+          - name: Windows x86_64
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -70,7 +76,8 @@ jobs:
 
       # The guest kernel is fetched per run (verified against the
       # sandal-assets release SHA256SUMS); caching it skips the download.
-      - name: Cache guest kernel
+      - name: Cache guest kernel (Unix)
+        if: runner.os != 'Windows'
         uses: actions/cache@v4
         with:
           path: vmlinux-sandal-*
@@ -96,5 +103,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build, fetch kernel, run the suite
+      - name: Build, fetch kernel, run the suite (Unix)
+        if: runner.os != 'Windows'
         run: make test
+
+      - name: Unit tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --release
