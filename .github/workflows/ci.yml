@@ -100,7 +100,12 @@ jobs:
           HDR="$(find "$(xcrun --show-sdk-path)" /System/Library/Frameworks \
                 -name Hypervisor.h 2>/dev/null | head -1)"
           echo "header: ${HDR:-not found}"
-          grep -nE "HV_[A-Z_]+ *=|fae940" "$HDR" || echo "no HV constants found"
+          HDRDIR="$(dirname "$HDR")"
+          grep -rnE "HV_[A-Z_]+ *= *0x|fae940" "$HDRDIR" || echo "no HV constants in any header"
+          # The values may live only in the binary (extern consts): ask it.
+          FW="/System/Library/Frameworks/Hypervisor.framework/Hypervisor"
+          nm "$FW" 2>/dev/null | grep -i " HV_" || true
+          otool -tV "$FW" 2>/dev/null | grep -n "fae9400f" | head -5 || echo "0xfae9400f not in the binary text"
           cat > /tmp/hvfprobe.c <<'EOF'
           #include <Hypervisor/Hypervisor.h>
           #include <stdio.h>
