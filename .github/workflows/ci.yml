@@ -100,6 +100,7 @@ jobs:
           #include <stdio.h>
           #include <unistd.h>
           int main(void) {
+              setvbuf(stdout, NULL, _IONBF, 0); // a SIGKILL loses buffers
               for (int i = 0; i < 12; i++) {
                   hv_return_t r = hv_vm_create(NULL);
                   printf("create %2d: %#010x\n", i, r);
@@ -109,9 +110,13 @@ jobs:
           }
           EOF
           cc /tmp/hvfprobe.c -o /tmp/hvfprobe -framework Hypervisor
-          printf '%s\n'             '<?xml version="1.0" encoding="UTF-8"?>'             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'             '<plist version="1.0"><dict><key>com.apple.vm.hypervisor</key><true/></dict></plist>'             > /tmp/ent.plist
-          codesign -s - --entitlements /tmp/ent.plist /tmp/hvfprobe
-          /tmp/hvfprobe
+          # The PROJECT's entitlements, exactly like make build signs sandal —
+          # the hand-rolled plist used the wrong key (com.apple.vm.hypervisor
+          # vs the project's com.apple.security.hypervisor) and got SIGKILL'd
+          # as unauthorized, proving nothing about the runner.
+          codesign -s - --entitlements sandal.entitlements /tmp/hvfprobe
+          # Never fail the job: the diagnostics report, the suite still runs.
+          /tmp/hvfprobe || echo "probe killed (exit $?): HVF refused at the kernel"
 
       - name: KVM permissions (Linux x86_64)
         if: runner.os == 'Linux' && runner.arch == 'X64'
