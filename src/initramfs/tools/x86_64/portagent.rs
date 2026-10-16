@@ -20,9 +20,9 @@
 //! convention).
 //!
 //! usage: portagent <port> <rows> <cols> <command> [args...]
-//! exit:  120 = the port open failed, 121 = the pty setup failed,
-//!        125 = the session exec failed, 126 = bad arguments,
-//!        otherwise the session's status.
+//! exit:  120 = the port open failed, 121 = the session setup failed
+//!        (the pty pair, or a pipe pair), 125 = the session exec failed,
+//!        126 = bad arguments, otherwise the session's status.
 //!
 //! Pure machine code, built with the x86_64 DSL — no toolchain, no
 //! sibling binary. The program documentation below IS the reference —
@@ -31,23 +31,27 @@
 //!
 //! ```text
 //! r15 = the initial sp ([r15]=argc, [r15+8+8i]=argv[i]), r14 = argc
-//! rsp -= FRAME (16-aligned): [rsp]=pollfd[2], [rsp+16]=the winsize,
-//!       [rsp+24]=the wait status, [rsp+32]=the pty slave fd,
+//! rsp -= FRAME (16-aligned): [rsp]=pollfd[2], [rsp+16]=the winsize or
+//!       the transient pipe pair, [rsp+24]=the wait status,
+//!       [rsp+32]=the pty slave fd / the input pipe's write end,
 //!       [rsp+40]=nargv[64], [rsp+552]=in_buf, [rsp+4648]=out_buf
 //! r13 = openat(argv[1], O_RDWR)              < 0 → exit(120)
-//! r12 = openat("/dev/ptmx", O_RDWR)          < 0 → exit(121)
-//! ioctl(r12, TIOCSPTLCK, &0)                 < 0 → exit(121)  (unlockpt)
-//! [rsp+32] = ioctl(r12, TIOCGPTPEER, O_RDWR) < 0 → exit(121) (the slave)
-//! rows = atol(argv[2]); cols = atol(argv[3]) — the boot geometry;
-//!       each valid (1..=4096) → ioctl(r12, TIOCSWINSZ, {rows, cols}),
-//!       applied to the pair BEFORE the fork (no session exists yet, so
-//!       the kernel's SIGWINCH lands on nobody)
-//! rbx = clone(SIGCHLD)                       < 0 → exit(121)
-//! rbx == 0 → the SESSION: setsid, close(r12, r13), dup3(slave, 0/1/2),
-//!       close(slave), ioctl(0, TIOCSCTTY, 1) — the pty slave as the
-//!       controlling terminal — then execve(argv[4], nargv, envp) with
-//!       "-i" forced when argc == 5, exit(125) if the exec failed
-//! rbx > 0 → the BRIDGE: close(slave), then a poll loop:
+//! rows = atol(argv[2]); cols = atol(argv[3]) — the advertised session
+//!       geometry; zero rows or zero cols → the PIPE transport (below),
+//!       else the PTY transport:
+//! PTY:  r12 = openat("/dev/ptmx", O_RDWR)    < 0 → exit(121)
+//!       ioctl(r12, TIOCSPTLCK, &0)           < 0 → exit(121) (unlockpt)
+//!       [rsp+32] = ioctl(r12, TIOCGPTPEER, O_RDWR) < 0 → exit(121)
+//!       rows/cols each valid (1..=4096) → ioctl(r12, TIOCSWINSZ,
+//!       {rows, cols}) — applied BEFORE the fork (no session exists yet,
+//!       so the kernel's SIGWINCH lands on nobody)
+//!       rbx = clone(SIGCHLD)                 < 0 → exit(121)
+//!       rbx == 0 → the SESSION: setsid, close(r12, r13), dup3(slave,
+//!       0/1/2), close(slave), ioctl(0, TIOCSCTTY, 1) — the pty slave
+//!       as the controlling terminal — then the shared exec tail
+//!       (execve(argv[4], nargv, envp) with "-i" forced when argc == 5,
+//!       exit(125) if the exec failed)
+//!       rbx > 0 → the BRIDGE: close(slave), then a poll loop:
 //!       poll({r13, r12}, POLLIN, -1)
 //!       r13 readable → read(r13, in_buf): ≤ 0 → nanosleep(100 ms);
 //!         else strip every whole "RSZ1" record (valid →
@@ -59,6 +63,22 @@
 //!       the reaper: kill(rbx, SIGKILL), wait4(-1, &status) — a signal
 //!       death (status & 0xff) exits 128+signal; a normal exit forwards
 //!       status >> 8
+//! PIPE: pipe2(&pair, 0) → [A_r, A_w]        < 0 → exit(121)
+//!       [rsp+32] = A_w (the input pipe's write end)
+//!       pipe2(&pair, 0) → [B_r, B_w]        < 0 → exit(121)
+//!       r12 = B_r (the output pipe's read end)
+//!       rt_sigaction(SIGPIPE, SIG_IGN) — a pipe write after the session
+//!       dies must not kill the bridge before the reaper forwards the
+//!       session's own status
+//!       close(A_r = [rsp+32]-1), close(B_w = r12+1)
+//!       rbx = clone(SIGCHLD)                 < 0 → exit(121)
+//!       rbx == 0 → the SESSION: setsid, close(A_w, B_r, r13),
+//!       dup3(A_r, 0), dup3(B_w, 1/2), close(A_r/B_w above 2), no
+//!       TIOCSCTTY (a pipe is not claimable), then the shared exec tail
+//!       rbx > 0 → the BRIDGE: the pty bridge's loop, with A_w
+//!       ([rsp+32]) wherever the pty bridge used its master for input,
+//!       and B_r (r12) wherever it used it for output; the reaper is
+//!       the shared one
 //! ```
 
 use std::sync::OnceLock;
@@ -134,6 +154,14 @@ fn build_portagent_elf() -> Vec<u8> {
     // forced "-i", the TIOCSPTLCK zero argument, the nanosleep timespec.
     xstrings!(e, s_ptmx = "/dev/ptmx", s_mi = "-i",);
     let s_zero = e.emit_data_bytes(&[0u8; 8]);
+    // rt_sigaction's kernel_sigaction: {handler, flags, restorer, mask} —
+    // SIG_IGN and nothing else (no restorer: no handler ever runs, no
+    // mask: nothing is blocked). The PIPE transport's bridge only.
+    let s_sigign = e.emit_data_bytes(&{
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&lx::SIG_IGN.to_le_bytes());
+        b
+    });
     let s_nap = e.emit_data_bytes(&{
         let mut b = [0u8; 16];
         b[8..].copy_from_slice(&NAP_NSEC.to_le_bytes());
@@ -245,6 +273,17 @@ fn build_portagent_elf() -> Vec<u8> {
     mov_rr_!(e, rbp, rdx);
     e.branch_back(Branch::Jmp, atol_cols);
     patch(&mut e, &mut p_atol); // cols done (rbp); fall through
+
+    // Zero rows or zero cols → the PIPE transport (emitted at the very
+    // end, behind everything else): the VMM sends zero exactly when its
+    // own stdio is not a terminal, and a programmatic session must get
+    // the command's own bytes back — nothing colorizes (isatty is false
+    // inside the guest) and no line discipline translates the output.
+    let mut p_pipe: Fwd = vec![];
+    cmp_i!(e, rbx, 0); // rows
+    p_pipe.push(fwd(&mut e, Branch::Je));
+    cmp_i!(e, rbp, 0); // cols
+    p_pipe.push(fwd(&mut e, Branch::Je));
 
     // The winsize qword FIRST (parked in rdx — the checks below mutate
     // rbx/rbp): rows | cols<<16 = {rows, cols, 0, 0}.
@@ -449,6 +488,8 @@ fn build_portagent_elf() -> Vec<u8> {
     // The session is gone (or its transport is). Forward the status:
     // a signal death (status & 0xff != 0) exits 128+signal (the shell
     // convention); a normal exit forwards status >> 8.
+    // SHARED with the PIPE transport (its bridge jumps here).
+    let at_reaper = e.offset();
     patch(&mut e, &mut p_reap);
     mov_rr_!(e, rdi, rbx);
     mov_i!(e, rsi, SIGKILL);
@@ -506,6 +547,9 @@ fn build_portagent_elf() -> Vec<u8> {
     // a prompt. nargv[0] = argv[4] (the command); the loop copies
     // argv[5..] — ONE counter (rbx = n), the source index = n + d
     // (d = 4 without "-i", 3 with it: the "-i" shifts everything down).
+    // This is the SHARED exec tail: the PIPE transport's child jumps here
+    // (nothing before this line is pty-specific).
+    let at_exec_tail = e.offset();
     load64!(e, rdx, r15, 40); // rdx = argv[4]
     store64!(e, rsp, NARGV, rdx); // nargv[0] = the command
     mov_i!(e, rbx, 1); // n = 1
@@ -565,6 +609,311 @@ fn build_portagent_elf() -> Vec<u8> {
     e.emit(&[0x0F, 0x0B]); // ud2: exit never returns
     patch(&mut e, &mut p_exit121);
     xexit!(e, 121); // the pty setup failed: the marker forwards it
+    e.emit(&[0x0F, 0x0B]); // ud2: exit never returns
+
+    // ── The PIPE transport (appended last: the mode check above is its
+    // only entry, and everything it jumps to is behind it) ──────────
+    //
+    // The programmatic session: two pipes instead of a pty pair. r12 =
+    // B_r — the output pipe's read end, the same register the pty
+    // bridge uses for its master; A_w — the input pipe's write end —
+    // rides the frame's +32 slot (the pty child's slave slot: the pipe
+    // child never reads it), loaded where the pty bridge used its
+    // master for input. The child's fds derive by arithmetic: A_r =
+    // A_w - 1 and B_w = B_r + 1 (pipe2 returns [read, write] pairs,
+    // and the pairs are allocated back to back).
+    //
+    // isatty is false inside the guest, so nothing colorizes, and no
+    // line discipline translates the output: the bytes that cross the
+    // bridge are the command's own. No controlling terminal exists to
+    // claim (TIOCSCTTY on a pipe fails ENOTTY and is ignored), which a
+    // programmatic session has no use for.
+    patch(&mut e, &mut p_pipe);
+    // pipe2(&pair, 0) — the input pipe [A_r, A_w]: plain pipes, no
+    // O_CLOEXEC (the child dups them onto 0/1/2, and execve must not
+    // close them). The transient pair rides the WS slot (+16) — the
+    // same slot the pty path's winsize rode, mode-exclusive.
+    mov_rr_!(e, rdi, rsp);
+    add_i!(e, rdi, WS);
+    zero!(e, rsi);
+    sys!(e, nr::PIPE2);
+    cmp_i!(e, rax, 0);
+    let mut p_pipe_exit121 = vec![fwd(&mut e, Branch::Jl)];
+    loadzx32!(e, rax, rsp, WS + 4); // A_w
+    store64!(e, rsp, SLAVE, rax); // the input pipe's write end
+
+    // pipe2(&pair, 0) — the output pipe [B_r, B_w].
+    mov_rr_!(e, rdi, rsp);
+    add_i!(e, rdi, WS);
+    zero!(e, rsi);
+    sys!(e, nr::PIPE2);
+    cmp_i!(e, rax, 0);
+    p_pipe_exit121.push(fwd(&mut e, Branch::Jl));
+    loadzx32!(e, r12, rsp, WS); // r12 = B_r (the output read end)
+
+    // rt_sigaction(SIGPIPE, SIG_IGN): the input pump's write would die
+    // with the signal the moment the session's stdin reader is gone (a
+    // pipe write after the child dies), before the reaper could forward
+    // the session's own status. The child's disposition is untouched:
+    // this is after the fork... no — BEFORE it, but the pty path never
+    // runs this code, and SIG_IGN must not survive into the child's
+    // execve — so the child re-arms... it cannot. Instead: the child
+    // never sees it — rt_sigaction here, and the child's execve resets
+    // nothing (SIG_IGN survives execve). The pipe child therefore
+    // inherits SIGPIPE ignored — accepted: the child's own pipelines
+    // (sh | pipes) get EPIPE instead of death, which is the safer
+    // failure mode for a programmatic session anyway.
+    mov_i!(e, rdi, lx::SIGPIPE as i32);
+    lea!(e, rsi, s_sigign);
+    zero!(e, rdx); // no oldact
+    mov_i!(e, r10, 8); // sigsetsize
+    sys!(e, nr::RT_SIGACTION);
+
+    xfork!(e);
+    mov_rr_!(e, rbx, rax); // rbx = pid
+    cmp_i!(e, rbx, 0);
+    p_pipe_exit121.push(fwd(&mut e, Branch::Jl)); // clone failed
+    cmp_i!(e, rbx, 0);
+    let mut p_pipe_child = vec![fwd(&mut e, Branch::Je)]; // 0 → the child
+
+    // ── The PIPE bridge (the parent) ───────────────────────────────
+    // close(A_r), close(B_w) — AFTER the fork, this side only: the child
+    // inherits both open (they are its dup sources), and the bridge must
+    // not hold them or the output pipe would never EOF — the session's
+    // death would go unseen. The child's startup window reads as EOF
+    // here (its fds are not wired yet); the WNOHANG gate below keeps
+    // that window from becoming a kill.
+    load64!(e, rcx, rsp, SLAVE);
+    sub_i!(e, rcx, 1); // A_r = A_w - 1
+    xclose!(e, rcx);
+    mov_rr_!(e, rcx, r12);
+    add_i!(e, rcx, 1); // B_w = B_r + 1
+    xclose!(e, rcx);
+    // The pty bridge's loop, verbatim, with A_w (loaded from +32)
+    // wherever the pty bridge used its master for input, and B_r (r12)
+    // wherever it used it for output.
+    let l_pipe_poll = e.offset();
+    mov_rr_!(e, rax, r13);
+    mov_i!(e, rdx, lx::POLLIN as i32);
+    e.emit(&shl_r_imm(xreg!(rdx), 32));
+    add_rr_!(e, rax, rdx);
+    store64!(e, rsp, 0, rax); // pfds[0] = {port, POLLIN}
+    mov_rr_!(e, rax, r12);
+    mov_i!(e, rdx, lx::POLLIN as i32);
+    e.emit(&shl_r_imm(xreg!(rdx), 32));
+    add_rr_!(e, rax, rdx);
+    store64!(e, rsp, 8, rax); // pfds[1] = {B_r, POLLIN}
+    mov_rr_!(e, rdi, rsp);
+    mov_i!(e, rsi, 2);
+    mov_i!(e, rdx, -1);
+    sys!(e, nr::POLL);
+    loadzx16!(e, rax, rsp, 6);
+    cmp_i!(e, rax, 0);
+    let mut p_pipe_out = vec![fwd(&mut e, Branch::Je)];
+
+    // Host input → A_w. A failed read is the port not yet connected (the
+    // control handshake): a paced retry, never a busy loop.
+    mov_rr_!(e, rdi, r13);
+    mov_rr_!(e, rsi, rsp);
+    add_i!(e, rsi, IN_BUF);
+    mov_i!(e, rdx, BUF_LEN);
+    sys!(e, nr::READ);
+    cmp_i!(e, rax, 0);
+    let mut p_pipe_nap = vec![fwd(&mut e, Branch::Jle)];
+
+    // The resize-record strip: the pty bridge's strip, verbatim, with the
+    // ioctl targeting A_w (ENOTTY on a pipe, ignored — no tty to
+    // resize). r14 = src, r15 = dst, rbp = end.
+    mov_rr_!(e, r14, rsp);
+    add_i!(e, r14, IN_BUF); // r14 = src = in_buf
+    mov_rr_!(e, r15, r14); // r15 = dst = in_buf
+    mov_rr_!(e, rbp, r14);
+    add_rr_!(e, rbp, rax); // rbp = end = in_buf + len
+    let l_pipe_strip = e.offset();
+    cmp_rr_!(e, r14, rbp); // src >= end → done
+    let mut p_pipe_done_strip = vec![fwd(&mut e, Branch::Jge)];
+    mov_rr_!(e, rax, rbp);
+    sub_rr_!(e, rax, r14); // end - src
+    cmp_i!(e, rax, 8); // < 8 → no whole record can start here
+    let mut p_pipe_copy = vec![fwd(&mut e, Branch::Jl)];
+    loadzx32!(e, rax, r14, 0); // the magic dword
+    cmp_i!(e, rax, RESIZE_MAGIC);
+    p_pipe_copy.push(fwd(&mut e, Branch::Jne)); // not a record → copy
+    loadzx16!(e, rax, r14, 4); // cols
+    loadzx16!(e, rcx, r14, 6); // rows
+    mov_rr_!(e, rdx, rax); // cols
+    e.emit(&shl_r_imm(xreg!(rdx), 16));
+    mov_rr_!(e, rax, rcx); // rows
+    add_rr_!(e, rdx, rax); // ws_q = cols<<16 | rows
+    let mut p_pipe_skip_ioctl: Fwd = vec![];
+    cmp_i!(e, rax, 0); // rows
+    p_pipe_skip_ioctl.push(fwd(&mut e, Branch::Je));
+    sub_i!(e, rax, 1);
+    cmp_i!(e, rax, RESIZE_MAX);
+    p_pipe_skip_ioctl.push(fwd(&mut e, Branch::Jg));
+    loadzx16!(e, rax, r14, 4); // cols (again — mutated above)
+    cmp_i!(e, rax, 0);
+    p_pipe_skip_ioctl.push(fwd(&mut e, Branch::Je));
+    sub_i!(e, rax, 1);
+    cmp_i!(e, rax, RESIZE_MAX);
+    p_pipe_skip_ioctl.push(fwd(&mut e, Branch::Jg));
+    store64!(e, rsp, WS, rdx);
+    load64!(e, rdi, rsp, SLAVE); // A_w (ENOTTY on a pipe, ignored)
+    mov_i!(e, rsi, lx::TIOCSWINSZ as i32);
+    mov_rr_!(e, rdx, rsp);
+    add_i!(e, rdx, WS);
+    sys!(e, nr::IOCTL);
+    patch(&mut e, &mut p_pipe_skip_ioctl);
+    add_i!(e, r14, 8);
+    e.branch_back(Branch::Jmp, l_pipe_strip);
+    patch(&mut e, &mut p_pipe_copy);
+    loadb_inc!(e, rax, r14); // c = *src; src++
+    storeb_inc!(e, r15, rax); // *dst = c; dst++
+    e.branch_back(Branch::Jmp, l_pipe_strip);
+    // The strip is done: the remainder is the session's input.
+    patch(&mut e, &mut p_pipe_done_strip);
+    mov_rr_!(e, rax, r15);
+    sub_rr_!(e, rax, rsp);
+    sub_i!(e, rax, IN_BUF); // total = dst - in_buf
+    cmp_i!(e, rax, 0);
+    let mut p_pipe_skip_write_in = vec![fwd(&mut e, Branch::Jle)];
+    // The write pump into A_w (partial writes retried until done).
+    mov_rr_!(e, r14, rsp);
+    add_i!(e, r14, IN_BUF);
+    mov_rr_!(e, r15, rax);
+    load64!(e, r12, rsp, SLAVE); // r12 = A_w (the pump's target)
+    let l_pipe_win = e.offset();
+    cmp_i!(e, r15, 0);
+    let mut p_pipe_done_win = vec![fwd(&mut e, Branch::Jle)];
+    mov_rr_!(e, rdi, r12);
+    mov_rr_!(e, rsi, r14);
+    mov_rr_!(e, rdx, r15);
+    sys!(e, nr::WRITE);
+    cmp_i!(e, rax, 0); // n <= 0 → the fd is gone; the loop's reader decides
+    p_pipe_done_win.push(fwd(&mut e, Branch::Jle));
+    add_rr_!(e, r14, rax);
+    sub_rr_!(e, r15, rax);
+    e.branch_back(Branch::Jmp, l_pipe_win);
+    patch(&mut e, &mut p_pipe_done_win);
+    // r12 = B_r again (the input pump clobbered it with A_w).
+    loadzx32!(e, r12, rsp, WS);
+    patch(&mut e, &mut p_pipe_skip_write_in);
+    e.branch_back(Branch::Jmp, l_pipe_poll);
+    // The paced !host_connected retry: 100 ms, then back to the poll loop.
+    patch(&mut e, &mut p_pipe_nap);
+    lea!(e, rdi, s_nap);
+    zero!(e, rsi);
+    sys!(e, nr::NANO_SLEEP);
+    e.branch_back(Branch::Jmp, l_pipe_poll);
+
+    // ── Session output → the port ──────────────────────────────────
+    patch(&mut e, &mut p_pipe_out);
+    loadzx16!(e, rax, rsp, 14);
+    cmp_i!(e, rax, 0);
+    e.branch_back(Branch::Je, l_pipe_poll); // skip → the poll loop
+    mov_rr_!(e, rdi, r12); // B_r
+    mov_rr_!(e, rsi, rsp);
+    add_i!(e, rsi, OUT_BUF);
+    mov_i!(e, rdx, BUF_LEN);
+    sys!(e, nr::READ);
+    cmp_i!(e, rax, 0);
+    let mut p_pipe_reap = vec![fwd(&mut e, Branch::Jle)]; // ≤ 0 → the reaper
+    mov_rr_!(e, r14, rsp);
+    add_i!(e, r14, OUT_BUF);
+    mov_rr_!(e, r15, rax);
+    let l_pipe_wout = e.offset();
+    cmp_i!(e, r15, 0);
+    let mut p_pipe_done_wout = vec![fwd(&mut e, Branch::Jle)];
+    mov_rr_!(e, rdi, r13);
+    mov_rr_!(e, rsi, r14);
+    mov_rr_!(e, rdx, r15);
+    sys!(e, nr::WRITE);
+    cmp_i!(e, rax, 0);
+    p_pipe_done_wout.push(fwd(&mut e, Branch::Jle));
+    add_rr_!(e, r14, rax);
+    sub_rr_!(e, r15, rax);
+    e.branch_back(Branch::Jmp, l_pipe_wout);
+    patch(&mut e, &mut p_pipe_done_wout);
+    e.branch_back(Branch::Jmp, l_pipe_poll); // pumped → the poll loop
+
+    // The output side is gone (EOF on B_r). The PIPE transport's own
+    // race: the bridge closed B_w before the child's dup3s, so the
+    // child's startup window reads as EOF — poll the child instead of
+    // reaping it: wait4(rbx, &status, WNOHANG, 0) returns the pid only
+    // once the child has actually exited (the status filled in); alive
+    // (0) or errored (-1) is the startup window — a paced retry, never
+    // a kill. Only a really-exited child reaches the shared reaper.
+    patch(&mut e, &mut p_pipe_reap);
+    mov_rr_!(e, rdi, rbx); // wait4(rbx, &status, WNOHANG, 0)
+    mov_rr_!(e, rsi, rsp);
+    add_i!(e, rsi, STATUS);
+    mov_i!(e, rdx, 1); // WNOHANG
+    zero!(e, r10);
+    sys!(e, nr::WAIT4);
+    cmp_rr_!(e, rax, rbx); // the pid = exited; 0/-1 = alive/errored
+    let mut p_pipe_reap_now = vec![fwd(&mut e, Branch::Je)];
+    // Alive (or errored): the startup window — a paced retry.
+    let mut p_pipe_reap_retry: Fwd = vec![];
+    p_pipe_reap_retry.push((e.branch_placeholder(Branch::Jmp), Branch::Jmp));
+    patch(&mut e, &mut p_pipe_reap_now);
+    // Exited: the shared reaper (behind this transport).
+    e.branch_back(Branch::Jmp, at_reaper);
+    e.emit(&[0x0F, 0x0B]); // ud2: the jump never returns
+                           // The paced reaper retry: 100 ms, then back to the poll loop (the
+                           // child may still be wiring its fds).
+    {
+        let (at, br) = p_pipe_reap_retry.remove(0);
+        e.patch_branch(at, br);
+    }
+    lea!(e, rdi, s_nap);
+    zero!(e, rsi);
+    sys!(e, nr::NANO_SLEEP);
+    e.branch_back(Branch::Jmp, l_pipe_poll);
+
+    // ── The PIPE session (the child) ───────────────────────────────
+    patch(&mut e, &mut p_pipe_child);
+    // Own session, then the wiring: A_w/B_r/the port are the bridge's
+    // fds — closed here, or the bridge would never see the session die
+    // (its read side would never EOF). A_r becomes fd 0; B_w becomes
+    // fds 1/2; both close above 2. No TIOCSCTTY: a pipe is not
+    // claimable, and a programmatic session has no use for a
+    // controlling terminal.
+    xsetsid!(e);
+    load64!(e, rcx, rsp, SLAVE); // A_w
+    xclose!(e, rcx);
+    xclose!(e, r12); // B_r
+    xclose!(e, r13); // the port
+    load64!(e, rcx, rsp, SLAVE);
+    sub_i!(e, rcx, 1); // A_r = A_w - 1
+    xdup3!(e, rcx, 0);
+    mov_rr_!(e, rcx, r12);
+    add_i!(e, rcx, 1); // B_w = B_r + 1
+    xdup3!(e, rcx, 1);
+    mov_rr_!(e, rcx, r12);
+    add_i!(e, rcx, 1); // B_w (again)
+    xdup3!(e, rcx, 2);
+    load64!(e, rcx, rsp, SLAVE);
+    sub_i!(e, rcx, 1); // A_r
+    cmp_i!(e, rcx, 2);
+    let mut p_pipe_skip_close_in = vec![fwd(&mut e, Branch::Jle)]; // ≤ 2 → closed
+    xclose!(e, rcx);
+    patch(&mut e, &mut p_pipe_skip_close_in);
+    mov_rr_!(e, rcx, r12);
+    add_i!(e, rcx, 1); // B_w
+    cmp_i!(e, rcx, 2);
+    let mut p_pipe_skip_close_out = vec![fwd(&mut e, Branch::Jle)]; // ≤ 2 → closed
+    xclose!(e, rcx);
+    patch(&mut e, &mut p_pipe_skip_close_out);
+    // No TIOCSCTTY: a pipe is not claimable as a controlling terminal.
+    // The shared exec tail (behind this transport): the nargv build and
+    // the execve, identical for both sessions.
+    e.branch_back(Branch::Jmp, at_exec_tail);
+    e.emit(&[0x0F, 0x0B]); // ud2: the jump never returns
+
+    // The PIPE transport's own exit: 121 (a pipe pair failed, or the
+    // clone failed) — the marker forwards it.
+    patch(&mut e, &mut p_pipe_exit121);
+    xexit!(e, 121);
     e.emit(&[0x0F, 0x0B]); // ud2: exit never returns
 
     e.build()

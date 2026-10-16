@@ -29,6 +29,12 @@ pub mod nr {
     pub const OPENAT: u32 = 257;
     pub const MKDIRAT: u32 = 258;
     pub const DUP3: u32 = 292;
+    /// pipe2(2) — the pipe-mode session transport's pipe pairs.
+    pub const PIPE2: u32 = 293;
+    /// rt_sigaction(2) — the bridge ignores SIGPIPE (a pipe write after
+    /// the session dies would kill the bridge before the reaper forwards
+    /// the session's own status).
+    pub const RT_SIGACTION: u32 = 13;
     pub const IOPL: u32 = 172;
     pub const LSEEK: u32 = 8;
 }
@@ -48,6 +54,10 @@ pub const MS_BIND: u32 = 0x1000;
 // ── Signals ───────────────────────────────────────────────────────────
 pub const SIGCHLD: u32 = 17;
 pub const SIGKILL: u32 = 9;
+/// SIGPIPE — ignored by the bridge (see nr::RT_SIGACTION).
+pub const SIGPIPE: u32 = 13;
+/// SIG_IGN — the rt_sigaction handler value.
+pub const SIG_IGN: u64 = 1;
 
 // ── Terminal ──────────────────────────────────────────────────────────
 /// Terminal ioctls.

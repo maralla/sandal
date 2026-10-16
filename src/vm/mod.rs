@@ -1391,9 +1391,34 @@ impl Vmm {
             })
             .unwrap_or_default();
 
+        // The advertised session geometry: the console's window when the
+        // host is interactive, zero when it is not. Zero is the x86_64
+        // guest session agent's pipe-mode signal — no pty, so
+        // programmatic consumers get the command's own bytes back:
+        // nothing colorizes (isatty is false inside the guest) and no
+        // line discipline translates the output. Interactive hosts keep
+        // the pty session: its line discipline is what makes guest output
+        // render correctly on the host terminal. (aarch64 keeps its
+        // session on the console device either way; zero only skips its
+        // geometry ioctl there.)
+        #[cfg(not(target_os = "windows"))]
+        let session_size = {
+            #[cfg(unix)]
+            let interactive = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+            #[cfg(not(unix))]
+            let interactive = true;
+            if interactive {
+                self.console.lock().unwrap().terminal_size()
+            } else {
+                (0, 0)
+            }
+        };
+        #[cfg(target_os = "windows")]
+        let session_size = self.console.lock().unwrap().terminal_size();
+
         #[cfg(target_arch = "x86_64")]
         {
-            let (cols, rows) = self.console.lock().unwrap().terminal_size();
+            let (cols, rows) = session_size;
             self.config_blob = initramfs::build_init_config_text(
                 disk_mode,
                 &share_configs,
@@ -1408,7 +1433,7 @@ impl Vmm {
 
         #[cfg(target_arch = "aarch64")]
         {
-            let (cols, rows) = self.console.lock().unwrap().terminal_size();
+            let (cols, rows) = session_size;
             self.config_blob = initramfs::build_init_config(
                 disk_mode,
                 &share_configs,
