@@ -1,0 +1,5 @@
+# Guest shell scripts are executed by the guest's busybox sh and embedded
+# verbatim (include_str!): they must keep LF endings on every checkout,
+# including Windows (git's autocrlf would hand the init script CRLF and
+# break the shebang).
+*.sh text eol=lf

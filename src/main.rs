@@ -1,9 +1,10 @@
-// The Windows backend is a port in progress: the shared device model and
-// the guest helpers compile everywhere, but their Unix-only call sites
-// (the SPI layout, portagent, the winch machinery, the port session) are
-// unreachable there. Allow dead code on Windows only — every other host
-// keeps the lint, so real dead code still gets caught.
-#![cfg_attr(target_os = "windows", allow(dead_code))]
+// The macOS and Windows backends share the device model with Linux but
+// run their own console paths: the shared model's Linux-only call sites
+// (the port session, the resize records, the SPI layout, portagent) and
+// the guest helpers compile everywhere and are unreachable there. Allow
+// dead code on those two hosts only — Linux keeps the lint, so real dead
+// code still gets caught where the model is fully driven.
+#![cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 
 // The VMM runs the host terminal with output processing disabled (guest
 // escape sequences must pass verbatim), which also stops the terminal from

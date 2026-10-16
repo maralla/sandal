@@ -171,7 +171,9 @@ impl Vmm {
             // PORT_READY processing proof).
             // The control replies carry the session signal (PORT_OPEN(1) —
             // see process_control_tx; the marker-free session routing).
-            let control_tx = self
+            // The drained bytes need no consumer here: the session flag is
+            // applied inside, the pump needs no proof gating.
+            let _control_tx = self
                 .console
                 .lock()
                 .unwrap()
