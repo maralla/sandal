@@ -94,31 +94,22 @@ def timed_boot(extra_args):
         timeout=120,
     )
     wall = time.time() - t0
+    stderr = out.stderr.decode("utf-8", "replace")
     fields = {}
-    for line in out.stderr.decode("utf-8", "replace").splitlines():
+    for line in stderr.splitlines():
         m = re.match(r"BOOT_TIMING\s+(\S+):\s+([0-9.]+)(µs|ms|s)", line)
         if m:
             name, val, unit = m.groups()
             fields[name] = float(val) * {"µs": 1e-3, "ms": 1.0, "s": 1000.0}[unit]
-    return fields, wall, out.returncode
+    return fields, wall, out.returncode, stderr
 
 
 def main() -> None:
     # The no-layer baseline first: the wall tripwire divides by it.
-    base_fields, base_wall, base_rc = timed_boot([])
+    base_fields, base_wall, base_rc, base_stderr = timed_boot([])
     print(f"base boot:  rc={base_rc} wall={base_wall:.2f}s")
     if base_rc != 0:
-        import subprocess as _sp
-
-        out = _sp.run(
-            [str(SANDAL), "--", "uname", "-a"],
-            env=env,
-            stdin=_sp.DEVNULL,
-            stdout=_sp.DEVNULL,
-            stderr=_sp.PIPE,
-            timeout=120,
-        )
-        print("VMM stderr:", out.stderr.decode("utf-8", "replace"))
+        print("VMM stderr:", base_stderr)
         raise SystemExit(1)
 
     for name, layer, disk_bound in LAYERS:
@@ -126,7 +117,7 @@ def main() -> None:
             print(f"[{name}] SKIP: {layer} missing")
             continue
         print(f"[{name}] {layer}")
-        fields, wall, rc = timed_boot(["--layer", str(layer)])
+        fields, wall, rc, _ = timed_boot(["--layer", str(layer)])
         print(f"  boot: rc={rc} wall={wall:.2f}s")
         for k in ("zstd_decode", "tar_parse", "ext2_inject", "data_disk"):
             if k in fields:
