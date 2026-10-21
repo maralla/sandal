@@ -4,7 +4,7 @@
 
 use super::{
     resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_CONSOLE, MMIO_OFF_DATA_BLK,
-    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG,
+    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG, MMIO_OFF_VSOCK,
 };
 // The virtiofs MMIO window is Unix-only (no --share on Windows).
 #[cfg(not(target_os = "windows"))]
@@ -95,6 +95,21 @@ impl KernelImage {
             Self::Owned(vec) => vec,
         }
     }
+
+    /// Unpin the host-resident pages of a file-backed mapping. The guest
+    /// copy is loaded and nothing reads the image again, but the clean
+    /// file pages stay pinned in the page table for the VM's life — a
+    /// whole kernel image of resident overhead. MADV_DONTNEED drops the
+    /// PTEs; the page cache keeps the file's own pages (host-reclaimable
+    /// under pressure), so the VMM's resident set sheds the image.
+    #[cfg(target_os = "linux")]
+    fn drop_resident_pages(&self) {
+        if let Self::Mapped { ptr, len } = self {
+            unsafe {
+                libc::madvise(*ptr as *mut libc::c_void, *len, libc::MADV_DONTNEED);
+            }
+        }
+    }
 }
 
 /// The kernel embedded in release builds (`make dist`): zstd-compressed,
@@ -115,9 +130,13 @@ fn embedded_kernel() -> Option<KernelImage> {
 pub(crate) const MAX_FS_DEVICES: usize = 5;
 
 /// Legacy ISA IRQs usable for virtio-mmio devices (skips the timer,
-/// keyboard, cascade, RTC and FPU lines). Device slot i takes POOL[i];
+/// keyboard, cascade, serial, RTC lines). Device slot i takes POOL[i];
 /// the slot index matches the `virtio_mmio.device=` cmdline order.
-pub(super) const ISA_IRQ_POOL: [u32; 10] = [3, 5, 6, 7, 9, 10, 11, 12, 14, 15];
+/// Index 10 (the vsock device) takes the FPU line: nothing registers
+/// IRQ 13 on x86_64 (the coprocessor-overrun handler was removed;
+/// the FPU exception is a CPU vector, not this PIC line), so
+/// request_irq(13) succeeds exactly like the lines above it.
+pub(super) const ISA_IRQ_POOL: [u32; 11] = [3, 5, 6, 7, 9, 10, 11, 12, 14, 15, 13];
 
 /// COM1 (earlycon) base port.
 pub(super) const SERIAL_BASE: u16 = 0x3f8;
@@ -147,6 +166,17 @@ pub fn x86_hypercall_page_off(mmio_base: u64) -> (u64, u64) {
 /// Config blob injected into the rootfs as /etc/sandal.conf (replaces the
 /// arm64 INIT_CONFIG BRK hypercall: a plain file read needs no privileges).
 pub(super) const CONFIG_PATH: &str = "etc/sandal.conf";
+
+/// Guest RAM declared in the boot memory map. The KVM slot maps the whole
+/// `--memory` cap, but only this floor is declared as RAM: the rest is a
+/// hole the guest init hot-adds in section-sized steps (see init.sh —
+/// a fixed headroom at session start, then one section per MemAvailable
+/// descent), so the host resident set tracks what workloads touch, not
+/// the cap. The floor is the measured size that boots the kernel, the
+/// initramfs and the rootfs pivot with several-fold margin for ordinary
+/// commands (python/git/ripgrep peak at tens of MB); its whole boot
+/// footprint, vmemmap included, is the measured ~54MB irreducible.
+pub(super) const RAM_FLOOR: u64 = 256 << 20;
 
 impl Vmm {
     #[cfg(target_arch = "x86_64")]
@@ -209,6 +239,12 @@ impl Vmm {
                 _ => {}
             }
         }
+        // The guest copy is loaded and the PVH entry parsed; nothing
+        // reads the image again. Unpin the file mapping's resident pages
+        // (see KernelImage::drop_resident_pages) — a whole kernel image
+        // of otherwise-permanent resident overhead.
+        #[cfg(target_os = "linux")]
+        kernel_image.drop_resident_pages();
         let entry = pvh_entry.ok_or_else(|| anyhow!("kernel has no PVH entry note"))?;
 
         // ── Kernel command line: console + virtio-mmio devices ─────────
@@ -221,13 +257,18 @@ impl Vmm {
         let mb = self.mmio_base;
         // The virtiofs pushes below are Unix-only; on Windows the vec
         // never mutates past the literal.
+        // Each entry carries its fixed ISA-pool slot: the slot (not the
+        // vec position) is what the presence filter below matches, so a
+        // missing device never shifts another device into its slot (an
+        // empty virtiofs list must not slide the vsock device into the
+        // virtiofs slots).
         #[cfg_attr(target_os = "windows", allow(unused_mut))]
-        let mut devices: Vec<(u64, u32)> = vec![
-            (mb + MMIO_OFF_NET, ISA_IRQ_POOL[0]),
-            (mb + MMIO_OFF_CONSOLE, ISA_IRQ_POOL[1]),
-            (mb + MMIO_OFF_BLK, ISA_IRQ_POOL[2]),
-            (mb + MMIO_OFF_DATA_BLK, ISA_IRQ_POOL[3]),
-            (mb + MMIO_OFF_RNG, ISA_IRQ_POOL[4]),
+        let mut devices: Vec<(u64, u32, usize)> = vec![
+            (mb + MMIO_OFF_NET, ISA_IRQ_POOL[0], 0),
+            (mb + MMIO_OFF_CONSOLE, ISA_IRQ_POOL[1], 1),
+            (mb + MMIO_OFF_BLK, ISA_IRQ_POOL[2], 2),
+            (mb + MMIO_OFF_DATA_BLK, ISA_IRQ_POOL[3], 3),
+            (mb + MMIO_OFF_RNG, ISA_IRQ_POOL[4], 4),
         ];
         #[cfg(not(target_os = "windows"))]
         if self.net.lock().unwrap().is_none() {
@@ -244,13 +285,16 @@ impl Vmm {
                     MAX_FS_DEVICES
                 )
             })?;
-            devices.push((mb + MMIO_OFF_FS + i as u64 * VIRTIOFS_SIZE, irq));
+            devices.push((mb + MMIO_OFF_FS + i as u64 * VIRTIOFS_SIZE, irq, slot));
         }
-        // When networking is disabled the net region is still first in the
-        // mmio table — describe only real devices, keeping index order.
+        // The vsock device keeps its fixed slot (10) whether or not it
+        // is present — same as the net slot above it.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        devices.push((mb + MMIO_OFF_VSOCK, ISA_IRQ_POOL[10], 10));
+        // Describe only real devices, keyed by each entry's fixed slot.
         let mut described: Vec<(u64, u32)> = Vec::new();
-        for (idx, (base, irq)) in devices.iter().enumerate() {
-            let present = match idx {
+        for (base, irq, slot) in devices.iter() {
+            let present = match slot {
                 #[cfg(not(target_os = "windows"))]
                 0 => self.net.lock().unwrap().is_some(),
                 #[cfg(target_os = "windows")]
@@ -260,8 +304,11 @@ impl Vmm {
                 3 => self.data_blk.is_some(), // data blk
                 4 => self.rng.is_some(),      // rng
                 #[cfg(not(target_os = "windows"))]
-                _ => idx - 5 < self.virtiofs.len(), // virtiofs
+                5..=9 => slot - 5 < self.virtiofs.len(), // virtiofs
                 #[cfg(target_os = "windows")]
+                5..=9 => false,
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                10 => self.vsock.is_some(), // the vsock device
                 _ => false,
             };
             if present {
@@ -294,8 +341,13 @@ impl Vmm {
             &[0],
         )?;
 
-        // e820-style memory map: low RAM, the legacy hole, extended RAM.
+        // e820-style memory map: low RAM, the legacy hole, the boot floor.
+        // Only the floor is RAM (see RAM_FLOOR): [floor, mem_size) stays a
+        // hole the guest hot-adds from /sys/devices/system/memory/probe,
+        // so the KVM slot's lazy zero pages only become host-resident as
+        // workloads touch them.
         let mem_size = self.memory.len() as u64;
+        let ram_floor = mem_size.min(RAM_FLOOR);
         let mut memmap: Vec<u8> = Vec::new();
         let push_entry = |memmap: &mut Vec<u8>, addr: u64, size: u64, typ: u32| {
             memmap.extend_from_slice(&addr.to_le_bytes());
@@ -303,13 +355,13 @@ impl Vmm {
             memmap.extend_from_slice(&typ.to_le_bytes());
             memmap.extend_from_slice(&0u32.to_le_bytes());
         };
-        let low_ram_end = 0x9_FC00u64.min(mem_size);
+        let low_ram_end = 0x9_FC00u64.min(ram_floor);
         if low_ram_end > 0 {
             push_entry(&mut memmap, 0x0, low_ram_end, E820_RAM);
         }
-        if mem_size > 0x100_000 {
+        if ram_floor > 0x100_000 {
             push_entry(&mut memmap, 0x9_FC00, 0x10_0000 - 0x9_FC00, E820_RESERVED);
-            push_entry(&mut memmap, 0x10_0000, mem_size - 0x10_0000, E820_RAM);
+            push_entry(&mut memmap, 0x10_0000, ram_floor - 0x10_0000, E820_RAM);
         }
         write_guest(self.memory.as_shared_slice(), PVH_MEMMAP_ADDR, &memmap)?;
 

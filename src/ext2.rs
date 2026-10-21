@@ -2754,6 +2754,43 @@ pub fn inject_runtime_files(
         0o755,
     )?;
 
+    // The SSH channel's guest-side forwarder: /bin/vsockrelay listens on
+    // the guest's vsock (the VMM's own channel bridges each client
+    // connection to it) and forwards to the guest's TCP loopback — sshd
+    // there, unmodified (OpenSSH has no AF_VSOCK listen support). One
+    // forked pump child per connection; SIGCHLD is SIG_IGN inside it
+    // (auto-reaped), and every refusal funnels through one paced retry.
+    // Injected wherever the portagent is: nothing runs it unless the
+    // init script does (the VMM's relay mode passes VSOCKRELAY below),
+    // so the other builds carry a dormant binary and nothing else.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        &mut alloc,
+        "bin/vsockrelay",
+        initramfs::tools::x86_64::vsockrelay::vsockrelay_helper(),
+        0o755,
+    )?;
+
+    // The relay test's echo endpoint: /bin/vsockecho listens on the
+    // guest's TCP loopback and echoes every connection straight back —
+    // sshd's stand-in for the channel's measurement (the python
+    // stand-in's startup pegs the single emulated vCPU for minutes and
+    // blocks the whole guest; this one is up in milliseconds). Dormant
+    // until the test starts it: nothing else runs it, ever.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        &mut alloc,
+        "bin/vsockecho",
+        initramfs::tools::x86_64::vsockecho::vsockecho_helper(),
+        0o755,
+    )?;
+
     // Export helpers: resize + done BRK binaries, and the sandal-export script.
     // Used by the guest `sandal-export [path]` command to turn the overlay
     // upper directory into a host-side gzip-compressed .layer file.

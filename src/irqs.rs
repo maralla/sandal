@@ -18,3 +18,6 @@ pub const SPI_BLK: u32 = 18;
 pub const SPI_DATA_BLK: u32 = 19;
 pub const SPI_RNG: u32 = 20;
 pub const SPI_FS_START: u32 = 21; // virtiofs devices take SPI_FS_START + i
+/// The userspace virtio-vsock device (Linux/x86_64 only; see
+/// virtio/vsock.rs).
+pub const SPI_VSOCK: u32 = 26;

@@ -12,7 +12,9 @@
 
 pub(crate) use crate::cli::Args;
 #[cfg(not(target_os = "windows"))]
-pub(crate) use crate::irqs::{SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG};
+pub(crate) use crate::irqs::{
+    SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK,
+};
 
 use crate::hypervisor::{Vcpu, Vm};
 use crate::initramfs;
@@ -104,6 +106,9 @@ pub(crate) const MMIO_OFF_CONSOLE: u64 = 0x200;
 pub(crate) const MMIO_OFF_BLK: u64 = 0x400;
 pub(crate) const MMIO_OFF_DATA_BLK: u64 = 0x600;
 pub(crate) const MMIO_OFF_RNG: u64 = 0x800;
+/// The userspace virtio-vsock device (Linux/x86_64 only).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const MMIO_OFF_VSOCK: u64 = 0xa00;
 #[cfg(target_arch = "x86_64")]
 pub(crate) const MMIO_OFF_HYPERCALL: u64 = 0xe00;
 pub(crate) const MMIO_OFF_FS: u64 = 0x1000;
@@ -169,6 +174,88 @@ pub(crate) struct GuestRam {
 }
 
 impl GuestRam {
+    /// Debug (SANDAL_DEBUG_RESIDENCY): dump which guest-physical 16MB
+    /// buckets of the RAM mapping have host-resident pages (mincore over
+    /// the whole slot). The total is the real overhead number; the
+    /// per-bucket histogram pins it to guest physical ranges (compare
+    /// /proc/iomem: kernel image, device MMIO, the hotplug sections).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dump_residency(&self) {
+        const BUCKET: usize = 16 << 20;
+        let mut vec = vec![0u8; self.len / 4096];
+        let rc = unsafe { libc::mincore(self.ptr.cast(), self.len, vec.as_mut_ptr()) };
+        if rc != 0 {
+            eprintln!("RESIDENCY: mincore failed: {rc}");
+            return;
+        }
+        let mut counts = vec![0u32; self.len.div_ceil(BUCKET)];
+        let mut total = 0usize;
+        for (i, r) in vec.iter().enumerate() {
+            if *r & 1 != 0 {
+                total += 1;
+                counts[i * 4096 / BUCKET] += 1;
+            }
+        }
+        eprintln!(
+            "RESIDENCY: guest RAM: {} pages resident ({}MB) of {}MB mapped",
+            total,
+            total * 4096 >> 20,
+            self.len >> 20
+        );
+        for (b, c) in counts.iter().enumerate() {
+            if *c != 0 {
+                eprintln!(
+                    "RESIDENCY: guest [{:#010x}..{:#010x}) {}MB resident",
+                    b * BUCKET,
+                    (b + 1) * BUCKET,
+                    (*c as usize) * 4096 >> 20
+                );
+            }
+        }
+        // The VMM's own mappings: the rest of the overhead. Walk
+        // /proc/self/maps and mincore each mapping of this process — the
+        // per-mapping resident totals pin the VMM's own cost to the heap,
+        // the binary, the stacks, and whatever anonymous buffers the boot
+        // path left behind (the guest RAM mapping above is excluded by
+        // its exact range).
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        for line in maps.lines() {
+            let Some((range, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                continue;
+            };
+            let Ok(start) = usize::from_str_radix(start, 16) else {
+                continue;
+            };
+            let Ok(end) = usize::from_str_radix(end, 16) else {
+                continue;
+            };
+            if start == self.ptr as usize && end == start + self.len {
+                continue; // the guest RAM mapping, dumped above
+            }
+            let len = end - start;
+            if len == 0 || len % 4096 != 0 {
+                continue;
+            }
+            let mut vec = vec![0u8; len / 4096];
+            let rc = unsafe { libc::mincore(start as *mut libc::c_void, len, vec.as_mut_ptr()) };
+            if rc != 0 {
+                continue;
+            }
+            let resident = vec.iter().filter(|r| **r & 1 != 0).count();
+            if resident > 0 {
+                eprintln!(
+                    "RESIDENCY: vmm  {start:#x}-{end:#x} {}MB of {}MB: {}",
+                    resident * 4096 >> 20,
+                    len >> 20,
+                    rest.split_whitespace().next().unwrap_or("")
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn new(len: usize) -> Self {
         assert_eq!(len % 4096, 0, "guest RAM size must be page-aligned");
@@ -242,6 +329,7 @@ impl GuestRam {
 
         // MAP_ANONYMOUS memory is already zero-filled by the kernel (lazy
         // zero pages until first write) — no explicit memset needed.
+        //
         GuestRam { ptr, len }
     }
 
@@ -616,6 +704,11 @@ struct Vmm {
     /// Set on drop so the net-kick thread exits.
     #[cfg(target_os = "linux")]
     net_kick_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The userspace virtio-vsock device and its host machinery
+    /// (Linux/x86_64 only): the device, its stop flag, its threads,
+    /// and the listener's socket path. None without --vsock-sock.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    vsock: Option<linux::VsockHost>,
     #[cfg(target_os = "macos")]
     vt_off: u64,
     #[cfg(target_os = "macos")]
@@ -1213,6 +1306,42 @@ impl Vmm {
         #[cfg(target_os = "linux")]
         let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // The userspace virtio-vsock device (--ssh-port): the VMM
+        // listens on the operator's ADDR:PORT and bridges every
+        // connection to the guest's own TCP loopback, the guest's
+        // vsockrelay → sshd. The vsock side and the guest forward
+        // target are FIXED by the relay design (RELAY_VSOCK_PORT →
+        // vsockrelay → the guest's loopback); only this listener is
+        // the operator's. The listener binds synchronously (fail fast
+        // on a bad target); the listener/bridge threads and their
+        // shutdown live in VsockHost.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let vsock = if let Some(target) = args.ssh_port.as_ref() {
+            // [ADDR:]PORT — ADDR defaults to loopback; 0.0.0.0 exposes
+            // it.
+            let (addr, port) = match target.rsplit_once(':') {
+                Some((addr, port)) => (addr, port),
+                None => ("127.0.0.1", target.as_str()),
+            };
+            let port: u16 = port
+                .parse()
+                .map_err(|error| anyhow!("--ssh-port: bad port {port:?}: {error}"))?;
+            if port == 0 {
+                return Err(anyhow!("--ssh-port: port 0 is random; name one"));
+            }
+            let addr = if addr.is_empty() { "127.0.0.1" } else { addr };
+            Some(linux::VsockHost::spawn(
+                addr,
+                port,
+                memory.clone(),
+                vm.clone(),
+                host.irq_lock.clone(),
+                host.irq_levels.clone(),
+            )?)
+        } else {
+            None
+        };
+
         // macOS keeps its own inline console path (process_console_tx);
         // the shared filter exists only where it is drained.
         #[cfg(not(target_os = "macos"))]
@@ -1295,6 +1424,8 @@ impl Vmm {
             host,
             #[cfg(target_os = "linux")]
             net_kick_stop,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            vsock,
             #[cfg(target_os = "macos")]
             vt_off,
             #[cfg(target_os = "macos")]
@@ -1419,6 +1550,30 @@ impl Vmm {
         #[cfg(target_arch = "x86_64")]
         {
             let (cols, rows) = session_size;
+            // The whole slot is the hotplug cap: the boot memory map
+            // declares only the RAM floor (see RAM_FLOOR), and the guest
+            // init grows toward this cap on demand.
+            let mem_cap = self.memory.len() as u64;
+            // The relay mode's ports, verbatim from the device's own
+            // constant (they must never diverge): the vsock side is what
+            // the device's REQUESTs carry, and the TCP side is sshd's own
+            // port — the guest's vsockrelay forwards between them. The
+            // per-command mode (or no vsock at all) starts nothing.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            let vsock_relay = if self
+                .vsock
+                .as_ref()
+                .is_some_and(|vsock| vsock.device.lock().unwrap().relay_mode())
+            {
+                Some((
+                    crate::virtio::vsock::RELAY_VSOCK_PORT,
+                    crate::virtio::vsock::RELAY_VSOCK_PORT,
+                ))
+            } else {
+                None
+            };
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            let vsock_relay = None;
             self.config_blob = initramfs::build_init_config_text(
                 disk_mode,
                 &share_configs,
@@ -1428,6 +1583,8 @@ impl Vmm {
                 cols,
                 rows,
                 &host_term,
+                mem_cap,
+                vsock_relay,
             );
         }
 
@@ -1596,6 +1753,18 @@ impl Vmm {
             }
         }
 
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(vsock) = self.vsock.as_ref() {
+            if (mw + MMIO_OFF_VSOCK..mw + MMIO_OFF_VSOCK + 0x200).contains(&addr) {
+                // The config space (the guest CID) needs the sas.
+                return vsock
+                    .device
+                    .lock()
+                    .unwrap()
+                    .mmio_read(addr - mw - MMIO_OFF_VSOCK, sas);
+            }
+        }
+
         #[cfg(not(target_os = "windows"))]
         if let Some(idx) = self.virtiofs_index(addr) {
             if let Some(dev) = self.virtiofs.get_mut(idx) {
@@ -1747,6 +1916,21 @@ impl Vmm {
                 {
                     rng.process_queue(self.memory.as_shared_slice(), RAM_BASE);
                 }
+                return;
+            }
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(vsock) = self.vsock.as_ref() {
+            if (mw + MMIO_OFF_VSOCK..mw + MMIO_OFF_VSOCK + 0x200).contains(&addr) {
+                // QueueNotify returns Some(queue); the driving is the run
+                // loop's per-iteration process() — the same iteration
+                // this exit is handled in, never inside the dispatch.
+                let _ = vsock
+                    .device
+                    .lock()
+                    .unwrap()
+                    .mmio_write(addr - mw - MMIO_OFF_VSOCK, val as u32);
                 return;
             }
         }

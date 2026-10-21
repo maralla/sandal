@@ -38,25 +38,37 @@ else
     PYTHON="python3"
 fi
 
-# name|command — the suite, in run order. $PYTHON expands here, once.
+# name|timeout|command — the suite, in run order. $PYTHON expands
+# here, once. The timeout column (seconds) replaces TEST_TIMEOUT for
+# that test; 0 = the TEST_TIMEOUT default. The channel tests (vsock,
+# ssh) go last: the fast tests and the hang gates decide first. They
+# self-skip on hosts that cannot run the guest (see vm_harness.py),
+# and MEASURED they fit the default with huge margin (9 s, 1 s, 12 s,
+# 8 s — the VM boots in seconds and the measurements are sub-second);
+# the column exists for a test that genuinely needs its own bound, not
+# for these (the interactive-gate's 60 s was a hardcoded special case
+# before; it is a column entry now).
 read -r -d '' SUITE <<EOF || true
-cargo-unit|cargo test --release -q
-boot-time|$PYTHON tests/test_boot_time.py
-devices|$PYTHON tests/test_devices.py
-blk|$PYTHON tests/test_blk.py
-exit-codes|$PYTHON tests/test_exit_codes.py
-console-input|$PYTHON tests/test_console_input.py
-marker-passthrough|$PYTHON tests/test_marker_passthrough.py
-export|$PYTHON tests/test_export.py
-layer|$PYTHON tests/test_layer.py
-share|$PYTHON tests/test_share.py
-geometry|$PYTHON tests/test_geometry.py
-tmux|$PYTHON tests/test_tmux.py
-tmux-attached|$PYTHON tests/test_tmux_attached.py
-python-repl|$PYTHON tests/test_python_repl.py
-packages|$PYTHON tests/test_packages.py
-curl-hang|tests/test_curl_hang.sh 1 128
-interactive-gate|env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_interactive_gate.sh --fail-fast --exit-cycle
+cargo-unit|0|cargo test --release -q
+boot-time|0|$PYTHON tests/test_boot_time.py
+devices|0|$PYTHON tests/test_devices.py
+blk|0|$PYTHON tests/test_blk.py
+exit-codes|0|$PYTHON tests/test_exit_codes.py
+console-input|0|$PYTHON tests/test_console_input.py
+marker-passthrough|0|$PYTHON tests/test_marker_passthrough.py
+export|0|$PYTHON tests/test_export.py
+layer|0|$PYTHON tests/test_layer.py
+share|0|$PYTHON tests/test_share.py
+geometry|0|$PYTHON tests/test_geometry.py
+tmux|0|$PYTHON tests/test_tmux.py
+tmux-attached|0|$PYTHON tests/test_tmux_attached.py
+python-repl|0|$PYTHON tests/test_python_repl.py
+packages|0|$PYTHON tests/test_packages.py
+curl-hang|0|tests/test_curl_hang.sh 1 128
+interactive-gate|60|env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_interactive_gate.sh --fail-fast --exit-cycle
+vsockrelay|0|$PYTHON tests/test_vsockrelay.py
+ssh-relay|0|$PYTHON tests/test_ssh_relay.py
+ssh-layer|0|$PYTHON tests/test_ssh_layer.py
 EOF
 
 # Prerequisite skips: a test that cannot run says so and passes the suite.
@@ -68,7 +80,7 @@ prereq_skip() {
 }
 
 run_one() {
-    local name="$1" cmd="$2"
+    local name="$1" tmo="$2" cmd="$3"
 
     local why
     why="$(prereq_skip "$name")"
@@ -77,6 +89,10 @@ run_one() {
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
+
+    # The per-test timeout: the suite entry's own bound, or the default.
+    local cap="$TEST_TIMEOUT"
+    [ "$tmo" -gt 0 ] 2>/dev/null && cap="$tmo"
 
     # test_boot_time gets ONE retry, loudly marked: its bounds are
     # deliberately tight tripwires (they exist to catch a serial read by
@@ -88,7 +104,7 @@ run_one() {
     [ "$name" = "boot-time" ] && tries=2
     local attempt=1
     while :; do
-        if _run_attempt "$name" "$cmd"; then
+        if _run_attempt "$name" "$cap" "$cmd"; then
             return 0
         fi
         [ "$attempt" -ge "$tries" ] && break
@@ -101,20 +117,19 @@ run_one() {
 # One attempt: exits 0 (and prints its own PASS line) on pass, exits 1 on
 # a failed attempt. The caller decides whether that failure is final.
 _run_attempt() {
-    local name="$1" cmd="$2"
+    local name="$1" cap="$2" cmd="$3"
 
     # </dev/null on every child: a test that spawns the VMM with an
     # inherited stdin would otherwise have the VMM's stdin poller drain
     # THIS loop's stdin — the suite list itself (measured: test_boot_time
     # ate the rest of the suite and everything after it silently never
     # ran). The tests type through their own ptys; none needs ours.
+    # The cap is the caller's (the suite entry's own bound, or the
+    # TEST_TIMEOUT default) — the interactive-gate's 60 s is its suite
+    # entry, not a special case here.
     local out rc
-    if [ -n "$TIMEOUT_BIN" ] && [ "$name" != "interactive-gate" ]; then
-        out="$("$TIMEOUT_BIN" "$TEST_TIMEOUT" bash -c "$cmd" 2>&1 </dev/null)"
-        rc=$?
-    elif [ -n "$TIMEOUT_BIN" ]; then
-        # The hang gate keeps its own tighter cap.
-        out="$("$TIMEOUT_BIN" 60 bash -c "$cmd" 2>&1 </dev/null)"
+    if [ -n "$TIMEOUT_BIN" ]; then
+        out="$("$TIMEOUT_BIN" "$cap" bash -c "$cmd" 2>&1 </dev/null)"
         rc=$?
     else
         out="$(bash -c "$cmd" 2>&1 </dev/null)"
@@ -168,11 +183,11 @@ if [ "$(uname -s)" = "Darwin" ] && [ -x target/release/sandal ]; then
     fi
 fi
 
-echo "sandal test suite (TEST_TIMEOUT=${TEST_TIMEOUT}s)"
+echo "sandal test suite (TEST_TIMEOUT=${TEST_TIMEOUT}s, per-test overrides in the suite list)"
 echo "=================================================================="
 
 WANT="${*:-}"
-while IFS='|' read -r name cmd; do
+while IFS='|' read -r name tmo cmd; do
     [ -z "$name" ] && continue
     if [ -n "$WANT" ]; then
         # Name filter: exact words (pass `tmux tmux-attached` for both).
@@ -181,7 +196,7 @@ while IFS='|' read -r name cmd; do
             *) continue ;;
         esac
     fi
-    run_one "$name" "$cmd"
+    run_one "$name" "$tmo" "$cmd"
 done <<EOF
 $SUITE
 EOF

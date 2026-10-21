@@ -4,3 +4,5 @@ pub mod exit;
 pub mod export;
 pub mod init;
 pub mod portagent;
+pub mod vsockecho;
+pub mod vsockrelay;

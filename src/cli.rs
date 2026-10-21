@@ -69,6 +69,18 @@ pub struct RunArgs {
     /// When combined with --disk-size, layers are injected into the ext2 disk.
     #[arg(long = "layer", value_name = "PATH")]
     pub layers: Vec<PathBuf>,
+
+    /// Enable the virtio-vsock device: the VMM listens on
+    /// ADDR:PORT (ADDR defaults to 127.0.0.1; 0.0.0.0 exposes it) and
+    /// bridges every connection through vsock to the guest's own TCP
+    /// loopback — /bin/vsockrelay forwards to sshd there, unmodified.
+    /// No port file: the port is the one you named. The guest side
+    /// needs sshd listening on its own loopback (apk add openssh;
+    /// see tests/test_ssh_relay.py for the proven recipe); auth is
+    /// whatever sshd allows — key-only for root by openssh's own
+    /// defaults.
+    #[arg(long = "ssh-port", value_name = "[ADDR:]PORT")]
+    pub ssh_port: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]

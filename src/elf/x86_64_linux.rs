@@ -14,6 +14,10 @@ pub mod nr {
     pub const CLOSE: u32 = 3;
     pub const IOCTL: u32 = 16;
     pub const SOCKET: u32 = 41;
+    pub const BIND: u32 = 49;
+    pub const LISTEN: u32 = 50;
+    pub const ACCEPT: u32 = 43;
+    pub const CONNECT: u32 = 42;
     pub const CLONE: u32 = 56;
     pub const EXECVE: u32 = 59;
     pub const EXIT: u32 = 60;
@@ -77,7 +81,13 @@ pub const POLLIN: u32 = 0x001;
 
 // ── Networking ────────────────────────────────────────────────────────
 pub const AF_INET: u32 = 2;
+/// AF_VSOCK — the guest's vsock address family (the vsockrelay's
+/// listener; see initramfs/tools/x86_64/vsockrelay.rs).
+pub const AF_VSOCK: u32 = 40;
+pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
+/// INADDR_LOOPBACK — the vsockrelay's forward target (guest loopback).
+pub const INADDR_LOOPBACK: u32 = 0x7F00_0001;
 pub const SIOCSIFADDR: u32 = 0x8916;
 pub const SIOCSIFNETMASK: u32 = 0x891C;
 pub const SIOCSIFFLAGS: u32 = 0x8914;

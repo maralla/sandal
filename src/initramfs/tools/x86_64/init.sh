@@ -23,6 +23,8 @@ CLOCK=0
 SHARES_TEXT=
 COLS=80
 ROWS=24
+MEMCAP=0
+VSOCKRELAY=
 while IFS= read -r line; do
     case $line in
         ARG=*) set -- "$@" "${line#ARG=}" ;;
@@ -33,6 +35,8 @@ while IFS= read -r line; do
         TERM=*) TERM=${line#TERM=} ;;
         COLS=*) COLS=${line#COLS=} ;;
         ROWS=*) ROWS=${line#ROWS=} ;;
+        MEMCAP=*) MEMCAP=${line#MEMCAP=} ;;
+        VSOCKRELAY=*) VSOCKRELAY=${line#VSOCKRELAY=} ;;
     esac
 done < /etc/sandal.conf
 
@@ -105,6 +109,73 @@ printf '%b' "$SHARES_TEXT" | while IFS= read -r line; do
     mkdir -p "$path"
     mount -t virtiofs "$tag" "$path"
 done
+
+# ── The vsock relay: the SSH channel's guest-side forwarder ──────────
+# /bin/vsockrelay listens on the guest's vsock (the VMM's own channel
+# bridges each client connection to it) and forwards every connection to
+# the guest's own TCP loopback — sshd there, unmodified: OpenSSH has no
+# AF_VSOCK listen support, so the relay IS the difference. One forked
+# pump child per connection (concurrent sessions are the point); SIGCHLD
+# is SIG_IGN inside it (the kernel auto-reaps — no zombies), and every
+# refusal funnels through one paced retry — a persistent refusal (no
+# sshd: ECONNREFUSED) degrades to ten attempts a second, never a spin.
+# No VSOCKRELAY line (the per-command channel, or no vsock at all):
+# nothing starts, and the vsock port answers nothing.
+if [ -n "$VSOCKRELAY" ] && [ -x /bin/vsockrelay ]; then
+    /bin/vsockrelay "${VSOCKRELAY%%:*}" "${VSOCKRELAY##*:}" &
+fi
+
+# ── Memory hotplug: the floor is online; the cap arrives on demand ──
+# The VMM maps the whole cap as one lazy slot but declares only a RAM
+# floor in the boot memory map; [floor, cap) is a hole. A fixed
+# headroom goes online before the session starts — an instant allocation
+# (a linker's multi-GB buffer) outruns any poll, and the guest OOM path
+# kills the session before a daemon could deliver the section — then a
+# daemon adds one 128MB section at a time, each time MemAvailable
+# descends below one section, up to the cap, for the gradual growth
+# (sequential builds, caches) the headroom does not cover. A probe
+# creates its section's block offline; the online is one explicit write
+# per block (the auto-online policy does not apply to the probe path).
+# Pages nothing touches stay lazy host zero mappings: the headroom costs
+# its vmemmap and nothing else, and the host resident set still tracks
+# what workloads touch, not the cap. A cap at or below the floor (the
+# sandbox default) leaves nothing to add: no headroom, no daemon.
+if [ "$MEMCAP" -gt 0 ] && [ -w /sys/devices/system/memory/probe ]; then
+    SECTION_KB=$((128 * 1024))                   # block_size_bytes / 1024
+    CAP_KB=$((MEMCAP / 1024))                    # never cross the slot
+    # The next section index: one past the highest block the kernel
+    # already carries (the RAM floor's own blocks). Derived from the
+    # block list, not MemTotal: no arithmetic on memory totals, and
+    # self-correcting against whatever the floor turns out to be.
+    IDX=$(ls /sys/devices/system/memory/ \
+        | sed -n 's/^memory\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
+    IDX=$((IDX + 1))
+    add_section() {
+        echo $((IDX * SECTION_KB * 1024)) > /sys/devices/system/memory/probe \
+            && echo online > /sys/devices/system/memory/memory$IDX/state \
+            && IDX=$((IDX + 1))
+    }
+    # Headroom: the whole cap online before the session. A partial
+    # envelope loses to the linker's working set (multi-GB in one
+    # allocation, far past any measured toolchain peak), and an instant
+    # allocation that exceeds the envelope OOM-kills the session before
+    # any poll could deliver the difference — so nothing is left to a
+    # poll: the pages stay lazy host zero mappings, and the cost is the
+    # vmemmap and about a second of boot time.
+    while [ $((IDX * SECTION_KB)) -lt "$CAP_KB" ]; do
+        add_section
+    done
+    (
+        while :; do
+            AVAIL_KB=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+            if [ "$AVAIL_KB" -lt "$SECTION_KB" ] \
+               && [ $((IDX * SECTION_KB)) -lt "$CAP_KB" ]; then
+                add_section
+            fi
+            sleep 0.1
+        done
+    ) &
+fi
 
 cd /root
 
