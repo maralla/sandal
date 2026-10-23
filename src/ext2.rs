@@ -2663,12 +2663,7 @@ fn remove_dir_entry(
 
 /// Inject all runtime files into a pre-built ext2 image.
 /// This adds /init, device nodes, CA certificates and the sandal-export helpers.
-pub fn inject_runtime_files(
-    image: &mut [u8],
-    network: bool,
-    mmio_base: u64,
-    host_term: &str,
-) -> Result<()> {
+pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) -> Result<()> {
     let sb = Ext2Superblock::parse(image)?;
     let bgdt = Ext2BgdTable::parse(image, &sb)?;
     let mut alloc = Ext2Alloc::default();
@@ -2742,9 +2737,8 @@ pub fn inject_runtime_files(
     // SIGCHLD is SIG_IGN inside it (auto-reaped), and every refusal
     // funnels through one paced retry. Nothing runs it
     // unless the init script does (the VMM's own
-    // channel passes VSOCKD below), so the other builds carry a
-    // dormant binary and nothing else.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
+    // channel passes VSOCKD below). Every platform runs the line now —
+    // the vsock IS the session transport on each of them.
     let vsockd_elf = initramfs::tools::bin::vsockd_helper();
     log::info!(
         "vsockd: injecting the Rust guest helper ({} bytes)",
@@ -2756,20 +2750,20 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "bin/vsockd",
-        &vsockd_elf,
+        vsockd_elf,
         0o755,
     )?;
 
-    // Export helpers: resize + done BRK binaries, and the sandal-export script.
-    // Used by the guest `sandal-export [path]` command to turn the overlay
-    // upper directory into a host-side gzip-compressed .layer file.
+    // Export helpers: resize + done signal binaries, and the sandal-export
+    // script. Used by the guest `sandal-export [path]` command to turn the
+    // overlay upper directory into a host-side gzip-compressed .layer file.
     inject_file(
         image,
         &sb,
         &bgdt,
         &mut alloc,
         "usr/sbin/sandal-export-resize",
-        &initramfs::tools::export_resize_helper(mmio_base),
+        initramfs::tools::bin::export_resize_helper(),
         0o755,
     )?;
     inject_file(
@@ -2778,13 +2772,14 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "usr/sbin/sandal-export-done",
-        &initramfs::tools::export_done_helper(mmio_base),
+        initramfs::tools::bin::export_done_helper(),
         0o755,
     )?;
     // The exit protocol helper: the init script runs `sandal-exit <status>`
     // once the session is reaped — a /dev/mem MMIO store of
     // `EXIT_PORT | (code << 16)` to the hypercall page (marker-free exit
-    // code delivery; the old console marker is gone).
+    // code delivery; the old console marker is gone). x86_64 only: the
+    // aarch64 session's exit rides the EXIT BRK from vsockd itself.
     #[cfg(target_arch = "x86_64")]
     inject_file(
         image,
@@ -2792,7 +2787,7 @@ pub fn inject_runtime_files(
         &bgdt,
         &mut alloc,
         "usr/sbin/sandal-exit",
-        &initramfs::tools::x86_64::exit::exit_helper(mmio_base),
+        initramfs::tools::bin::sandal_exit_helper(),
         0o755,
     )?;
     let export_script = initramfs::generate_export_script();
@@ -2806,8 +2801,12 @@ pub fn inject_runtime_files(
         0o755,
     )?;
 
-    // /init binary (compiled ARM64 ELF)
-    let init_binary = crate::initramfs::tools::init_binary("/dev/hvc0");
+    // /init: x86_64 — the busybox shell script; aarch64 — the compiled
+    // Rust init (both exec /bin/vsockd as their last command).
+    #[cfg(target_arch = "x86_64")]
+    let init_binary = initramfs::tools::x86_64::init::init_binary("/dev/hvc0");
+    #[cfg(target_arch = "aarch64")]
+    let init_binary = initramfs::tools::bin::init_helper();
     inject_file(image, &sb, &bgdt, &mut alloc, "init", init_binary, 0o755)?;
 
     Ok(())

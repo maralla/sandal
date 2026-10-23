@@ -25,7 +25,6 @@ mod cli;
 #[cfg(target_arch = "aarch64")]
 mod devicetree;
 #[macro_use]
-mod elf;
 mod ext2;
 mod hypervisor;
 mod initramfs;
@@ -38,7 +37,6 @@ mod tar;
 pub mod unet;
 mod virtio;
 mod vm;
-mod vmm_trace;
 mod zchunk;
 
 use anyhow::Result;

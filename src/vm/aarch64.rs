@@ -7,7 +7,8 @@
 
 use super::{
     resolve_data_path, Args, Vmm, DATA_BLK_BASE, SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET,
-    SPI_RNG, VIRTIOFS_BASE_START, VIRTIOFS_SIZE, VIRTIO_BLK_BASE, VIRTIO_NET_BASE, VIRTIO_RNG_BASE,
+    SPI_RNG, SPI_VSOCK, VIRTIOFS_BASE_START, VIRTIOFS_SIZE, VIRTIO_BLK_BASE, VIRTIO_NET_BASE,
+    VIRTIO_RNG_BASE, VIRTIO_VSOCK_BASE,
 };
 use crate::devicetree::DeviceTree;
 use crate::hypervisor::Reg;
@@ -99,6 +100,7 @@ impl Vmm {
                 .map(|_| (DATA_BLK_BASE, SPI_DATA_BLK)), // vdb (overlay upper)
             self.rng.as_ref().map(|_| (VIRTIO_RNG_BASE, SPI_RNG)),
             &virtiofs_dt,
+            self.vsock.as_ref().map(|_| (VIRTIO_VSOCK_BASE, SPI_VSOCK)),
             args.verbose,
             None,             // overlay bootarg handled by the guest init from the config
             Some(&[0u8; 64]), // rng-seed so CRNG never blocks at boot
@@ -188,18 +190,6 @@ impl Vmm {
         let pc = self.vcpu.read_register(Reg::Pc)?;
         self.vcpu.write_register(Reg::Pc, pc + 4)?;
         match imm {
-            initramfs::INIT_CONFIG_IMM => {
-                // Deliver the init config blob over the console RX and set x0.
-                let size = self.config_blob.len() as u64;
-                self.vcpu.write_register(Reg::X0, size)?;
-                let chunk = self.config_blob.clone();
-                self.console.lock().unwrap().push_rx_and_drain(
-                    self.memory.as_shared_slice(),
-                    RAM_BASE,
-                    crate::virtio::console::CONSOLE_RX,
-                    &chunk,
-                );
-            }
             initramfs::EXPORT_RESIZE_IMM => self.handle_export_resize(),
             initramfs::EXPORT_DONE_IMM => self.handle_export_done(),
             // The exit protocol: the code rides x15 (marker-free — the old
@@ -209,7 +199,16 @@ impl Vmm {
                 self.guest_exit_code = Some(code);
                 self.guest_shutdown = true;
             }
-            // Unknown BRKs are resumed; the init protocol has no other
+            // The command execution line's readiness: vsockd's listener is
+            // bound — connect every parked front end now (the event-driven
+            // connect; the x86_64 hypercall store's BRK analog).
+            initramfs::VSOCKD_READY_IMM => {
+                log::info!("vsockd: the READY brk landed");
+                if let Some(vsock) = self.vsock.as_ref() {
+                    vsock.device.lock().unwrap().set_guest_listening();
+                }
+            }
+            // Unknown BRKs are resumed; the protocol has no other
             // immediate values.
             _ => {}
         }

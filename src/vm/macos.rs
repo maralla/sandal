@@ -4,13 +4,12 @@
 //! complete HVF contract.
 
 use super::{
-    host_tty_size, Args, Vmm, HOST_WINCH, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE,
-    SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG,
+    Args, Vmm, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG,
+    SPI_VSOCK,
 };
 use crate::hypervisor::{HvSysReg, Reg, Vcpu};
 use crate::irqs::IRQ_VTIMER;
 use anyhow::Result;
-use std::sync::atomic::Ordering;
 
 pub(super) const CNTFRQ: u64 = 24_000_000; // Apple Silicon host timer frequency (Hz)
 
@@ -59,8 +58,10 @@ impl Vmm {
             irqs[n] = intid;
             n += 1;
         };
-        if self.console.lock().unwrap().interrupt_status != 0 {
-            push(32 + SPI_CONSOLE);
+        if let Some(vsock) = self.vsock.as_ref() {
+            if vsock.device.lock().unwrap().interrupt_status != 0 {
+                push(32 + SPI_VSOCK);
+            }
         }
         if self.blk.as_ref().is_some_and(|d| d.interrupt_status != 0) {
             push(32 + SPI_BLK);
@@ -95,15 +96,6 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub(super) fn run_loop_hvf(&mut self, args: &Args) -> Result<i32> {
         loop {
-            // Host terminal resized: re-apply the geometry to the guest
-            // console. The console's config-change interrupt is
-            // level-triggered and re-pended from `interrupt_status` below,
-            // so `set_size` is enough — no manual IRQ pulse is needed.
-            if HOST_WINCH.swap(false, Ordering::Relaxed) {
-                let (cols, rows) = host_tty_size();
-                let _ = self.console.lock().unwrap().set_size(cols, rows);
-            }
-
             // Poll the user-space network backend and deliver any incoming
             // packets to the guest's RX queue.
             if let Some(net) = self.net.lock().unwrap().as_mut() {
@@ -163,45 +155,22 @@ impl Vmm {
                 }
             }
 
-            // The port-instantiation control sequence: without it the guest
-            // driver instantiates NO console at all (hvc0 exists only after
-            // CONSOLE_PORT), so every platform pumps it until delivered. Its
-            // interrupt lands through the pending-interrupt update above.
-            // The captured control replies (parsed by the pump for the
-            // PORT_READY processing proof).
-            // The control replies carry the session signal (PORT_OPEN(1) —
-            // see process_control_tx; the marker-free session routing).
-            // The drained bytes need no consumer here: the session flag is
-            // applied inside, the pump needs no proof gating.
-            let _control_tx = self
-                .console
-                .lock()
-                .unwrap()
-                .process_control_tx(self.memory.as_shared_slice(), RAM_BASE);
-            // The export path port: the whole stream is the export path
-            // (marker-free; stored on the device, handle_export_done takes
-            // it).
-            self.console.lock().unwrap();
-            self.console
-                .lock()
-                .unwrap()
-                .pump_control_sequence(self.memory.as_shared_slice(), RAM_BASE);
-
-            // Drain guest console TX → host stdout (intercepting protocol markers).
-            let tx = self.console.lock().unwrap().process_tx(
-                self.memory.as_shared_slice(),
-                RAM_BASE,
-                crate::virtio::console::CONSOLE_TX,
-            );
-            if !tx.is_empty() {
-                // The host terminal runs with output processing disabled, so
-                // the \n → \r\n translation happens here, once, for the
-                // console stream (the only stream this platform has).
-                self.process_console_tx(&crate::virtio::onlcr(tx));
+            // The vsock device: ONE process pass per exit — the guest's
+            // kicks land here, the same iteration the exit was handled
+            // in. One pass, never a loop: whatever it cannot deliver (a
+            // closed credit window, an exhausted RX ring) waits for the
+            // next event (the bridge's slice, the next exit) — a loop
+            // here would wedge the vCPU on the first stalled pass (the
+            // bridge holds the same device mutex). The IRQ: the
+            // interrupt_status mirror above pends the line at the next
+            // iteration (the level model — see device_irq_intids).
+            if let Some(vsock) = self.vsock.as_ref() {
+                vsock
+                    .device
+                    .lock()
+                    .unwrap()
+                    .process(self.memory.as_shared_slice(), RAM_BASE);
             }
-
-            // Host stdin → guest console RX.
-            self.poll_stdin()?;
 
             // If the guest asked the VMM to shut down, exit the loop.
             if self.guest_shutdown {
@@ -613,47 +582,6 @@ impl Vmm {
         match Reg::from_gpr(rt) {
             Some(r) => self.vcpu.read_register(r),
             None => Ok(0),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn poll_stdin(&mut self) -> Result<()> {
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if n > 0 && pfd.revents & libc::POLLIN != 0 {
-            self.drain_stdin()?;
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn drain_stdin(&mut self) -> Result<()> {
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    return Ok(());
-                }
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err.into());
-            }
-            if n == 0 {
-                return Ok(());
-            }
-            self.console.lock().unwrap().push_rx_and_drain(
-                self.memory.as_shared_slice(),
-                RAM_BASE,
-                crate::virtio::console::CONSOLE_RX,
-                &buf[..n as usize],
-            );
         }
     }
 }

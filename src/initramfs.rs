@@ -9,13 +9,13 @@ use std::fs;
 pub mod tools;
 
 /// Mount point and device path constants.
-#[cfg(target_arch = "aarch64")]
-pub const MNT_LOWER: &str = "/mnt/lower"; // bind-mount of the original root
-#[cfg(target_arch = "aarch64")]
-pub const MNT_OVERLAY: &str = "/mnt/overlay"; // final overlay mount (becomes new root)
 pub const MNT_TMP: &str = "/mnt/tmpupper"; // tmpfs-backed upper (layer + default)
 pub const MNT_DISK: &str = "/mnt/diskupper"; // ext2-backed upper (disk mode)
 pub const DATA_DEV: &str = "/dev/vdb"; // secondary virtio-blk device
+
+/// The run configuration injected into the rootfs as /etc/sandal.conf (a
+/// plain file read needs no privileges — the same channel on both arches).
+pub const CONFIG_PATH: &str = "etc/sandal.conf";
 
 /// Load CA certificates from the host system for HTTPS support.
 /// On macOS, reads /etc/ssl/cert.pem which contains the system CA bundle.
@@ -38,36 +38,33 @@ pub fn load_host_ca_certificates() -> Option<Vec<u8>> {
     None
 }
 
-/// Export resize signal: guest requests the VMM to grow /dev/vdb so it can
-/// write a tar archive for `sandal-export` (tmpfs-upper mode).
-#[cfg(target_arch = "aarch64")]
+/// Export resize signal: the guest asks the VMM to grow /dev/vdb so it can
+/// write a tar archive for `sandal-export` (tmpfs-upper mode). The aarch64
+/// raises it as a BRK immediate; the x86_64 stores the same number to the
+/// hypercall page (the low half of the MMIO write selects the signal).
 pub const EXPORT_RESIZE_IMM: u32 = 0x5D2; // "SanDal 2"
 
-/// Export done signal: guest has finished the export.  In disk mode the VMM
-/// reads the ext2 `upper/` subtree; in tmpfs mode the guest has written an
-/// uncompressed tar to /dev/vdb and the VMM reads it from there.
-#[cfg(target_arch = "aarch64")]
+/// Export done signal: the guest has finished the export. In disk mode the
+/// VMM reads the ext2 `upper/` subtree; in tmpfs mode the guest has written
+/// an uncompressed tar to /dev/vdb and the VMM reads it from there.
 pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
 
-/// Exit protocol signal: the crafted init BRKs with the session's exit
+/// Exit protocol signal (aarch64): the init BRKs with the session's exit
 /// code in x15; the VMM reads the register at the trap (the marker-free
 /// exit protocol — the old fixed `SANDAL_EXIT:<code>` stdout marker is
-/// gone).
-#[cfg(target_arch = "aarch64")]
+/// gone). The x86_64 carries the code in the hypercall store's high half.
 pub const EXIT_IMM: u32 = 0x5D5; // "SanDal 5"
 
-/// Init config signal: guest requests VM configuration (disk mode,
-/// virtiofs mounts, network flag, timestamp).
-/// The VMM pushes a binary config blob into the UART RX buffer
-/// and sets x0 = blob size before resuming.
-#[cfg(target_arch = "aarch64")]
-pub const INIT_CONFIG_IMM: u32 = 0x5D4; // "SanDal 4"
+/// The command execution line's readiness (aarch64): vsockd's listener is
+/// bound — the VMM connects every parked front end. The x86_64 stores the
+/// same number to the hypercall page.
+pub const VSOCKD_READY_IMM: u32 = 0x5D6;
 
-/// Build the TEXT config injected into the rootfs as /etc/sandal.conf for
-/// the x86_64 shell-script init (sourced line-by-line with `read`/`case`).
-/// The text config has one field per run knob; the argument count mirrors
-/// the knobs, not a design smell.
-#[cfg(target_arch = "x86_64")]
+/// Build the TEXT config injected into the rootfs as /etc/sandal.conf —
+/// the one run-configuration channel on every platform (the x86_64 init
+/// script sources it line-by-line; the aarch64 init parses the same file).
+/// One field per run knob; the argument count mirrors the knobs, not a
+/// design smell.
 #[allow(clippy::too_many_arguments)]
 pub fn build_init_config_text(
     disk_mode: Option<&str>,
@@ -112,55 +109,6 @@ pub fn build_init_config_text(
         out.push_str(&format!("TERM={host_term}\n"));
     }
     out.into_bytes()
-}
-
-/// Build the binary config blob that the VMM sends to the guest init
-/// binary via UART after `BRK #INIT_CONFIG`.
-///
-/// Layout (little-endian):
-/// ```text
-/// 0x00  disk_mode: u8     (0=none, 1=disk)
-/// 0x01  num_virtiofs: u8
-/// 0x02  num_argv: u8
-/// 0x03  network: u8       (0=off, 1=on)
-/// 0x08  clock_secs: u64
-/// 0x10  data[]:           virtiofs (tag\0 path\0)... then argv (arg\0)...
-/// ```
-#[cfg(target_arch = "aarch64")]
-pub fn build_init_config(
-    disk_mode: Option<&str>,
-    shares: &[(String, String)],
-    network: bool,
-    clock_secs: u64,
-) -> Vec<u8> {
-    let mut blob = Vec::new();
-
-    // Header (16 bytes)
-    let dm: u8 = match disk_mode {
-        Some("disk") => 1,
-        _ => 0,
-    };
-    blob.push(dm);
-    blob.push(shares.len() as u8);
-    blob.push(0); // no argv: the command execution line is x86_64-only
-    blob.push(if network { 1 } else { 0 });
-    blob.extend_from_slice(&clock_secs.to_le_bytes());
-
-    // Virtiofs entries: tag\0 path\0
-    for (tag, path) in shares {
-        blob.extend_from_slice(tag.as_bytes());
-        blob.push(0);
-        blob.extend_from_slice(path.as_bytes());
-        blob.push(0);
-    }
-
-    // Argv entries: arg\0
-    for arg in command {
-        blob.extend_from_slice(arg.as_bytes());
-        blob.push(0);
-    }
-
-    blob
 }
 
 /// Generate the `sandal-export` shell script for the guest.

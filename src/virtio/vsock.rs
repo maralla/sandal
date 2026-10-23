@@ -73,7 +73,9 @@ use std::collections::{HashMap, VecDeque};
 /// the device never cares which.
 pub trait HostStream: std::io::Read + std::io::Write + Send {
     fn shutdown_both(&self);
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd;
+    /// The fd the bridge's poll side watches for reads (unix only — the
+    /// Windows bridge runs on a plain slice and never polls).
+    fn as_raw_fd(&self) -> i32;
     /// The fd the bridge must watch for POLLOUT when this stream's
     /// output backs up. None: the read fd serves both directions (a
     /// socket). The session front end writes to stdout — a DIFFERENT
@@ -84,7 +86,7 @@ pub trait HostStream: std::io::Read + std::io::Write + Send {
     /// round-tripped undelivered, and each round re-wrote the prefix
     /// that had landed: the terminal flashed with duplicated output
     /// (MEASURED).
-    fn write_fd(&self) -> Option<std::os::unix::io::RawFd> {
+    fn write_fd(&self) -> Option<i32> {
         None
     }
     /// What a zero-byte read means. True (the default): the peer hung up
@@ -367,6 +369,7 @@ pub struct VirtioVsockDevice {
     /// status trailer with it) waited out the poll's full slice
     /// (MEASURED: 20 ms on every `sandal -- ls`, the completion
     /// delivery arriving exactly one slice late).
+    #[cfg(unix)]
     wake_fd: Option<std::os::unix::io::RawFd>,
 }
 
@@ -385,12 +388,14 @@ impl VirtioVsockDevice {
             connections: HashMap::new(),
             next_host_port: 1024,
             guest_listening: false,
+            #[cfg(unix)]
             wake_fd: None,
             probed: false,
         }
     }
 
     /// Give the device the bridge's wake eventfd (see the field note).
+    #[cfg(unix)]
     pub fn set_wake_fd(&mut self, fd: std::os::unix::io::RawFd) {
         self.wake_fd = Some(fd);
     }
@@ -399,6 +404,7 @@ impl VirtioVsockDevice {
     /// immediately, the next round delivers what just landed. The
     /// counter semantics make this idempotent (the bridge drains once
     /// per round), and a lost write costs one slice — never progress.
+    #[cfg(unix)]
     fn wake_bridge(&self) {
         if let Some(fd) = self.wake_fd {
             let one = 1u64.to_ne_bytes();

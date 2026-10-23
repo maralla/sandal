@@ -1,4 +1,4 @@
-//! The shared VM core: guest RAM, device dispatch, the console protocol
+//! The shared VM core: guest RAM, device dispatch, the run configuration
 //! (markers, escape tracking, DSR replies), the export/exit handlers, and
 //! the platform-specific setup that the per-OS run loops drive.
 //!
@@ -15,6 +15,9 @@ pub(crate) use crate::cli::Args;
 pub(crate) use crate::irqs::{SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK};
 
 use crate::hypervisor::{Vcpu, Vm};
+
+/// The tracked SPI lines (the KVM line mirror's width): NET .. VSOCK.
+pub(crate) const NUM_TRACKED_SPIS: usize = 32;
 use crate::initramfs;
 use crate::virtio::blk::VirtioBlkDevice;
 use crate::virtio::rng::VirtioRngDevice;
@@ -38,6 +41,7 @@ use crate::unet::UserNet;
 
 #[cfg(not(target_os = "windows"))]
 use crate::virtio::fs::VirtioFsDevice;
+use vsock_host::VsockHost;
 
 #[cfg(not(target_os = "windows"))]
 use crate::virtio::net::VirtioNetDevice;
@@ -50,8 +54,8 @@ mod aarch64;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) mod session;
+mod vsock_host;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos;
@@ -92,6 +96,9 @@ pub(crate) const DATA_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_DATA_BLK;
 pub(crate) const VIRTIO_RNG_BASE: u64 = MMIO_BASE + MMIO_OFF_RNG;
 
 #[cfg(target_arch = "aarch64")]
+pub(crate) const VIRTIO_VSOCK_BASE: u64 = MMIO_BASE + MMIO_OFF_VSOCK;
+
+#[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + MMIO_OFF_FS;
 
 // Per-device offsets inside the MMIO window (shared by both architectures).
@@ -102,8 +109,8 @@ pub(crate) const MMIO_OFF_NET: u64 = 0x000;
 pub(crate) const MMIO_OFF_BLK: u64 = 0x400;
 pub(crate) const MMIO_OFF_DATA_BLK: u64 = 0x600;
 pub(crate) const MMIO_OFF_RNG: u64 = 0x800;
-/// The userspace virtio-vsock device (Linux/x86_64 only).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// The userspace virtio-vsock device (the one session transport on every
+/// platform).
 pub(crate) const MMIO_OFF_VSOCK: u64 = 0xa00;
 #[cfg(target_arch = "x86_64")]
 pub(crate) const MMIO_OFF_HYPERCALL: u64 = 0xe00;
@@ -160,8 +167,8 @@ fn restore_terminal(fd: RawFd, orig: &libc::termios) {
     }
 }
 
-/// Disable output post-processing (OPOST/ONLCR) on the console fd. The
-/// guest console stream is already fully formed (the guest tty applies
+/// Disable output post-processing (OPOST/ONLCR) on the session's stdout. The
+/// guest pty output is already fully formed (the guest tty applies
 /// ONLCR and its console driver inserts CRs); the host tty re-applying
 /// ONLCR turned every guest newline into `\r\r\n` on the pane.
 /// Mangles from the CURRENT state (see [`enable_raw_mode`]: the
@@ -260,7 +267,7 @@ impl GuestRam {
         eprintln!(
             "RESIDENCY: guest RAM: {} pages resident ({}MB) of {}MB mapped",
             total,
-            total * 4096 >> 20,
+            (total * 4096) >> 20,
             self.len >> 20
         );
         for (b, c) in counts.iter().enumerate() {
@@ -269,7 +276,7 @@ impl GuestRam {
                     "RESIDENCY: guest [{:#010x}..{:#010x}) {}MB resident",
                     b * BUCKET,
                     (b + 1) * BUCKET,
-                    (*c as usize) * 4096 >> 20
+                    ((*c as usize) * 4096) >> 20
                 );
             }
         }
@@ -309,7 +316,7 @@ impl GuestRam {
             if resident > 0 {
                 eprintln!(
                     "RESIDENCY: vmm  {start:#x}-{end:#x} {}MB of {}MB: {}",
-                    resident * 4096 >> 20,
+                    (resident * 4096) >> 20,
                     len >> 20,
                     rest.split_whitespace().next().unwrap_or("")
                 );
@@ -475,7 +482,7 @@ struct Vmm {
     /// Windows: the HLT park for the run loop + the device-thread wake.
     #[cfg(target_os = "windows")]
     halt: Arc<crate::hypervisor::whp::HaltWaker>,
-    /// Windows: the PIT tick + console-input threads (stopped on drop).
+    /// Windows: the PIT tick thread (stopped on drop).
     #[cfg(target_os = "windows")]
     device_threads: Option<crate::vm::windows::DeviceThreads>,
     blk: Option<VirtioBlkDevice>,
@@ -495,11 +502,10 @@ struct Vmm {
     /// Set on drop so the net-kick thread exits.
     #[cfg(target_os = "linux")]
     net_kick_stop: Arc<std::sync::atomic::AtomicBool>,
-    /// The userspace virtio-vsock device and its host machinery
-    /// (Linux/x86_64 only): the device, its stop flag, its threads,
-    /// and the listener's socket path. None without --vsock-sock.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    vsock: Option<linux::VsockHost>,
+    /// The userspace virtio-vsock device and its host machinery (every
+    /// platform: the one session transport). The device, its stop flag,
+    /// and its threads. None while the VM runs without a session line.
+    vsock: Option<VsockHost>,
     #[cfg(target_os = "macos")]
     vt_off: u64,
     #[cfg(target_os = "macos")]
@@ -918,7 +924,7 @@ impl Vmm {
         };
 
         #[cfg(not(target_os = "windows"))]
-        let (tty_saved, tty_out_saved) = unsafe {
+        let (tty_saved, tty_out_saved) = {
             // BOTH originals BEFORE any mangling (the exit-path
             // restore's source), then the SEQUENTIAL mangling — each
             // mangle from the current state, so they compose: a mangle
@@ -999,7 +1005,7 @@ impl Vmm {
         // registers its stream with it when there's a command); the TCP
         // proxy (front end 2) only when the operator named --port. One
         // core, two front ends — the exchange loop is stream-agnostic.
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        // Every platform: the vsock IS the session transport.
         let vsock = {
             // Front end 2: the TCP proxy — only with --port. The
             // listener binds synchronously (fail fast on a bad target).
@@ -1032,11 +1038,15 @@ impl Vmm {
             } else {
                 Some(session::SessionStream::new(&args.command)?)
             };
-            Some(linux::VsockHost::spawn(
+            #[cfg(target_os = "linux")]
+            let host_spawner = (host.irq_lock.clone(), host.irq_levels.clone());
+            Some(vsock_host::VsockHost::spawn(
                 memory.clone(),
                 vm.clone(),
-                host.irq_lock.clone(),
-                host.irq_levels.clone(),
+                #[cfg(target_os = "linux")]
+                host_spawner.0,
+                #[cfg(target_os = "linux")]
+                host_spawner.1,
                 listener,
                 session,
             )?)
@@ -1092,7 +1102,6 @@ impl Vmm {
             host,
             #[cfg(target_os = "linux")]
             net_kick_stop,
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             vsock,
             #[cfg(target_os = "macos")]
             vt_off,
@@ -1114,6 +1123,7 @@ impl Vmm {
     fn boot(&mut self, args: &Args) -> Result<()> {
         let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
         let t0 = std::time::Instant::now();
+
         // The device is always present. With `--disk-size`/`--layer` it backs
         // the overlay upperdir; without them the overlay upper stays on tmpfs
         // but the device is still needed as the scratch target `sandal-export`
@@ -1129,10 +1139,10 @@ impl Vmm {
             eprintln!("BOOT_TIMING data_disk: {:?}", t0.elapsed());
         }
 
-        // ── Init config blob ───────────────────────────────────────────
-        // arm64: delivered at the INIT_CONFIG BRK hypercall. x86_64: injected
-        // into the rootfs as /etc/sandal.conf (a plain file read needs no
-        // I/O-port privileges, which nested KVM denies to userspace).
+        // ── Init config (the text injected as /etc/sandal.conf) ────────
+        // The one run-configuration channel on every platform: a plain
+        // file read needs no privileges, and both inits (the script and
+        // the aarch64 Rust binary) parse the same format.
         let clock_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1176,48 +1186,38 @@ impl Vmm {
             })
             .unwrap_or_default();
 
+        // The whole slot is the hotplug cap: the boot memory map declares
+        // only the RAM floor (see RAM_FLOOR), and the guest init grows
+        // toward this cap on demand. x86_64 only — the aarch64 kernel
+        // carries no memory hotplug, and its slot is fully declared RAM.
         #[cfg(target_arch = "x86_64")]
-        {
-            // The whole slot is the hotplug cap: the boot memory map
-            // declares only the RAM floor (see RAM_FLOOR), and the guest
-            // init grows toward this cap on demand.
-            let mem_cap = self.memory.len() as u64;
-            // The relay mode's ports, verbatim from the device's own
-            // constant (they must never diverge): the vsock side is what
-            // the device's REQUESTs carry, and the TCP side is sshd's own
-            // port — the guest's vsockrelay forwards between them. The
-            // per-command mode (or no vsock at all) starts nothing.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let vsockd_port = if self.vsock.is_some() {
-                Some(crate::virtio::vsock::VSOCKD_PORT)
-            } else {
-                None
-            };
-            let hypercall_addr = vsockd_port.map(|_| {
-                let (page, off) = crate::vm::x86_hypercall_page_off(self.mmio_base);
-                page + off
-            });
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let vsockd_port = None;
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let hypercall_addr = None;
-            self.config_blob = initramfs::build_init_config_text(
-                disk_mode,
-                &share_configs,
-                network,
-                clock_secs,
-                &host_term,
-                mem_cap,
-                vsockd_port,
-                hypercall_addr,
-            );
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.config_blob =
-                initramfs::build_init_config(disk_mode, &share_configs, network, clock_secs);
-        }
+        let mem_cap = self.memory.len() as u64;
+        #[cfg(not(target_arch = "x86_64"))]
+        let mem_cap = 0u64;
+        // The session line's ports, verbatim from the device's own
+        // constant (they must never diverge): every platform runs the
+        // vsock session line, so the port is always present.
+        let vsockd_port = Some(crate::virtio::vsock::VSOCKD_PORT);
+        // The hypercall page's address rides the config on x86_64 (the
+        // guest helpers' /dev/mem MMIO store); the aarch64 signals are
+        // BRK immediates and need no address.
+        #[cfg(target_arch = "x86_64")]
+        let hypercall_addr = Some({
+            let (page, off) = crate::vm::x86_hypercall_page_off(self.mmio_base);
+            page + off
+        });
+        #[cfg(not(target_arch = "x86_64"))]
+        let hypercall_addr = None;
+        self.config_blob = initramfs::build_init_config_text(
+            disk_mode,
+            &share_configs,
+            network,
+            clock_secs,
+            &host_term,
+            mem_cap,
+            vsockd_port,
+            hypercall_addr,
+        );
 
         // ── Root filesystem (vda): busybox ext2 + runtime files ───────
         let mut rootfs_img = match &args.rootfs {
@@ -1233,17 +1233,11 @@ impl Vmm {
             }
         };
 
-        // The arm64 initramfs helpers are BRK-based and ignore the base
-        // (see initramfs.rs); only x86_64 pokes an MMIO hypercall window.
-        #[cfg(target_arch = "x86_64")]
-        let mmio_base = self.mmio_base;
-        #[cfg(target_arch = "aarch64")]
-        let mmio_base = 0u64;
-        crate::ext2::inject_runtime_files(&mut rootfs_img, network, mmio_base, &host_term)?;
+        crate::ext2::inject_runtime_files(&mut rootfs_img, network, &host_term)?;
 
-        #[cfg(target_arch = "x86_64")]
+        // The init reads the run configuration from this file (the shell
+        // script sources it line-by-line; the aarch64 init parses it).
         {
-            // The init script reads the run configuration from this file.
             let sb = crate::ext2::Ext2Superblock::parse(&rootfs_img)?;
             let bgdt = crate::ext2::Ext2BgdTable::parse(&rootfs_img, &sb)?;
             let mut alloc = crate::ext2::Ext2Alloc::default();
@@ -1252,7 +1246,7 @@ impl Vmm {
                 &sb,
                 &bgdt,
                 &mut alloc,
-                crate::vm::x86_64::CONFIG_PATH,
+                initramfs::CONFIG_PATH,
                 &self.config_blob,
                 0o644,
             )?;
@@ -1362,7 +1356,6 @@ impl Vmm {
             }
         }
 
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if let Some(vsock) = self.vsock.as_ref() {
             if (mw + MMIO_OFF_VSOCK..mw + MMIO_OFF_VSOCK + 0x200).contains(&addr) {
                 // The config space (the guest CID) needs the sas.
@@ -1452,7 +1445,6 @@ impl Vmm {
             }
         }
 
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if let Some(vsock) = self.vsock.as_ref() {
             if (mw + MMIO_OFF_VSOCK..mw + MMIO_OFF_VSOCK + 0x200).contains(&addr) {
                 // QueueNotify returns Some(queue); the driving is the run
@@ -1492,14 +1484,19 @@ impl Vmm {
                     eprintln!("HYPERCALL write 0x{addr:x} = 0x{val:x}");
                 }
                 // Hypercall page: a u32 write of the port number signals the VMM
-                // (the x86 analog of the ARM64 BRK immediates).
+                // (the x86 analog of the ARM64 BRK immediates). The port
+                // numbers are the shared "SanDal N" signals (initramfs.rs).
+                const RESIZE: u16 = initramfs::EXPORT_RESIZE_IMM as u16;
+                const DONE: u16 = initramfs::EXPORT_DONE_IMM as u16;
+                const EXIT: u16 = initramfs::EXIT_IMM as u16;
+                const READY: u16 = initramfs::VSOCKD_READY_IMM as u16;
                 match val as u16 {
-                    crate::elf::x86_64_linux::EXPORT_RESIZE_PORT => self.handle_export_resize(),
-                    crate::elf::x86_64_linux::EXPORT_DONE_PORT => self.handle_export_done(),
+                    RESIZE => self.handle_export_resize(),
+                    DONE => self.handle_export_done(),
                     // The exit protocol: the low half selects the signal,
                     // the high half carries the session's exit code (the
                     // init script's `sandal-exit <status>` helper).
-                    crate::elf::x86_64_linux::EXIT_PORT => {
+                    EXIT => {
                         self.guest_exit_code = Some((val >> 16) as i32);
                         self.guest_shutdown = true;
                     }
@@ -1508,9 +1505,8 @@ impl Vmm {
                     // parked front end now. The event replaces the old
                     // RST-retry loop: the REQUEST goes out exactly once,
                     // at the moment the guest can accept it.
-                    crate::elf::x86_64_linux::VSOCKD_READY_PORT => {
+                    READY => {
                         log::info!("vsockd: the READY hypercall landed");
-                        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                         if let Some(vsock) = self.vsock.as_ref() {
                             vsock.device.lock().unwrap().set_guest_listening();
                         }

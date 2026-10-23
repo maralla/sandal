@@ -8,10 +8,8 @@ pub mod fs;
 #[cfg(not(target_os = "windows"))]
 pub mod net;
 pub mod rng;
-/// The userspace virtio-vsock device (Linux/x86_64 only: the guest-side
-/// wiring — the virtio_mmio cmdline slot and its IRQ — is x86_64-only
-/// for now; the device code itself is portable).
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// The userspace virtio-vsock device: THE session transport on every
+/// platform (Linux KVM, macOS HVF, Windows WHP).
 pub mod vsock;
 use std::sync::atomic::{fence, Ordering};
 

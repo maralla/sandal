@@ -104,10 +104,14 @@ impl KernelImage {
     /// under pressure), so the VMM's resident set sheds the image.
     #[cfg(target_os = "linux")]
     fn drop_resident_pages(&self) {
-        if let Self::Mapped { ptr, len } = self {
-            unsafe {
+        match self {
+            Self::Mapped { ptr, len } => unsafe {
                 libc::madvise(*ptr as *mut libc::c_void, *len, libc::MADV_DONTNEED);
-            }
+            },
+            // The owned-buffer variants never exist on this build's cfg
+            // set; the arm keeps the match exhaustive under the others.
+            #[cfg(any(target_os = "windows", sandal_embed_kernel))]
+            Self::Owned(_) => {}
         }
     }
 }
@@ -161,11 +165,6 @@ pub fn x86_hypercall_page_off(mmio_base: u64) -> (u64, u64) {
     let hyper = mmio_base + MMIO_OFF_HYPERCALL;
     (hyper & !0xfff, hyper & 0xfff)
 }
-
-/// Page-aligned base for /dev/mem mmap guests.
-/// Config blob injected into the rootfs as /etc/sandal.conf (replaces the
-/// arm64 INIT_CONFIG BRK hypercall: a plain file read needs no privileges).
-pub(super) const CONFIG_PATH: &str = "etc/sandal.conf";
 
 /// Guest RAM declared in the boot memory map. The KVM slot maps the whole
 /// `--memory` cap, but only this floor is declared as RAM: the rest is a

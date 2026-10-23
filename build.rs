@@ -27,28 +27,48 @@ fn main() {
         // or extra libraries needed.
     }
 
-    // ── The guest command execution line ─────────────────────────────
-    // vsockd is pure Rust (no_std, raw syscalls) compiled with rustc
-    // for x86_64-unknown-none: a self-contained static ELF with no
-    // libc, no toolchain, no sibling binary — the target ships with
-    // the toolchain (`rustup target add x86_64-unknown-none`).
-    // x86_64 only: the injection site (ext2.rs inject_runtime_files)
-    // is x86_64-gated.
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+    // ── The guest helper binaries ────────────────────────────────────
+    // Pure Rust (no_std, raw syscalls) compiled with rustc for the
+    // {arch}-unknown-none target: self-contained static ELFs with no
+    // libc, no toolchain, no sibling binaries — the target ships with
+    // the toolchain (`rustup target add x86_64-unknown-none` /
+    // `aarch64-unknown-none`). Every platform compiles its own arch's
+    // set; the injection sites (ext2.rs inject_runtime_files) pick.
+    //
+    //   vsockd         — the command execution line (every platform)
+    //   sandal-exit    — the exit protocol (x86_64: the init script's tail)
+    //   export resize/done — the overlay export signals (every platform)
+    //   init           — the aarch64 /init (x86_64 runs the shell script)
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target = match arch.as_str() {
+        "x86_64" => "x86_64-unknown-none",
+        "aarch64" => "aarch64-unknown-none",
+        other => panic!("build.rs: no guest target for host arch {other}"),
+    };
+    let mut guests: Vec<(&str, bool)> = vec![
+        ("vsockd", true),
+        ("export_resize", true),
+        ("export_done", true),
+        ("sandal_exit", arch == "x86_64"),
+        ("init", arch == "aarch64"),
+    ];
+    guests.retain(|(_, build)| *build);
+    println!("cargo::rerun-if-changed=src/initramfs/tools/bin/common.rs");
+    println!("cargo::rerun-if-env-changed=SANDAL_GUEST_DEBUG");
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    // The guest-side debug builds: SANDAL_GUEST_DEBUG=1 keeps the DWARF
+    // (the debug sections dwarf the code — the shipping binaries are a
+    // few KB stripped). The shipping binaries: stripped.
+    let debug = std::env::var_os("SANDAL_GUEST_DEBUG").is_some();
+    for (name, _) in &guests {
         let out = std::env::var("OUT_DIR").unwrap();
-        let bin = format!("{out}/vsockd.bin");
-        println!("cargo::rerun-if-changed=src/initramfs/tools/bin/vsockd.rs");
-        println!("cargo::rerun-if-env-changed=SANDAL_GUEST_DEBUG");
-        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-        // The guest-side debug builds: SANDAL_GUEST_DEBUG=1 keeps the DWARF
-        // (the debug sections were 764 KB of the first 798 KB build — the
-        // code itself is 7 KB). The shipping binary: stripped.
-        let debug = std::env::var_os("SANDAL_GUEST_DEBUG").is_some();
+        let bin = format!("{out}/{name}.bin");
+        println!("cargo::rerun-if-changed=src/initramfs/tools/bin/{name}.rs");
         let mut args = vec![
             "--edition".to_string(),
             "2021".to_string(),
             "--target".to_string(),
-            "x86_64-unknown-none".to_string(),
+            target.to_string(),
             "-C".to_string(),
             "panic=abort".to_string(),
             "-C".to_string(),
@@ -69,14 +89,14 @@ fn main() {
         );
         args.push("-o".to_string());
         args.push(bin.clone());
-        args.push("src/initramfs/tools/bin/vsockd.rs".to_string());
+        args.push(format!("src/initramfs/tools/bin/{name}.rs"));
         let status = std::process::Command::new(&rustc)
             .args(&args)
             .status()
-            .expect("rustc: the guest command execution line needs it");
+            .expect("rustc: the guest helper binaries need it");
         assert!(
             status.success(),
-            "rustc: vsockd_guest.rs failed to compile (rustup target add x86_64-unknown-none)"
+            "rustc: {name}.rs failed to compile (rustup target add {target})"
         );
     }
 

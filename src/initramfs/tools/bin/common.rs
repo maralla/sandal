@@ -1,5 +1,7 @@
 // The guest helpers' shared platform layer: compiled as a MODULE of
-// the guest binary's crate (which declares #![no_std]).
+// the guest binary's crate (which declares #![no_std]). Each binary uses
+// a slice of it — the unused rest is the point of sharing.
+#![allow(dead_code)]
 
 use core::arch::asm;
 
@@ -7,6 +9,8 @@ use core::arch::asm;
 //    termios/signals and the same socket families) ────────────────────
 
 pub const AF_VSOCK: usize = 40;
+pub const AF_INET: usize = 2;
+pub const SOCK_DGRAM: usize = 2;
 pub const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
 pub const SOCK_STREAM: usize = 1;
 pub const AT_FDCWD: usize = usize::MAX - 99; // -100
@@ -24,11 +28,27 @@ pub const SIG_DFL: usize = 0;
 pub const EINTR: isize = 4;
 pub const EAGAIN: isize = 11;
 pub const FIONBIO: usize = 0x5421;
+pub const TCGETS: usize = 0x5401;
+pub const TCSETS: usize = 0x5402;
 pub const TIOCSPTLCK: usize = 0x4004_5431;
 pub const TIOCGPTPEER: usize = 0x5441;
 pub const TIOCSWINSZ: usize = 0x5414;
 pub const TIOCSPGRP: usize = 0x5410;
 pub const TIOCSCTTY: usize = 0x540E;
+// File open flags (the init's resolv.conf write and the /dev/mem opens).
+pub const O_RDONLY: usize = 0;
+pub const O_WRONLY: usize = 1;
+pub const O_CREAT: usize = 0x40;
+pub const O_TRUNC: usize = 0x200;
+// The networking ioctls (arch-uniform: the 0x89xx family).
+pub const SIOCSIFFLAGS: usize = 0x8914;
+pub const SIOCSIFADDR: usize = 0x8916;
+pub const SIOCSIFNETMASK: usize = 0x891C;
+pub const SIOCADDRT: usize = 0x890B;
+pub const IFF_UP: u16 = 1;
+pub const RTF_UP_GATEWAY: u16 = 0x0003; // RTF_UP | RTF_GATEWAY
+// reboot(RB_POWER_OFF): the two magics are fixed by the kernel's reboot(2).
+pub const RB_POWER_OFF: usize = 0x4321_FEDC;
 
 // ── The syscall numbers (per arch) ──────────────────────────────────
 
@@ -54,6 +74,13 @@ pub mod nr {
     pub const OPENAT: usize = 257;
     pub const DUP3: usize = 292;
     pub const EXECVE: usize = 59;
+    pub const MOUNT: usize = 165;
+    pub const MKDIRAT: usize = 258;
+    pub const SYMLINKAT: usize = 266;
+    pub const CHDIR: usize = 80;
+    pub const CLOCK_SETTIME: usize = 228;
+    pub const PIVOT_ROOT: usize = 217;
+    pub const REBOOT: usize = 169;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -78,6 +105,13 @@ pub mod nr {
     pub const OPENAT: usize = 56;
     pub const DUP3: usize = 24;
     pub const EXECVE: usize = 221;
+    pub const MOUNT: usize = 40;
+    pub const MKDIRAT: usize = 34;
+    pub const SYMLINKAT: usize = 36;
+    pub const CHDIR: usize = 49;
+    pub const CLOCK_SETTIME: usize = 113;
+    pub const PIVOT_ROOT: usize = 151;
+    pub const REBOOT: usize = 142;
 }
 
 // ── The raw syscall entry (per arch) ────────────────────────────────
@@ -200,6 +234,69 @@ pub fn dup3(fd: i32, newfd: i32) -> i32 {
 pub fn exit(code: usize) -> ! {
     let _ = syscall(nr::EXIT, [code, 0, 0, 0, 0, 0]);
     unreachable!()
+}
+
+pub fn open(path: &[u8], flags: usize, mode: u32) -> i32 {
+    syscall(nr::OPENAT, [
+        AT_FDCWD,
+        path.as_ptr() as usize,
+        flags,
+        mode as usize,
+        0,
+        0,
+    ]) as i32
+}
+
+pub fn mount(src: &[u8], tgt: &[u8], fs_type: &[u8], flags: usize, data: usize) -> isize {
+    syscall(nr::MOUNT, [
+        src.as_ptr() as usize,
+        tgt.as_ptr() as usize,
+        fs_type.as_ptr() as usize,
+        flags,
+        data,
+        0,
+    ])
+}
+
+pub fn mkdir(path: &[u8], mode: u32) -> isize {
+    syscall(nr::MKDIRAT, [AT_FDCWD, path.as_ptr() as usize, mode as usize, 0, 0, 0])
+}
+
+pub fn chdir(path: &[u8]) -> isize {
+    syscall(nr::CHDIR, [path.as_ptr() as usize, 0, 0, 0, 0, 0])
+}
+
+pub fn symlink(target: &[u8], link: &[u8]) -> isize {
+    syscall(nr::SYMLINKAT, [
+        target.as_ptr() as usize,
+        AT_FDCWD,
+        link.as_ptr() as usize,
+        0,
+        0,
+        0,
+    ])
+}
+
+/// clock_settime(CLOCK_REALTIME, {secs, 0}) — the wall clock.
+pub fn clock_settime(secs: u64) -> isize {
+    let ts = [secs as usize, 0usize];
+    syscall(nr::CLOCK_SETTIME, [0, ts.as_ptr() as usize, 0, 0, 0, 0])
+}
+
+pub fn pivot_root(new_root: &[u8], put_old: &[u8]) -> isize {
+    syscall(nr::PIVOT_ROOT, [
+        new_root.as_ptr() as usize,
+        put_old.as_ptr() as usize,
+        0,
+        0,
+        0,
+        0,
+    ])
+}
+
+/// reboot(RB_POWER_OFF) — the init's final act after the exit signal.
+pub fn power_off() -> isize {
+    syscall(nr::REBOOT, [0xFEE1_DEAD, 0x2812_1969, RB_POWER_OFF, 0, 0, 0])
 }
 
 /// poll(fds, timeout): x86_64 poll(2) (the ms timeout); aarch64 has no
@@ -341,8 +438,12 @@ pub fn env_get(key: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
-/// The hypercall page's guest-physical address from the HYPERCALL env
-/// var (decimal; the VMM injects it). Zero: not present.
+/// The hypercall page's guest-physical address: the HYPERCALL env var
+/// (decimal; the config carries it and the init exports it before the
+/// exec, so every session child inherits it). Zero: absent — the x86_64
+/// MMIO window moves with --memory, so there is NO correct static
+/// fallback; a caller without the env simply cannot signal (the VMM
+/// times the operation out and says so).
 #[cfg(target_arch = "x86_64")]
 pub fn hyper_addr() -> u64 {
     match env_get(b"HYPERCALL") {
@@ -373,6 +474,17 @@ pub const VM_SIGNAL_READY: u32 = 0x5D6;
 /// x86_64: the exit signal constant (the code rides the high half).
 #[cfg(target_arch = "x86_64")]
 pub const VM_SIGNAL_EXIT: u32 = 0x5D5;
+/// x86_64: the export resize signal (the same "SanDal N" numbering as the
+/// aarch64 BRK immediates).
+#[cfg(target_arch = "x86_64")]
+pub const VM_SIGNAL_RESIZE: u32 = 0x5D2;
+/// x86_64: the export done signal.
+#[cfg(target_arch = "x86_64")]
+pub const VM_SIGNAL_DONE: u32 = 0x5D3;
+/// The aarch64 BRK immediates (the VMM's handle_brk dispatch matches them).
+/// The config blob delivery: brk #0x5d4, the size returned in x0, the bytes
+/// over the console RX.
+pub const VM_SIGNAL_CONFIG: u32 = 0x5D4;
 
 /// The VM signal: the command execution line's readiness — the raw
 /// store (the value the VMM's dispatch matches).
@@ -392,7 +504,7 @@ pub fn signal_ready() {
     }
 }
 
-/// The VM signal: the session's exit (the code rides the signal: the
+/// The VM signal: the exit (the code rides the signal: the
 /// x86_64 high half / the aarch64 x15). The VM dies here whatever the
 /// transport managed.
 pub fn exit_vm(code: u8) {
@@ -418,14 +530,59 @@ pub fn exit_vm(code: u8) {
 /// userspace — the machine-code draft died on exactly that.) Off by
 /// default; flip for the guest-side bisection.
 pub fn debug_event(stage: u32) {
+    // Off by default; flip for the guest-side bisection (the x86_64 trace
+    // lands as an "unknown hypercall 0x300N" line at -v; the aarch64 BRKs
+    // are resumed silently by the VMM's handle_brk's catch-all).
     const DEBUG_TRACE: bool = false;
+    let _ = stage;
     if DEBUG_TRACE {
         #[cfg(target_arch = "x86_64")]
-        hyper_store(0x3000 | stage);
+        {
+            // A raw store — NOT hyper_store (which traces, and would
+            // recurse into itself here).
+            let addr = hyper_addr();
+            let path = b"/dev/mem\0";
+            let fd = syscall(nr::OPENAT, [
+                AT_FDCWD, path.as_ptr() as usize, O_RDWR, 0, 0, 0,
+            ]) as i32;
+            if fd < 0 {
+                return;
+            }
+            let base = mmap(0x1000, fd, (addr & !0xFFF) as usize);
+            close(fd);
+            if base < 0 {
+                return;
+            }
+            let ptr = (base as usize + (addr & 0xFFF) as usize) as *mut u32;
+            unsafe {
+                ptr.write_volatile(0x3000 | stage);
+            }
+            let _ = munmap(base as usize, 0x1000);
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             asm!("brk #0x3000", options(nomem, nostack));
         }
+    }
+}
+
+/// The VM signal: the export resize (grow /dev/vdb, tmpfs-upper mode).
+pub fn signal_resize() {
+    #[cfg(target_arch = "x86_64")]
+    hyper_store(VM_SIGNAL_RESIZE);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!("brk #0x5d2", options(nomem, nostack));
+    }
+}
+
+/// The VM signal: the export data is ready (the VMM extracts the layer).
+pub fn signal_done() {
+    #[cfg(target_arch = "x86_64")]
+    hyper_store(VM_SIGNAL_DONE);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!("brk #0x5d3", options(nomem, nostack));
     }
 }
 
@@ -435,18 +592,20 @@ pub fn debug_event(stage: u32) {
 fn hyper_store(value: u32) {
     let addr = hyper_addr();
     if addr == 0 {
-        return;
+        return; // no env: no address, no signal (see hyper_addr)
     }
     let path = b"/dev/mem\0";
     let fd = syscall(nr::OPENAT, [
         AT_FDCWD, path.as_ptr() as usize, O_RDWR, 0, 0, 0,
     ]) as i32;
     if fd < 0 {
+        debug_event(0x11); // open failed
         return;
     }
     let base = mmap(0x1000, fd, (addr & !0xFFF) as usize);
     close(fd);
     if base < 0 {
+        debug_event(0x12); // mmap failed
         return;
     }
     let ptr = (base as usize + (addr & 0xFFF) as usize) as *mut u32;
@@ -454,6 +613,7 @@ fn hyper_store(value: u32) {
         ptr.write_volatile(value);
     }
     let _ = munmap(base as usize, 0x1000);
+    debug_event(0x13); // stored
 }
 
 // ── The entry shim (per arch): the args' rsp captured naked ────────
@@ -489,6 +649,20 @@ pub unsafe extern "C" fn _start() -> ! {
         "bl {}",
         sym guest_entry_shim,
     );
+}
+
+// ── The console termios (the init's raw-mode config read) ─────────
+
+/// The kernel's struct termios: 4 flag words + c_line + c_cc[32] (+ pad).
+/// The flags the init touches: c_iflag at 0, c_lflag at 12.
+pub const TERMIOS_LEN: usize = 48;
+
+pub fn termios_get(fd: i32, buf: &mut [u8; TERMIOS_LEN]) -> isize {
+    ioctl3(fd, TCGETS, buf.as_mut_ptr() as usize)
+}
+
+pub fn termios_set(fd: i32, buf: &[u8; TERMIOS_LEN]) -> isize {
+    ioctl3(fd, TCSETS, buf.as_ptr() as usize)
 }
 
 // ── The shared protocol helpers ─────────────────────────────────────

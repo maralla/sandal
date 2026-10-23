@@ -23,7 +23,6 @@
 mod common;
 
 use common::*;
-use common::nr::*;
 
 /// The panic floor: no_std has no unwinding — the exit code 126 (the
 /// generic failure).
@@ -113,7 +112,7 @@ fn strip_input(master: i32, session_pid: i32, input: &mut [u8]) -> usize {
 // 64 KiB holds, a backed-up direction is not read from. The death paths
 // (EOF or a hard error on either side) funnel into the reaper.
 
-fn mode_pty_bridge(conn: i32, master: i32, session_pid: i32, envp: usize,
+fn mode_pty_bridge(conn: i32, master: i32, session_pid: i32, _envp: usize,
                    own_lifetime: bool) {
     let mut in_buf = [0u8; HOLD_LEN];
     let mut out_buf = [0u8; HOLD_LEN];

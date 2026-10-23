@@ -1,10 +1,11 @@
 //! Windows-host run loop (`WHP` backend) and the host-side device threads.
 //!
-//! The loop mirrors `run_loop_kvm`: run the vCPU, handle exits, drain the
-//! guest console TX, pump the network backend, and raise device IRQ lines
-//! through the userspace PIC. The vCPU idle model differs: WHP has no
-//! in-kernel halt-and-wake, so on `HLT` the loop parks on a condvar until a
-//! device thread signals an event (the PIT tick, console input, net arrival).
+//! The loop mirrors `run_loop_kvm`: run the vCPU, handle exits, give the
+//! vsock device its per-exit process pass, pump the network backend, and
+//! raise device IRQ lines through the userspace PIC. The vCPU idle model
+//! differs: WHP has no in-kernel halt-and-wake, so on `HLT` the loop parks
+//! on a condvar until a device thread signals an event (the PIT tick, the
+//! bridge's progress).
 
 use super::{Args, Vmm, RAM_BASE};
 use crate::hypervisor::KvmExit;
@@ -27,49 +28,35 @@ impl Vmm {
         loop {
             match self.vcpu.run()? {
                 KvmExit::Hlt => {
-                    // Park until a device event (timer tick, console input,
+                    // Park until a device event (timer tick, net arrival,
                     // net arrival) — re-entering immediately would spin.
                     self.halt.wait_timeout(50);
                 }
                 exit => self.handle_kvm_exit(exit)?,
             }
 
-            // ── Guest console TX → host stdout ─────────────────────────
-            let tx = self.console.lock().unwrap().process_tx(
-                self.memory.as_shared_slice(),
-                RAM_BASE,
-                crate::virtio::console::CONSOLE_TX,
-            );
-            if !tx.is_empty() {
-                let mut out = Vec::new();
-                let replied = {
-                    let mut f = self.console_tx_filter.lock().unwrap();
-                    f.feed(&tx, &self.console, &self.memory, RAM_BASE, &mut out);
-                    let replied = f.replied;
-                    f.replied = false;
-                    replied
-                };
-                if !out.is_empty() {
-                    let _ = std::io::stdout().write_all(&out);
-                    let _ = std::io::stdout().flush();
-                }
-                // The exit code comes from the EXIT hypercall in the shared
-                // mmio_write; the export path and the session routing ride
-                // their own channels (see process_export_tx /
-                // process_control_tx).
-                self.console.lock().unwrap();
-                if replied {
-                    // The filter answered a terminal query: the reply is in
-                    // the console RX — raise the console IRQ line.
-                    self.raise_console_irq();
-                }
+            // ── The vsock device: ONE process pass per exit ────────────
+            // The guest's kicks land here, the same iteration the exit was
+            // handled in. One pass, never a loop: whatever it cannot
+            // deliver (a closed credit window, an exhausted RX ring)
+            // waits for the next event (the bridge's slice, the next
+            // exit) — a loop here would wedge the vCPU on the first
+            // stalled pass (the bridge holds the same device mutex).
+            if let Some(vsock) = self.vsock.as_ref() {
+                vsock
+                    .device
+                    .lock()
+                    .unwrap()
+                    .process(self.memory.as_shared_slice(), RAM_BASE);
             }
 
             // ── Device IRQ lines → the userspace PIC ───────────────────
             // Edge model: assert on each 0→1 transition of a device's
             // interrupt status (the guest ACK clears it).
-            if self.console.lock().unwrap().interrupt_status != 0 {
-                self.raise_console_irq();
+            if let Some(vsock) = self.vsock.as_ref() {
+                if vsock.device.lock().unwrap().interrupt_status != 0 {
+                    self.raise_vsock_irq();
+                }
             }
             if let Some(blk) = self.blk.as_ref() {
                 if blk.interrupt_status != 0 {
@@ -147,8 +134,10 @@ impl Vmm {
         self.halt.notify();
     }
 
-    pub(super) fn raise_console_irq(&self) {
-        let _ = self.vm.raise_irq(5);
+    pub(super) fn raise_vsock_irq(&self) {
+        // ISA_IRQ_POOL[10] — the vsock slot (the cmdline's virtio_mmio
+        // order; see x86_64.rs).
+        let _ = self.vm.raise_irq(15);
         self.halt.notify();
     }
 
@@ -191,7 +180,7 @@ impl DeviceThreads {
 }
 
 /// Spawn the host-side device threads: the PIT tick (the guest timer + the
-/// net pump) and the console input reader.
+/// net pump).
 pub(super) fn spawn_device_threads(vmm: &mut Vmm) -> DeviceThreads {
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
@@ -226,65 +215,8 @@ pub(super) fn spawn_device_threads(vmm: &mut Vmm) -> DeviceThreads {
         }));
     }
 
-    // ── The console input reader ───────────────────────────────────────────
-    {
-        let stop = stop.clone();
-        let pic = vmm.pic_handle();
-        let halt = vmm.halt_waker();
-        let console = vmm.console.clone();
-        let memory = vmm.memory.clone();
-
-        handles.push(std::thread::spawn(move || {
-            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-            let mut chunk = [0u8; 256];
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let mut read: u32 = 0;
-                let ok = unsafe {
-                    ReadFile(
-                        handle,
-                        chunk.as_mut_ptr(),
-                        chunk.len() as u32,
-                        &mut read,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    // No input available (the console without buffered input
-                    // blocks in ReadFile; a closed handle spins — pace it).
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                if read > 0 {
-                    console.lock().unwrap().push_rx_and_drain(
-                        memory.as_shared_slice(),
-                        RAM_BASE,
-                        crate::virtio::console::CONSOLE_RX,
-                        &chunk[..read as usize],
-                    );
-                    pic.lock().unwrap().raise(5); // the console IRQ line
-                    halt.notify();
-                }
-            }
-        }));
-    }
+    // The console input reader is gone: the session input rides the
+    // vsock line (the guest's vsockd bridges it to the session's pty).
 
     DeviceThreads { stop, handles }
-}
-
-// ── Windows console/input FFI (kernel32, auto-linked) ──────────────────────
-
-const STD_INPUT_HANDLE: u32 = 0xFFFF_FFD6;
-
-unsafe extern "system" {
-    fn GetStdHandle(which: u32) -> *mut c_void;
-    fn ReadFile(
-        handle: *mut c_void,
-        buffer: *mut u8,
-        to_read: u32,
-        read: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
 }

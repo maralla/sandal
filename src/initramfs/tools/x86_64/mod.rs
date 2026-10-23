@@ -1,5 +1,3 @@
-//! x86_64 guest helpers (pure machine code, built with the x86_64 DSL).
+//! x86_64 guest helpers that are plain data: the init shell script.
 
-pub mod exit;
-pub mod export;
 pub mod init;
