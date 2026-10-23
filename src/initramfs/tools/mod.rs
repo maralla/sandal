@@ -12,6 +12,7 @@
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 #[cfg(target_arch = "x86_64")]
+pub mod bin;
 pub mod x86_64;
 
 #[cfg(target_arch = "aarch64")]
@@ -40,12 +41,6 @@ mod helper_tests {
             let page = 0x4000_0000u64; // the dump helper only checks that it builds
             std::fs::write("/tmp/helper-done", super::export_done_helper(page)).unwrap();
             std::fs::write("/tmp/helper-resize", super::export_resize_helper(page)).unwrap();
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            std::fs::write(
-                "/tmp/helper-portagent",
-                super::x86_64::portagent::portagent_helper(),
-            )
-            .unwrap();
         }
     }
 }

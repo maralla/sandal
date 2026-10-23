@@ -59,8 +59,18 @@ PROBE_B64 = base64.b64encode(
 
 def geo_session(vm):
     """The last GEO_RESULT line's geometry (the probe tty's winsize)."""
+    import re
+
     for line in reversed(vm.buf.decode("utf-8", "replace").splitlines()):
         if line.startswith("GEO_RESULT "):
+            # Strip ANSI/CSI escape sequences before the parse: a live
+            # resize makes the shell's line editor redraw its prompt
+            # line, and the redraw's erase sequences (ESC[K ...) land on
+            # the SAME output line as the probe's result — the geometry
+            # itself is correct, and the escapes are the terminal's own
+            # redraw noise (a timing-dependent interleaving: MEASURED 1
+            # pass in 3 runs without this).
+            line = re.sub("\x1b\\[[0-9;?]*[ -/]*[@-~]", "", line)
             return line.split(" ", 1)[1].strip()
     return None
 

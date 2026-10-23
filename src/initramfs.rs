@@ -57,7 +57,7 @@ pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
 pub const EXIT_IMM: u32 = 0x5D5; // "SanDal 5"
 
 /// Init config signal: guest requests VM configuration (disk mode,
-/// virtiofs mounts, command argv, network flag, timestamp).
+/// virtiofs mounts, network flag, timestamp).
 /// The VMM pushes a binary config blob into the UART RX buffer
 /// and sets x0 = blob size before resuming.
 #[cfg(target_arch = "aarch64")]
@@ -72,14 +72,12 @@ pub const INIT_CONFIG_IMM: u32 = 0x5D4; // "SanDal 4"
 pub fn build_init_config_text(
     disk_mode: Option<&str>,
     shares: &[(String, String)],
-    command: &[String],
     network: bool,
     clock_secs: u64,
-    console_cols: u16,
-    console_rows: u16,
     host_term: &str,
     mem_cap: u64,
-    vsock_relay: Option<(u32, u32)>,
+    vsockd_port: Option<u32>,
+    hypercall_addr: Option<u64>,
 ) -> Vec<u8> {
     let mut out = String::new();
     if disk_mode.is_some() {
@@ -90,29 +88,28 @@ pub fn build_init_config_text(
     for (tag, path) in shares {
         out.push_str(&format!("SHARE={tag}:{path}\n"));
     }
-    out.push_str(&format!("COLS={}\n", console_cols));
-    out.push_str(&format!("ROWS={}\n", console_rows));
     // Memory hotplug cap (bytes): the whole KVM slot size, passed so the
     // guest init can grow the declared RAM floor toward it on demand.
     // Zero means no hotplug (a cap at or below the floor).
     out.push_str(&format!("MEMCAP={mem_cap}\n"));
-    // The vsock relay mode's ports (vsock listen, TCP forward), verbatim
-    // from the VMM's own constants: the guest init starts /bin/vsockrelay
-    // with them (one forked pump child per connection, forwarded to the
-    // guest's own TCP loopback — sshd there, unmodified). None means no
-    // relay: nothing starts, and the vsock port answers nothing.
-    if let Some((vsock_port, tcp_port)) = vsock_relay {
-        out.push_str(&format!("VSOCKRELAY={vsock_port}:{tcp_port}\n"));
+    // The command execution line's port, verbatim from the VMM's own
+    // constant: the guest init starts /bin/vsockd with it (one forked
+    // child per connection — the general command execution proxy: the
+    // connection's own bytes decide what runs). None means no channel:
+    // nothing starts, and the vsock port answers nothing.
+    if let Some(vsockd_port) = vsockd_port {
+        out.push_str(&format!("VSOCKD={vsockd_port}\n"));
+        if let Some(addr) = hypercall_addr {
+            out.push_str(&format!("HYPERCALL={addr}\n"));
+        }
     }
-    // The guest runs the user's terminal type, not a hardcoded console type:
-    // TERM=linux caps vim and every TUI at 8 colors (t_Co=8), which is what
-    // broke colorschemes. Sanitized by the caller; empty means no line and
-    // the guest init keeps its linux fallback.
+    // The guest terminal type: the host's own, sanitized by the caller
+    // (see Vmm::boot). The pty session is a REAL terminal — the guest
+    // init exports this so every terminal application agrees with the
+    // host side, and the matching terminfo entry is injected below
+    // (inject_runtime_files). Empty: the guest keeps its linux fallback.
     if !host_term.is_empty() {
         out.push_str(&format!("TERM={host_term}\n"));
-    }
-    for arg in command {
-        out.push_str(&format!("ARG={arg}\n"));
     }
     out.into_bytes()
 }
@@ -126,8 +123,6 @@ pub fn build_init_config_text(
 /// 0x01  num_virtiofs: u8
 /// 0x02  num_argv: u8
 /// 0x03  network: u8       (0=off, 1=on)
-/// 0x04  console_cols: u16
-/// 0x06  console_rows: u16
 /// 0x08  clock_secs: u64
 /// 0x10  data[]:           virtiofs (tag\0 path\0)... then argv (arg\0)...
 /// ```
@@ -135,11 +130,8 @@ pub fn build_init_config_text(
 pub fn build_init_config(
     disk_mode: Option<&str>,
     shares: &[(String, String)],
-    command: &[String],
     network: bool,
     clock_secs: u64,
-    console_cols: u16,
-    console_rows: u16,
 ) -> Vec<u8> {
     let mut blob = Vec::new();
 
@@ -150,10 +142,8 @@ pub fn build_init_config(
     };
     blob.push(dm);
     blob.push(shares.len() as u8);
-    blob.push(command.len() as u8);
+    blob.push(0); // no argv: the command execution line is x86_64-only
     blob.push(if network { 1 } else { 0 });
-    blob.extend_from_slice(&console_cols.to_le_bytes());
-    blob.extend_from_slice(&console_rows.to_le_bytes());
     blob.extend_from_slice(&clock_secs.to_le_bytes());
 
     // Virtiofs entries: tag\0 path\0

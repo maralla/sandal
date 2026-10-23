@@ -12,14 +12,11 @@
 
 pub(crate) use crate::cli::Args;
 #[cfg(not(target_os = "windows"))]
-pub(crate) use crate::irqs::{
-    SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK,
-};
+pub(crate) use crate::irqs::{SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK};
 
 use crate::hypervisor::{Vcpu, Vm};
 use crate::initramfs;
 use crate::virtio::blk::VirtioBlkDevice;
-use crate::virtio::console::VirtioConsoleDevice;
 use crate::virtio::rng::VirtioRngDevice;
 use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
@@ -53,6 +50,8 @@ mod aarch64;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) mod session;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos;
@@ -83,8 +82,6 @@ pub(crate) const MMIO_BASE: u64 = 0x0a00_0000;
 pub(crate) const VIRTIO_NET_BASE: u64 = MMIO_BASE + MMIO_OFF_NET;
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) const VIRTIO_CONSOLE_BASE: u64 = MMIO_BASE + MMIO_OFF_CONSOLE;
-
 #[cfg(target_arch = "aarch64")]
 pub(crate) const VIRTIO_BLK_BASE: u64 = MMIO_BASE + MMIO_OFF_BLK;
 
@@ -102,7 +99,6 @@ pub(crate) const VIRTIOFS_BASE_START: u64 = MMIO_BASE + MMIO_OFF_FS;
 // the guest gets the full requested memory: capping RAM below a fixed device
 // region silently shrank `-m` to 1 GB and OOM-killed large builds.
 pub(crate) const MMIO_OFF_NET: u64 = 0x000;
-pub(crate) const MMIO_OFF_CONSOLE: u64 = 0x200;
 pub(crate) const MMIO_OFF_BLK: u64 = 0x400;
 pub(crate) const MMIO_OFF_DATA_BLK: u64 = 0x600;
 pub(crate) const MMIO_OFF_RNG: u64 = 0x800;
@@ -119,22 +115,41 @@ pub(crate) const VIRTIOFS_SIZE: u64 = 0x200;
 /// Put the host terminal in raw mode: disable echo, canonical mode and
 /// signal generation so every keystroke (including Tab and the guest line
 /// editor's CSI queries) is forwarded to the guest verbatim instead of
-/// being line-buffered/echoed by the host tty. Returns the original
-/// settings for restore.
+/// being line-buffered/echoed by the host tty.
+///
+/// Mangles from the CURRENT state: the manglings must COMPOSE (the
+/// output-side mangle below runs after this one, on the same tty), so
+/// each mangle starts from whatever the previous one left — never from
+/// a pre-mangling original (MEASURED: an output-side mangle from the
+/// original turned ECHO back on mid-session). The RESTORE's original
+/// is captured separately, before any mangling (see [`capture_tty`]).
 #[cfg(not(target_os = "windows"))]
-fn enable_raw_mode(fd: RawFd) -> Option<libc::termios> {
+fn enable_raw_mode(fd: RawFd) {
     unsafe {
-        let mut orig: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut orig) != 0 {
-            return None;
+        let mut raw: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut raw) != 0 {
+            return;
         }
-        let mut raw = orig;
         raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN);
         raw.c_iflag &= !(libc::ICRNL | libc::IXON);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(fd, libc::TCSANOW, &raw);
-        Some(orig)
+    }
+}
+
+/// Capture a tty's ORIGINAL termios — the pre-mangling state, for both
+/// the Drop's restore and the exit-path restore (see
+/// [`register_host_terminal_restore`]). None when the fd is not a tty.
+#[cfg(not(target_os = "windows"))]
+fn capture_tty(fd: RawFd) -> Option<libc::termios> {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::isatty(fd) != 0 && libc::tcgetattr(fd, &mut orig) == 0 {
+            Some(orig)
+        } else {
+            None
+        }
     }
 }
 
@@ -148,19 +163,65 @@ fn restore_terminal(fd: RawFd, orig: &libc::termios) {
 /// Disable output post-processing (OPOST/ONLCR) on the console fd. The
 /// guest console stream is already fully formed (the guest tty applies
 /// ONLCR and its console driver inserts CRs); the host tty re-applying
-/// ONLCR turned every guest newline into `\r\r\n` on the pane. Returns
-/// the original settings for restore.
+/// ONLCR turned every guest newline into `\r\r\n` on the pane.
+/// Mangles from the CURRENT state (see [`enable_raw_mode`]: the
+/// manglings compose); the RESTORE's original is captured separately,
+/// before any mangling (see [`capture_tty`]).
 #[cfg(not(target_os = "windows"))]
-fn disable_output_processing(fd: RawFd) -> Option<libc::termios> {
+fn disable_output_processing(fd: RawFd) {
     unsafe {
-        let mut orig: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut orig) != 0 {
-            return None;
+        let mut raw: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut raw) != 0 {
+            return;
         }
-        let mut raw = orig;
         raw.c_oflag &= !(libc::OPOST | libc::ONLCR);
         libc::tcsetattr(fd, libc::TCSANOW, &raw);
-        Some(orig)
+    }
+}
+
+// ── The exit-path host-terminal restore ────────────────────────────────
+//
+// `process::exit` runs atexit handlers but never Drops, and the
+// session's own exit path (the status trailer's match in
+// `vm/session.rs`) must not leave the host terminal mangled: the
+// session disables the host tty's OPOST (the guest pty already formed
+// the output) and the raw input mode (every keystroke must reach the
+// guest verbatim), and the ORIGINALS outlived the process — the
+// user's own shell inherited a bare-`\n` terminal (MEASURED: fish's
+// own `time` report printed as a staircase, each line shifted right by
+// the previous one, ending in a bare CR) and an echo-less input side.
+// The Drop's restore never runs on that path; this one does.
+#[cfg(not(target_os = "windows"))]
+static HOST_TERMINAL_ORIGINALS: std::sync::OnceLock<[libc::termios; 2]> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(target_os = "windows"))]
+extern "C" fn restore_host_terminal() {
+    if let Some([fd0, fd1]) = HOST_TERMINAL_ORIGINALS.get() {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, fd0);
+            libc::tcsetattr(1, libc::TCSANOW, fd1);
+        }
+    }
+    if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+        eprintln!(
+            "BOOT_TIMING atexit_terminal_restore: {:?}",
+            BOOT_T0.get().map(|t| t.elapsed())
+        );
+    }
+}
+
+/// Register the exit-path restore for the host terminal's originals
+/// (both descriptors). Idempotent: the first caller wins, and the
+/// handler restores the SAME originals no matter which path mangled
+/// the terminal afterwards (the raw input side, the OPOST-off output
+/// side — every mangling of this process started from these).
+#[cfg(not(target_os = "windows"))]
+fn register_host_terminal_restore(fd0: libc::termios, fd1: libc::termios) {
+    if HOST_TERMINAL_ORIGINALS.set([fd0, fd1]).is_ok() {
+        unsafe {
+            libc::atexit(restore_host_terminal as extern "C" fn());
+        };
     }
 }
 
@@ -396,255 +457,6 @@ impl Drop for GuestRam {
     }
 }
 
-/// The console TX pipeline: escape-sequence tracking and terminal-query
-/// (DSR/DA) replies. Owned by the net-kick thread that drains the console
-/// TX virtqueue (Linux).
-///
-/// One instance per stream: the console port's stream (the guest init and
-/// kernel output; query replies go back through the CONSOLE RX queue) and
-/// the host device port's stream (the interactive session; replies go back
-/// through the PORT RX queue so the guest agent can read them).
-///
-/// The protocol markers are GONE — the exit code rides the hypercall page
-/// (`sandal-exit`), the session routing rides the control queue
-/// (`PORT_OPEN(1)`), the export path rides its own port. Every byte of
-/// guest output streams through here verbatim: nothing is scanned for
-/// strings, so no user content can ever act as a protocol (the class of
-/// the vim screen-desync bug: a marker matched mid-redraw swallowed the
-/// rest of a newline-less TUI burst).
-#[cfg(not(target_os = "macos"))]
-pub(crate) struct ConsoleTxFilter {
-    /// Which RX queue (host → guest) this stream's terminal-query replies
-    /// are injected through: the stream's own port's RX queue.
-    pub rx_queue: usize,
-    /// Escape-sequence tracking state (see the module docs).
-    vt_esc: bool,
-    vt_csi: u8,
-    vt_seq: Vec<u8>,
-    vt_param: u32,
-    vt_priv: u8,
-    vt_dsr: bool,
-    vt_row: u32,
-    vt_col: u32,
-    /// Set by feed(): true when a query reply was injected into the console
-    /// RX (the caller must pulse the console IRQ so the guest reads it).
-    pub replied: bool,
-    /// DA1 (`ESC[c`) answered once: tmux re-sends DA1 around redraws while
-    /// its own reply is still in flight; its parser consumes the FIRST
-    /// response and treats every later one as plain keys (TTY_HAVEDA is
-    /// already set), which would leak into the focused pane as typed text.
-    /// A real terminal answers every query, but tmux only needs the first —
-    /// later queries are swallowed silently.
-    da1_answered: bool,
-    /// DA2 (`ESC[>c`) — same once-only treatment as DA1.
-    da2_answered: bool,
-    /// True while a fullscreen app owns the terminal (alternate screen:
-    /// tmux attaches with `ESC[?1049h`, leaves with `ESC[?1049l`). Under
-    /// alt-screen the outer console shell is parked, so console-level DSR
-    /// replies have no consumer — the attached client forwards them as
-    /// unknown keys into the focused pane, where they leak as typed text
-    /// (a probe reply racing the attach is what skewed ash's cursor state).
-    /// Pane-level probes are answered by the guest's own tmux and are
-    /// unaffected.
-    alt_screen: bool,
-}
-
-#[cfg(not(target_os = "macos"))]
-impl ConsoleTxFilter {
-    pub(crate) fn new(rx_queue: usize) -> Self {
-        ConsoleTxFilter {
-            rx_queue,
-            vt_esc: false,
-            vt_csi: 0,
-            vt_seq: Vec::new(),
-            vt_param: 0,
-            vt_priv: 0,
-            vt_dsr: false,
-            vt_row: 1,
-            vt_col: 1,
-            replied: false,
-            da1_answered: false,
-            da2_answered: false,
-            alt_screen: false,
-        }
-    }
-
-    /// Feed guest console TX bytes: track the escape state, answer terminal
-    /// queries (into the console RX), and append the visible bytes to `out`
-    /// verbatim — every byte streams through (see the struct docs).
-    pub(crate) fn feed(
-        &mut self,
-        data: &[u8],
-        console: &Arc<Mutex<VirtioConsoleDevice>>,
-        memory: &Arc<GuestRam>,
-        ram_base: u64,
-        out: &mut Vec<u8>,
-    ) {
-        let mut replies: Vec<Vec<u8>> = Vec::new();
-
-        for &ch in data {
-            // ── Virtual-terminal escape handling ──────────────────────
-            // The guest's line editor probes the terminal with `ESC [ 6 n`
-            // and reads the reply from its input; tmux also probes with
-            // DA1/DA2 before its first draw. The VMM is the virtual
-            // terminal: those queries are answered here from a tracked
-            // cursor position. Every OTHER escape sequence (erase, colors,
-            // cursor movement) is forwarded verbatim — swallowing those
-            // breaks guest-side erases like the backspace path's `ESC[J`.
-            if self.vt_esc {
-                self.vt_seq.push(ch);
-                if self.vt_csi == 0 {
-                    if ch == b'[' {
-                        self.vt_csi = b'[';
-                    } else {
-                        self.end_vt_sequence(&mut replies, out);
-                    }
-                    continue;
-                }
-
-                if ch == b'>' && self.vt_param == 0 {
-                    self.vt_priv = 2;
-                } else if ch == b'?' {
-                    self.vt_priv = 1;
-                } else if ch.is_ascii_digit() {
-                    self.vt_param = self.vt_param * 10 + (ch - b'0') as u32;
-                }
-
-                if (0x40..=0x7e).contains(&ch) {
-                    self.end_vt_sequence(&mut replies, out);
-                }
-
-                continue;
-            }
-
-            if ch == 0x1b {
-                self.vt_esc = true;
-                self.vt_csi = 0;
-                self.vt_seq.clear();
-                self.vt_seq.push(0x1b);
-                self.vt_param = 0;
-                self.vt_priv = 0;
-                self.vt_dsr = false;
-                continue;
-            }
-
-            // Cursor tracking for the DSR replies (printable +1, BS -1).
-            if (0x20..0x7f).contains(&ch) {
-                self.vt_col += 1;
-            } else if ch == b'\x08' {
-                self.vt_col = self.vt_col.saturating_sub(1);
-            } else if ch == b'\n' || ch == b'\r' {
-                self.vt_col = 0;
-                self.vt_row += 1;
-            }
-
-            out.push(ch);
-        }
-
-        // Inject query replies into the console RX.
-        if !replies.is_empty() {
-            let mut blob = Vec::new();
-            for r in &replies {
-                blob.extend_from_slice(r);
-            }
-
-            let (_, dropped) = console.lock().unwrap().push_rx_and_drain(
-                memory.as_shared_slice(),
-                ram_base,
-                self.rx_queue,
-                &blob,
-            );
-            if dropped > 0 {
-                console_eprintln(&format!(
-                    "sandal: dropped {dropped} bytes of console input the guest refused \
-                     for too long (a full tty or a busy guest): re-send it"
-                ));
-            }
-
-            self.replied = true;
-        }
-    }
-
-    /// Finish the escape sequence accumulated in `vt_seq`: answer terminal
-    /// queries, forward everything else verbatim, apply cursor movement.
-    fn end_vt_sequence(&mut self, replies: &mut Vec<Vec<u8>>, out: &mut Vec<u8>) {
-        let seq = std::mem::take(&mut self.vt_seq);
-        self.vt_esc = false;
-        self.vt_csi = 0;
-
-        let final_byte = seq[seq.len() - 1];
-        let is_csi = seq.len() >= 3 && seq[1] == b'[';
-
-        // Alternate-screen tracking (DEC private modes 47/1047/1049): a
-        // fullscreen app (tmux) owns the terminal while set — see the
-        // `alt_screen` field docs for why DSR replies are suppressed then.
-        if is_csi
-            && self.vt_priv == 1
-            && (final_byte == b'h' || final_byte == b'l')
-            && matches!(self.vt_param, 47 | 1047 | 1049)
-        {
-            self.alt_screen = final_byte == b'h';
-        }
-
-        // DSR cursor-position query: `ESC [ 6 n` (empty parameter = same).
-        // Suppressed under alt-screen: the outer shell is parked and the
-        // reply would be forwarded by the attached client into the focused
-        // pane as keys (the pane-level probes are answered by the guest's
-        // own tmux with the pane cursor, so nothing needs this reply).
-        if is_csi && self.vt_priv == 0 && final_byte == b'n' && self.vt_param <= 6 {
-            if !self.alt_screen {
-                replies.push(format!("\x1b[{};{}R", self.vt_row, self.vt_col + 1).into_bytes());
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // DA1 (primary device attributes): `ESC [ c` / `ESC [ 0 c`. tmux and
-        // friends block their first draw waiting for this reply. Answered
-        // once; tmux re-sends DA1 around redraws while its first reply is
-        // still in flight, and its parser treats every later response as
-        // plain keys (TTY_HAVEDA is already set) which would leak into the
-        // focused pane as typed text — later queries are swallowed silently.
-        if is_csi && self.vt_priv == 0 && final_byte == b'c' && self.vt_param <= 1 {
-            if !self.da1_answered {
-                replies.push(b"\x1b[?1;2c".to_vec()); // VT102 with AVO
-                self.da1_answered = true;
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // DA2 (secondary device attributes): `ESC [ > c` — once only.
-        if is_csi && self.vt_priv == 2 && final_byte == b'c' {
-            if !self.da2_answered {
-                replies.push(b"\x1b[>0;95;0c".to_vec());
-                self.da2_answered = true;
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // XTGETTCAP (`ESC [ > q`): swallowed without forwarding or reply —
-        // forwarding reaches the outer terminal, whose answer returns as
-        // console input at an unpredictable time and can leak into the
-        // focused pane; not answering is handled fine by tmux.
-        if is_csi && self.vt_priv == 2 && final_byte == b'q' {
-            self.vt_param = 0;
-            return;
-        }
-        self.vt_dsr = false;
-        self.vt_param = 0;
-
-        // Apply cursor movement so the tracker stays usable across redraws.
-        match final_byte {
-            b'C' => self.vt_col += self.vt_param.max(1),
-            b'D' => self.vt_col = self.vt_col.saturating_sub(self.vt_param.max(1)),
-            b'G' => self.vt_col = self.vt_param.saturating_sub(1),
-            _ => {}
-        }
-
-        // Forward the sequence to the user's terminal verbatim.
-        out.extend_from_slice(&seq);
-    }
-}
-
 // ── The virtual machine monitor ──────────────────────────────────────────
 
 struct Vmm {
@@ -656,21 +468,6 @@ struct Vmm {
     memory: Arc<GuestRam>,
     #[cfg(target_os = "macos")]
     gic: Gic,
-    /// Console device (shared with the stdin poller thread on Linux, which
-    /// injects keystrokes directly into the RX virtqueue).
-    console: Arc<Mutex<VirtioConsoleDevice>>,
-    /// Shared console-TX pipeline state (escape tracking, terminal-query
-    /// replies, protocol markers). The main loop and the net-kick thread
-    /// BOTH drain the TX queue; the filter must be singular or escape
-    /// sequences tear apart at drain boundaries.
-    /// macOS keeps its own inline console path instead (process_console_tx).
-    #[cfg(not(target_os = "macos"))]
-    console_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
-    /// The host device port's stream filter (Linux: the interactive
-    /// session; replies go back through the port RX queue so the guest
-    /// agent can read them).
-    #[cfg(not(target_os = "macos"))]
-    port_tx_filter: Arc<Mutex<ConsoleTxFilter>>,
     /// x86_64: base of the MMIO device window (above the guest RAM).
     #[cfg(target_arch = "x86_64")]
     mmio_base: u64,
@@ -681,12 +478,6 @@ struct Vmm {
     /// Windows: the PIT tick + console-input threads (stopped on drop).
     #[cfg(target_os = "windows")]
     device_threads: Option<crate::vm::windows::DeviceThreads>,
-    /// Terminal-query reply dedup for the macOS path (no shared filter —
-    /// the run loop's own tracker does the answering).
-    #[cfg(target_os = "macos")]
-    da1_answered: bool,
-    #[cfg(target_os = "macos")]
-    da2_answered: bool,
     blk: Option<VirtioBlkDevice>,
     data_blk: Option<VirtioBlkDevice>,
     /// Net device behind a mutex: the Linux net-kick thread pumps the
@@ -735,101 +526,8 @@ struct Vmm {
     /// init, the code in x15) — marker-free since the console protocol is
     /// gone.
     guest_exit_code: Option<i32>,
-    /// Virtual-terminal escape tracking for the macOS run loop (on Linux
-    /// this state lives in the shared `console_tx_filter` instead): the
-    /// guest's line editor (busybox ash) probes the terminal with
-    /// `ESC [ 6 n` (device status report: cursor position) and reads the
-    /// reply from its input. The VMM is the virtual terminal: it intercepts
-    /// that one query and answers it from a conservatively tracked cursor
-    /// position, so the editor's line-wrap and redraw logic stay correct on
-    /// long input lines. Every OTHER escape sequence (erase, colors, cursor
-    /// movement) is forwarded to the user's terminal untouched — swallowing
-    /// those breaks guest-side erases like the backspace path's `ESC [ J`.
-    #[cfg(target_os = "macos")]
-    vt_esc: bool,
-    #[cfg(target_os = "macos")]
-    vt_csi: u8,
-    /// Bytes of the escape sequence currently being parsed.
-    #[cfg(target_os = "macos")]
-    vt_seq: Vec<u8>,
-    /// Numeric parameter accumulated from the current CSI sequence.
-    #[cfg(target_os = "macos")]
-    vt_param: u32,
-    /// True when the accumulated CSI parameter is 6 (a DSR query).
-    #[cfg(target_os = "macos")]
-    vt_dsr: bool,
-    /// CSI private-marker byte: 0 = none, 1 = `?` (DEC), 2 = `>` (VT).
-    #[cfg(target_os = "macos")]
-    vt_priv: u8,
-    /// Tracked terminal cursor (1-based) for DSR cursor-position replies.
-    #[cfg(target_os = "macos")]
-    vt_row: u32,
-    #[cfg(target_os = "macos")]
-    vt_col: u32,
-    /// Alternate-screen state for DSR suppression (see `ConsoleTxFilter`).
-    #[cfg(target_os = "macos")]
-    alt_screen: bool,
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Host terminal geometry
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Set by the SIGWINCH handler when the host terminal is resized. MEASURED
-/// (instrumented handler + poll, run in a real tmux pane and in the test
-/// harness before and after vm_harness.py's _claim_ctty setup): the signal
-/// fires wherever the console pty is the VMM's controlling terminal — tmux
-/// TIOCSCTTYs its panes (real panes), the harness setsid + TIOCSCTTYs its
-/// pty — and NEVER where it isn't (no ctty: no live resize; the boot
-/// geometry stands, and host_tty_size falls back to 120x40 off-tty). The
-/// per-iteration TIOCGWINSZ poll that used to back this up was measured
-/// redundant wherever the ctty holds and was removed; set_size dedupes
-/// repeat signals against the device's own config.
-static HOST_WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn winch_handler(_sig: i32) {
-    HOST_WINCH.store(true, Ordering::Relaxed);
-}
-
-/// The guest console geometry: the host tty's size, so the guest screen
-/// matches the terminal it renders into. A hardcoded size mismatches the
-/// user's pane — a guest screen taller than the host pane scrolls the
-/// prompt out of view (the guest tmux status line would be the only thing
-/// left visible). Falls back to 120x40 when stdout is not a tty (tests
-/// drive their own pty and pipes have no size).
-#[cfg(not(target_os = "windows"))]
-fn host_tty_size() -> (u16, u16) {
-    let mut ws = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-
-    for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {
-        // SAFETY: `ws` is a valid winsize; TIOCGWINSZ only fills it in.
-        let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
-        if ok && ws.ws_col > 0 && ws.ws_row > 0 {
-            return (ws.ws_col, ws.ws_row);
-        }
-    }
-
-    (120, 40)
-}
-
-#[cfg(target_os = "windows")]
-fn host_tty_size() -> (u16, u16) {
-    // The console-mode path: GetConsoleScreenBufferInfo would give the exact
-    // size; 120x40 is the sandbox default and matches the common window.
-    (120, 40)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Entry points used by main.rs
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Resolve a data file (kernel, rootfs) relative to the working directory or
-/// the executable.
 pub fn resolve_data_path(name: &str) -> Option<PathBuf> {
     let candidates = [
         std::env::current_dir().ok()?.join(name),
@@ -839,9 +537,12 @@ pub fn resolve_data_path(name: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// Parse `--share host_path:guest_path` arguments into
-/// `(mount_tag, host_path, guest_path)` tuples.  Validates the host path and
-/// the maximum number of devices.
+/// Print a diagnostic line to the host console (stderr). The host tty runs
+/// with OPOST disabled (the guest's raw output requires it, and termios is
+/// per-tty, so stderr shares the setting): a bare `\n` moves the cursor
+/// down WITHOUT returning to column 0, so the guest's next output would
+/// appear indented by this line's width. Emit CRLF explicitly — harmless
+/// on a normal tty (an extra CR renders as nothing).
 fn parse_shares(args: &Args) -> Result<Vec<(String, PathBuf, String)>> {
     let mut shares = Vec::new();
 
@@ -991,6 +692,15 @@ pub(crate) fn diagnose_session_exit(code: i32, command: &[String]) {
             "sandal: no session: the session transport never opened (the host \
              device port did not come up, or the session helper rejected its \
              arguments)"
+        ),
+        // 127 is the guest shell's own not-found code (the command
+        // line reached it and nothing it resolved existed) — the same
+        // silence-measuring defect as 125: the operator sees nothing at
+        // all. Name the failure; forward the code unchanged.
+        127 => eprintln!(
+            "sandal: the workload command `{}` was not found inside the VM \
+             (the guest shell's own exit code, forwarded unchanged)",
+            command.join(" ")
         ),
         _ => {}
     }
@@ -1209,17 +919,17 @@ impl Vmm {
 
         #[cfg(not(target_os = "windows"))]
         let (tty_saved, tty_out_saved) = unsafe {
-            let saved = if libc::isatty(0) != 0 {
-                enable_raw_mode(0)
-            } else {
-                None
-            };
+            // BOTH originals BEFORE any mangling (the exit-path
+            // restore's source), then the SEQUENTIAL mangling — each
+            // mangle from the current state, so they compose: a mangle
+            // from the pre-mangling original would UNDO the other side's
+            // mangle on the same tty (MEASURED: the output-side mangle
+            // from the original turned ECHO back on mid-session).
+            let saved = capture_tty(0);
+            let out_saved = capture_tty(1);
 
-            let out_saved = if libc::isatty(1) != 0 {
-                disable_output_processing(1)
-            } else {
-                None
-            };
+            enable_raw_mode(0);
+            disable_output_processing(1);
 
             #[cfg(target_os = "macos")]
             {
@@ -1227,37 +937,24 @@ impl Vmm {
                 let _ = libc::fcntl(0, libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
 
-            (saved, out_saved)
+            // The exit-path restore: `process::exit` never runs the
+            // Drop that restores these, and the session's own exit path
+            // (the status trailer's match) exits straight through it.
+            // On the same tty both restores write the SAME pre-mangling
+            // original; on different ttys each side gets its own.
+            match (saved, out_saved) {
+                (Some(fd0), Some(fd1)) => {
+                    register_host_terminal_restore(fd0, fd1);
+                    (Some(fd0), Some(fd1))
+                }
+                pair => pair,
+            }
         };
-
-        let console = {
-            let (cols, rows) = host_tty_size();
-            Arc::new(Mutex::new(VirtioConsoleDevice::new(cols, rows)))
-        };
-
-        // Track host terminal resizes: the SIGWINCH handler only sets a
-        // flag; the run loop applies the new geometry (and interrupts the
-        // guest) on its next iteration. Unix only — Windows has no
-        // SIGWINCH (a console resize arrives as an input event); there
-        // the boot geometry stands.
-        #[cfg(not(target_os = "windows"))]
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = winch_handler as extern "C" fn(i32) as usize;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
-        }
 
         // User-space networking (enabled unless --no-network). The run loops
         // poll the backend after every guest exit and the Linux net-kick
         // thread pumps it independently, so an idle guest never waits for
         // its own delayed-ACK timer before more host data is delivered.
-        if tt {
-            eprintln!("BOOT_TIMING   console+winch: {:?}", tp.elapsed());
-            tp = std::time::Instant::now();
-        }
-
         #[cfg(not(target_os = "windows"))]
         let net = if args_no_network {
             Arc::new(Mutex::new(None))
@@ -1286,17 +983,8 @@ impl Vmm {
         let mut host = {
             let irq_lock = Arc::new(Mutex::new(()));
             let irq_levels = linux::new_irq_levels();
-            let (stdin_thread, stdin_stop_w) = linux::spawn_stdin_poller(
-                console.clone(),
-                memory.clone(),
-                irq_levels.clone(),
-                vm.clone(),
-            )?;
-
             linux::KvmHost {
                 irq_lock,
-                stdin_stop_w,
-                stdin_thread: Some(stdin_thread),
                 stop_fd: -1,
                 net_thread: None,
                 irq_levels,
@@ -1306,61 +994,53 @@ impl Vmm {
         #[cfg(target_os = "linux")]
         let net_kick_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // The userspace virtio-vsock device (--ssh-port): the VMM
-        // listens on the operator's ADDR:PORT and bridges every
-        // connection to the guest's own TCP loopback, the guest's
-        // vsockrelay → sshd. The vsock side and the guest forward
-        // target are FIXED by the relay design (RELAY_VSOCK_PORT →
-        // vsockrelay → the guest's loopback); only this listener is
-        // the operator's. The listener binds synchronously (fail fast
-        // on a bad target); the listener/bridge threads and their
-        // shutdown live in VsockHost.
+        // The command execution line's bridge core: the device + the
+        // exchange loop, ALWAYS (front end 1 — the session handler —
+        // registers its stream with it when there's a command); the TCP
+        // proxy (front end 2) only when the operator named --port. One
+        // core, two front ends — the exchange loop is stream-agnostic.
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        let vsock = if let Some(target) = args.ssh_port.as_ref() {
-            // [ADDR:]PORT — ADDR defaults to loopback; 0.0.0.0 exposes
-            // it.
-            let (addr, port) = match target.rsplit_once(':') {
-                Some((addr, port)) => (addr, port),
-                None => ("127.0.0.1", target.as_str()),
+        let vsock = {
+            // Front end 2: the TCP proxy — only with --port. The
+            // listener binds synchronously (fail fast on a bad target).
+            let listener = match args.port.as_ref() {
+                Some(target) => {
+                    let (addr, port) = match target.rsplit_once(':') {
+                        Some((addr, port)) => (addr, port),
+                        None => ("127.0.0.1", target.as_str()),
+                    };
+                    let port: u16 = port
+                        .parse()
+                        .map_err(|error| anyhow!("--port: bad port {port:?}: {error}"))?;
+                    if port == 0 {
+                        return Err(anyhow!("--port: port 0 is random; name one"));
+                    }
+                    let addr = if addr.is_empty() { "127.0.0.1" } else { addr };
+                    Some(
+                        std::net::TcpListener::bind((addr, port))
+                            .map_err(|error| anyhow!("--port: bind {addr}:{port}: {error}"))?,
+                    )
+                }
+                None => None,
             };
-            let port: u16 = port
-                .parse()
-                .map_err(|error| anyhow!("--ssh-port: bad port {port:?}: {error}"))?;
-            if port == 0 {
-                return Err(anyhow!("--ssh-port: port 0 is random; name one"));
-            }
-            let addr = if addr.is_empty() { "127.0.0.1" } else { addr };
+            // Front end 1: the session handler — the command execution
+            // line's own host side (the host stdio as a stream). Only
+            // when there's a command; the empty command is the pool's
+            // own long-lived VM (no session of its own).
+            let session = if args.command.is_empty() {
+                None
+            } else {
+                Some(session::SessionStream::new(&args.command)?)
+            };
             Some(linux::VsockHost::spawn(
-                addr,
-                port,
                 memory.clone(),
                 vm.clone(),
                 host.irq_lock.clone(),
                 host.irq_levels.clone(),
+                listener,
+                session,
             )?)
-        } else {
-            None
         };
-
-        // macOS keeps its own inline console path (process_console_tx);
-        // the shared filter exists only where it is drained.
-        #[cfg(not(target_os = "macos"))]
-        // One filter per stream (see ConsoleTxFilter): the console port's
-        // stream (the guest init/kernel output) and the host device port's
-        // stream (the interactive session). Replies go back through each
-        // stream's own port RX queue.
-        let console_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
-            crate::virtio::console::CONSOLE_RX,
-        )));
-        #[cfg(not(target_os = "macos"))]
-        let port_tx_filter = Arc::new(Mutex::new(ConsoleTxFilter::new(
-            // The port stream's query replies (ESC[6n etc. written by the
-            // session to its own stdout) must come back through the PORT
-            // input: the session's stdin is the port (the session agent
-            // bridges a pty to it), so the replies land in the port RX
-            // queue to reach the session's line editor.
-            crate::virtio::console::PORT_RX,
-        )));
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -1370,10 +1050,7 @@ impl Vmm {
             let net_thread = linux::spawn_net_kicker(
                 vm.clone(),
                 net.clone(),
-                console.clone(),
                 memory.clone(),
-                console_tx_filter.clone(),
-                port_tx_filter.clone(),
                 host.irq_lock.clone(),
                 host.irq_levels.clone(),
                 net_kick_stop.clone(),
@@ -1397,21 +1074,12 @@ impl Vmm {
             memory,
             #[cfg(target_os = "macos")]
             gic: Gic::new(),
-            console,
-            #[cfg(not(target_os = "macos"))]
-            console_tx_filter,
-            #[cfg(not(target_os = "macos"))]
-            port_tx_filter,
             #[cfg(target_arch = "x86_64")]
             mmio_base,
             #[cfg(target_os = "windows")]
             halt: Arc::new(crate::hypervisor::whp::HaltWaker::default()),
             #[cfg(target_os = "windows")]
             device_threads: None,
-            #[cfg(target_os = "macos")]
-            da1_answered: false,
-            #[cfg(target_os = "macos")]
-            da2_answered: false,
             blk: None,
             data_blk: None,
             #[cfg(not(target_os = "windows"))]
@@ -1440,24 +1108,6 @@ impl Vmm {
             // the guest tty stack entirely (see tests/test_tmux_attached.py).
             verbose_uart: args.verbose || std::env::var_os("SANDAL_VERBOSE_UART").is_some(),
             guest_exit_code: None,
-            #[cfg(target_os = "macos")]
-            vt_esc: false,
-            #[cfg(target_os = "macos")]
-            vt_csi: 0,
-            #[cfg(target_os = "macos")]
-            vt_seq: Vec::new(),
-            #[cfg(target_os = "macos")]
-            vt_param: 0,
-            #[cfg(target_os = "macos")]
-            vt_priv: 0,
-            #[cfg(target_os = "macos")]
-            vt_dsr: false,
-            #[cfg(target_os = "macos")]
-            vt_row: 1,
-            #[cfg(target_os = "macos")]
-            vt_col: 1,
-            #[cfg(target_os = "macos")]
-            alt_screen: false,
         })
     }
 
@@ -1507,10 +1157,14 @@ impl Vmm {
         #[cfg(not(target_os = "windows"))]
         let network = !args.no_network;
 
-        // The guest runs the host's terminal type (see build_init_config_text):
-        // TERM=linux caps every TUI at 8 colors. Only terminal-type names
-        // pass — the value lands in a line-based config file, so anything
-        // else would corrupt it; empty keeps the guest's linux fallback.
+        // The guest terminal type: the host's own TERM, sanitized to a
+        // single path-free token (the config line and the terminfo
+        // subdirectory are built from it). The pty session runs REAL
+        // terminal software — readline, vim, tmux — and without the
+        // matching terminfo entry every one of them falls back to dumb
+        // settings (MEASURED: the python REPL lost its line editor).
+        // Empty (no TERM, or a hostile value): the guest keeps its own
+        // linux fallback entry.
         let host_term = std::env::var("TERM")
             .ok()
             .filter(|t| {
@@ -1522,34 +1176,8 @@ impl Vmm {
             })
             .unwrap_or_default();
 
-        // The advertised session geometry: the console's window when the
-        // host is interactive, zero when it is not. Zero is the x86_64
-        // guest session agent's pipe-mode signal — no pty, so
-        // programmatic consumers get the command's own bytes back:
-        // nothing colorizes (isatty is false inside the guest) and no
-        // line discipline translates the output. Interactive hosts keep
-        // the pty session: its line discipline is what makes guest output
-        // render correctly on the host terminal. (aarch64 keeps its
-        // session on the console device either way; zero only skips its
-        // geometry ioctl there.)
-        #[cfg(not(target_os = "windows"))]
-        let session_size = {
-            #[cfg(unix)]
-            let interactive = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-            #[cfg(not(unix))]
-            let interactive = true;
-            if interactive {
-                self.console.lock().unwrap().terminal_size()
-            } else {
-                (0, 0)
-            }
-        };
-        #[cfg(target_os = "windows")]
-        let session_size = self.console.lock().unwrap().terminal_size();
-
         #[cfg(target_arch = "x86_64")]
         {
-            let (cols, rows) = session_size;
             // The whole slot is the hotplug cap: the boot memory map
             // declares only the RAM floor (see RAM_FLOOR), and the guest
             // init grows toward this cap on demand.
@@ -1560,46 +1188,35 @@ impl Vmm {
             // port — the guest's vsockrelay forwards between them. The
             // per-command mode (or no vsock at all) starts nothing.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let vsock_relay = if self
-                .vsock
-                .as_ref()
-                .is_some_and(|vsock| vsock.device.lock().unwrap().relay_mode())
-            {
-                Some((
-                    crate::virtio::vsock::RELAY_VSOCK_PORT,
-                    crate::virtio::vsock::RELAY_VSOCK_PORT,
-                ))
+            let vsockd_port = if self.vsock.is_some() {
+                Some(crate::virtio::vsock::VSOCKD_PORT)
             } else {
                 None
             };
+            let hypercall_addr = vsockd_port.map(|_| {
+                let (page, off) = crate::vm::x86_hypercall_page_off(self.mmio_base);
+                page + off
+            });
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let vsock_relay = None;
+            let vsockd_port = None;
+            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+            let hypercall_addr = None;
             self.config_blob = initramfs::build_init_config_text(
                 disk_mode,
                 &share_configs,
-                &args.command,
                 network,
                 clock_secs,
-                cols,
-                rows,
                 &host_term,
                 mem_cap,
-                vsock_relay,
+                vsockd_port,
+                hypercall_addr,
             );
         }
 
         #[cfg(target_arch = "aarch64")]
         {
-            let (cols, rows) = session_size;
-            self.config_blob = initramfs::build_init_config(
-                disk_mode,
-                &share_configs,
-                &args.command,
-                network,
-                clock_secs,
-                cols,
-                rows,
-            );
+            self.config_blob =
+                initramfs::build_init_config(disk_mode, &share_configs, network, clock_secs);
         }
 
         // ── Root filesystem (vda): busybox ext2 + runtime files ───────
@@ -1720,14 +1337,6 @@ impl Vmm {
             }
         }
 
-        if (mw + MMIO_OFF_CONSOLE..mw + MMIO_OFF_CONSOLE + 0x200).contains(&addr) {
-            return self
-                .console
-                .lock()
-                .unwrap()
-                .mmio_read(addr - mw - MMIO_OFF_CONSOLE, sas);
-        }
-
         #[cfg(not(target_os = "windows"))]
         if let Some(net) = self.net.lock().unwrap().as_mut() {
             if (mw + MMIO_OFF_NET..mw + MMIO_OFF_NET + 0x200).contains(&addr) {
@@ -1794,83 +1403,6 @@ impl Vmm {
                 self.gic.gicr_write(addr - aarch64::GICR_BASE, val as u32);
                 return;
             }
-        }
-
-        if (mw + MMIO_OFF_CONSOLE..mw + MMIO_OFF_CONSOLE + 0x200).contains(&addr) {
-            let mut console = self.console.lock().unwrap();
-            let is_reset = addr - mw - MMIO_OFF_CONSOLE == super::virtio::REG_STATUS && val == 0;
-            let notify = console.mmio_write(addr - mw - MMIO_OFF_CONSOLE, val as u32);
-            if is_reset {
-                // TEMP DIAGNOSTIC: the driver reset the console device —
-                // dump the kernel log ring and the vring state.
-                crate::vmm_trace::dump_guest_ram_lines(
-                    self.memory.as_shared_slice(),
-                    "not syncing",
-                    "PANIC",
-                    8,
-                    400,
-                );
-                crate::vmm_trace::dump_guest_ram_lines(
-                    self.memory.as_shared_slice(),
-                    "Error",
-                    "ERR",
-                    8,
-                    400,
-                );
-                crate::vmm_trace::dump_guest_ram_lines(
-                    self.memory.as_shared_slice(),
-                    "virtio",
-                    "VIRTIO",
-                    8,
-                    400,
-                );
-                crate::vmm_trace::dump_guest_ram_lines(
-                    self.memory.as_shared_slice(),
-                    "hvc",
-                    "HVC",
-                    8,
-                    400,
-                );
-            }
-            if let Some(qidx) = notify {
-                match qidx as usize {
-                    crate::virtio::console::CONSOLE_RX | crate::virtio::console::PORT_RX => {
-                        // An RX queue: the guest posted buffers; drain any
-                        // pending host input into them.
-                        let (_, dropped) = console.drain_rx_backlog(
-                            self.memory.as_shared_slice(),
-                            RAM_BASE,
-                            qidx as usize,
-                        );
-                        if dropped > 0 {
-                            console_eprintln(&format!(
-                                "sandal: dropped {dropped} bytes of console input the guest \
-                                 refused for too long (a full tty or a busy guest): re-send it"
-                            ));
-                        }
-                    }
-                    crate::virtio::console::CONTROL_RX => {
-                        // The control queue: retry the port-instantiation
-                        // sequence (a no-op once delivered). Its interrupt
-                        // lands through the next line update. The drained
-                        // replies carry the session signal (PORT_OPEN(1) —
-                        // see process_control_tx) and are applied there.
-                        let control_tx =
-                            console.process_control_tx(self.memory.as_shared_slice(), RAM_BASE);
-                        if !control_tx.is_empty() {
-                            crate::vmm_trace::write_console_io(format_args!(
-                                "CONTROL_TX bytes={} preview=\"{}\"",
-                                control_tx.len(),
-                                crate::vmm_trace::bytes_preview(&control_tx, 32)
-                            ));
-                        }
-                        console.pump_control_sequence(self.memory.as_shared_slice(), RAM_BASE);
-                    }
-                    _ => {}
-                }
-            }
-
-            return;
         }
 
         if let Some(b) = self.blk.as_mut() {
@@ -1956,6 +1488,9 @@ impl Vmm {
         {
             let hyper = mw + MMIO_OFF_HYPERCALL;
             if (hyper..hyper + 0x200).contains(&addr) {
+                if self.verbose_uart {
+                    eprintln!("HYPERCALL write 0x{addr:x} = 0x{val:x}");
+                }
                 // Hypercall page: a u32 write of the port number signals the VMM
                 // (the x86 analog of the ARM64 BRK immediates).
                 match val as u16 {
@@ -1967,6 +1502,18 @@ impl Vmm {
                     crate::elf::x86_64_linux::EXIT_PORT => {
                         self.guest_exit_code = Some((val >> 16) as i32);
                         self.guest_shutdown = true;
+                    }
+                    // The command execution line's readiness event: the
+                    // guest's vsockd bound its listener — connect every
+                    // parked front end now. The event replaces the old
+                    // RST-retry loop: the REQUEST goes out exactly once,
+                    // at the moment the guest can accept it.
+                    crate::elf::x86_64_linux::VSOCKD_READY_PORT => {
+                        log::info!("vsockd: the READY hypercall landed");
+                        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                        if let Some(vsock) = self.vsock.as_ref() {
+                            vsock.device.lock().unwrap().set_guest_listening();
+                        }
                     }
                     other => log::warn!("unknown hypercall {other:#x}"),
                 }
@@ -2005,10 +1552,7 @@ impl Vmm {
     /// extracted and serialized as a ustar archive.
     /// Tmpfs mode: the guest wrote an uncompressed tar to the raw device.
     fn handle_export_done(&mut self) {
-        log::info!(
-            "export: DONE hypercall, save_path={:?}",
-            self.console.lock().unwrap().export_path
-        );
+        log::info!("export: DONE hypercall (the default content-addressed name)");
         let Some(dev) = self.data_blk.as_mut() else {
             log::warn!("export done: no data disk");
             return;
@@ -2062,223 +1606,18 @@ impl Vmm {
             }
         };
 
-        let save_path = match self.console.lock().unwrap().export_path.take() {
-            Some(path) if !path.is_empty() => PathBuf::from(path),
-            _ => {
-                let mut hasher = DefaultHasher::new();
-                layer_data.hash(&mut hasher);
-                PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()))
-            }
-        };
+        // The default content-addressed name, always: the output path is
+        // never sent from the guest (the dedicated console port whose
+        // whole stream was the path is gone), the operator renames from
+        // the log line below, and nothing user-output can ever act as the
+        // protocol.
+        let mut hasher = DefaultHasher::new();
+        layer_data.hash(&mut hasher);
+        let save_path = PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()));
 
         match fs::write(&save_path, &layer_data) {
             Ok(()) => console_eprintln(&format!("Layer saved to: {}", save_path.display())),
             Err(e) => console_eprintln(&format!("sandal: failed to save layer: {e}")),
         }
-    }
-
-    /// Feed guest console TX bytes to stdout, answering terminal queries
-    /// (DSR/DA) and streaming every byte verbatim. macOS only: on Linux
-    /// the run loop and the net-kick thread share `console_tx_filter`
-    /// instead (a singular escape state — two trackers would tear
-    /// sequences apart at drain boundaries). The protocol markers are
-    /// GONE (see the Linux twin): the exit code rides the hypercall
-    /// page/BRK, the session routing rides the control queue, the export
-    /// path rides its own port.
-    #[cfg(target_os = "macos")]
-    fn process_console_tx(&mut self, data: &[u8]) {
-        let mut replies: Vec<Vec<u8>> = Vec::new();
-        let mut stdout = std::io::stdout();
-
-        for &ch in data {
-            if self.guest_shutdown {
-                // The guest is shutting down; drop any trailing kernel output
-                // (e.g. the poweroff path's `reboot: Power down`).
-                break;
-            }
-
-            // ── Virtual-terminal escape handling ──────────────────────
-            // The guest's line editor (busybox ash) probes the terminal
-            // with `ESC [ 6 n` (device status report: cursor position) and
-            // reads the reply from its input. The VMM is the virtual
-            // terminal: it intercepts that one query and answers it from a
-            // conservatively tracked cursor position, so the editor's
-            // line-wrap and redraw logic stay correct on long input lines.
-            // Every OTHER escape sequence (erase, colors, cursor movement)
-            // is forwarded to the user's terminal untouched — swallowing
-            // those breaks guest-side erases like the backspace path's
-            // `ESC [ J`.
-            if self.vt_esc {
-                self.vt_seq.push(ch);
-                if self.vt_csi == 0 {
-                    if ch == b'[' {
-                        self.vt_csi = b'[';
-                    } else {
-                        // Two-byte non-CSI escape (e.g. ESC 7): forward.
-                        self.end_vt_sequence(&mut replies);
-                    }
-                    continue;
-                }
-
-                if ch.is_ascii_digit() {
-                    self.vt_param = self.vt_param * 10 + (ch - b'0') as u32;
-                }
-
-                if (0x40..=0x7e).contains(&ch) {
-                    // Final byte: the sequence is complete.
-                    self.end_vt_sequence(&mut replies);
-                }
-
-                continue;
-            }
-
-            if ch == 0x1b {
-                self.vt_esc = true;
-                self.vt_csi = 0;
-                self.vt_seq.clear();
-                self.vt_seq.push(0x1b);
-                self.vt_param = 0;
-                self.vt_priv = 0;
-                self.vt_dsr = false;
-                continue;
-            }
-
-            // Advance the tracked cursor: printable characters move it
-            // right; a backspace moves it left (the guest erases with
-            // `BS ESC[J`, so this keeps the position honest); newlines
-            // restart the line.
-            if (0x20..0x7f).contains(&ch) {
-                self.vt_col += 1;
-            } else if ch == b'\x08' {
-                self.vt_col = self.vt_col.saturating_sub(1);
-            } else if ch == b'\n' || ch == b'\r' {
-                self.vt_col = 0;
-                self.vt_row += 1;
-            }
-
-            let _ = stdout.write_all(&[ch]);
-        }
-
-        let _ = stdout.flush();
-
-        // Answer terminal queries (DSR, DA, XTGETTCAP): the replies go
-        // into the console RX — guest terminal applications read them as
-        // input. One IRQ pulse for the whole batch.
-        if !replies.is_empty() {
-            let mut blob = Vec::new();
-            for r in &replies {
-                blob.extend_from_slice(r);
-            }
-            let (_, dropped) = self.console.lock().unwrap().push_rx_and_drain(
-                self.memory.as_shared_slice(),
-                RAM_BASE,
-                crate::virtio::console::CONSOLE_RX,
-                &blob,
-            );
-            if dropped > 0 {
-                console_eprintln(&format!(
-                    "sandal: dropped {dropped} bytes of console input the guest refused \
-                     for too long (a full tty or a busy guest): re-send it"
-                ));
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                // Raise the console line under the irq_lock so this raise
-                // can never be reordered after the pollers'/main loop's
-                // line updates (a lost interrupt).
-                let _guard = self.host.irq_lock.lock();
-                let idx = (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize;
-                linux::irq_pulse(
-                    &self.host.irq_levels,
-                    idx,
-                    &self.vm,
-                    self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
-                );
-            }
-        }
-    }
-
-    /// Finish the escape sequence accumulated in `vt_seq`: answer DSR
-    /// cursor-position queries, forward everything else to the user's
-    /// terminal, and apply cursor-movement sequences to the tracker.
-    #[cfg(target_os = "macos")]
-    fn end_vt_sequence(&mut self, replies: &mut Vec<Vec<u8>>) {
-        let seq = std::mem::take(&mut self.vt_seq);
-        if std::env::var_os("SANDAL_DEBUG_KVM").is_some() {
-            console_eprintln(&format!("DBG-SEQ param={} seq={seq:02x?}", self.vt_param));
-        }
-
-        self.vt_esc = false;
-        self.vt_csi = 0;
-
-        let final_byte = seq[seq.len() - 1];
-        let is_csi = seq.len() >= 3 && seq[1] == b'[';
-
-        // Alternate-screen tracking (see `ConsoleTxFilter`).
-        if is_csi
-            && self.vt_priv == 1
-            && (final_byte == b'h' || final_byte == b'l')
-            && matches!(self.vt_param, 47 | 1047 | 1049)
-        {
-            self.alt_screen = final_byte == b'h';
-        }
-
-        // DSR cursor-position query: `ESC [ 6 n` (empty parameter = same).
-        // Suppressed under alt-screen (a fullscreen app owns the terminal;
-        // the reply would have no consumer).
-        if is_csi && self.vt_priv == 0 && final_byte == b'n' && self.vt_param <= 6 {
-            if !self.alt_screen {
-                // Cursor position is 1-based: after N printable columns the
-                // cursor sits at column N+1.
-                replies.push(format!("\x1b[{};{}R", self.vt_row, self.vt_col + 1).into_bytes());
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // DA1 (primary device attributes): `ESC [ c` / `ESC [ 0 c`. tmux and
-        // friends block their first draw waiting for this reply. Answered
-        // once; later queries are swallowed (see `da1_answered`).
-        if is_csi && self.vt_priv == 0 && final_byte == b'c' && self.vt_param <= 1 {
-            if !self.da1_answered {
-                replies.push(b"\x1b[?1;2c".to_vec()); // VT102 with AVO
-                self.da1_answered = true;
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // DA2 (secondary device attributes): `ESC [ > c` — once only.
-        if is_csi && self.vt_priv == 2 && final_byte == b'c' {
-            if !self.da2_answered {
-                replies.push(b"\x1b[>0;95;0c".to_vec());
-                self.da2_answered = true;
-            }
-            self.vt_param = 0;
-            return;
-        }
-        // XTGETTCAP (`ESC [ > q`): swallowed without forwarding and without
-        // a reply. Forwarding it would reach the user's outer terminal,
-        // whose answer comes back as console input at an unpredictable time
-        // and can leak into the focused pane as keys; not answering just
-        // leaves tmux's terminfo-feature probing unanswered, which it
-        // handles fine (it worked before query answering existed).
-        if is_csi && self.vt_priv == 2 && final_byte == b'q' {
-            self.vt_param = 0;
-            return;
-        }
-        self.vt_dsr = false;
-        self.vt_param = 0;
-
-        // Apply cursor movement so the tracker stays usable across
-        // redraws: `C` (forward), `D` (back), `G` (column absolute).
-        match final_byte {
-            b'C' => self.vt_col += self.vt_param.max(1),
-            b'D' => self.vt_col = self.vt_col.saturating_sub(self.vt_param.max(1)),
-            b'G' => self.vt_col = self.vt_param.saturating_sub(1),
-            _ => {}
-        }
-
-        // Forward the sequence to the user's terminal verbatim.
-        let _ = std::io::stdout().write_all(&seq);
     }
 }

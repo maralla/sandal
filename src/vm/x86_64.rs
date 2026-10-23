@@ -3,8 +3,8 @@
 //! the legacy ISA IRQ pool.
 
 use super::{
-    resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_CONSOLE, MMIO_OFF_DATA_BLK,
-    MMIO_OFF_HYPERCALL, MMIO_OFF_NET, MMIO_OFF_RNG, MMIO_OFF_VSOCK,
+    resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_DATA_BLK, MMIO_OFF_HYPERCALL,
+    MMIO_OFF_NET, MMIO_OFF_RNG, MMIO_OFF_VSOCK,
 };
 // The virtiofs MMIO window is Unix-only (no --share on Windows).
 #[cfg(not(target_os = "windows"))]
@@ -248,7 +248,7 @@ impl Vmm {
         let entry = pvh_entry.ok_or_else(|| anyhow!("kernel has no PVH entry note"))?;
 
         // ── Kernel command line: console + virtio-mmio devices ─────────
-        // loglevel=7: the pane is the user's console, not a kernel log —
+        // loglevel=3: the pane is the user's console, not a kernel log —
         // probe noise (i8042, WMI, ...) stays in dmesg, not on screen.
         // (err-level and below are hidden; emerg/alert/crit still show.)
         let mut cmdline = String::from(
@@ -265,7 +265,6 @@ impl Vmm {
         #[cfg_attr(target_os = "windows", allow(unused_mut))]
         let mut devices: Vec<(u64, u32, usize)> = vec![
             (mb + MMIO_OFF_NET, ISA_IRQ_POOL[0], 0),
-            (mb + MMIO_OFF_CONSOLE, ISA_IRQ_POOL[1], 1),
             (mb + MMIO_OFF_BLK, ISA_IRQ_POOL[2], 2),
             (mb + MMIO_OFF_DATA_BLK, ISA_IRQ_POOL[3], 3),
             (mb + MMIO_OFF_RNG, ISA_IRQ_POOL[4], 4),
@@ -299,7 +298,6 @@ impl Vmm {
                 0 => self.net.lock().unwrap().is_some(),
                 #[cfg(target_os = "windows")]
                 0 => false,
-                1 => true,                    // console always present
                 2 => self.blk.is_some(),      // root blk
                 3 => self.data_blk.is_some(), // data blk
                 4 => self.rng.is_some(),      // rng

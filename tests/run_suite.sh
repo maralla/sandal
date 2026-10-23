@@ -53,22 +53,23 @@ cargo-unit|0|cargo test --release -q
 boot-time|0|$PYTHON tests/test_boot_time.py
 devices|0|$PYTHON tests/test_devices.py
 blk|0|$PYTHON tests/test_blk.py
-exit-codes|0|$PYTHON tests/test_exit_codes.py
+exit-codes|2400|$PYTHON tests/test_exit_codes.py
 console-input|0|$PYTHON tests/test_console_input.py
 marker-passthrough|0|$PYTHON tests/test_marker_passthrough.py
 export|0|$PYTHON tests/test_export.py
 layer|0|$PYTHON tests/test_layer.py
 share|0|$PYTHON tests/test_share.py
 geometry|0|$PYTHON tests/test_geometry.py
+session-resize|0|$PYTHON tests/test_session_resize.py
 tmux|0|$PYTHON tests/test_tmux.py
 tmux-attached|0|$PYTHON tests/test_tmux_attached.py
 python-repl|0|$PYTHON tests/test_python_repl.py
 packages|0|$PYTHON tests/test_packages.py
 curl-hang|0|tests/test_curl_hang.sh 1 128
 interactive-gate|60|env REPRO_FAIL_FAST=1 REPRO_FAST_STRESS=1 tests/test_interactive_gate.sh --fail-fast --exit-cycle
-vsockrelay|0|$PYTHON tests/test_vsockrelay.py
-ssh-relay|0|$PYTHON tests/test_ssh_relay.py
-ssh-layer|0|$PYTHON tests/test_ssh_layer.py
+vsockd|0|$PYTHON tests/test_vsockd.py
+trailer-leak|0|$PYTHON tests/test_trailer_leak.py
+default-cwd|0|$PYTHON tests/test_default_cwd.py
 EOF
 
 # Prerequisite skips: a test that cannot run says so and passes the suite.

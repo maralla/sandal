@@ -1,5 +1,4 @@
 pub mod blk;
-pub mod console;
 #[cfg(not(target_os = "windows"))]
 pub mod fs;
 /// Virtio MMIO transport implementation (virtio v2 / modern).

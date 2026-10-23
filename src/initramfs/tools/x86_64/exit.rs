@@ -125,3 +125,14 @@ fn build_exit_elf(mmio_base: u64) -> Vec<u8> {
 
     e.build()
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    #[test]
+    fn dump_elf() {
+        if std::env::var_os("SANDAL_DUMP_EXIT").is_some() {
+            let elf = super::build_exit_elf(0xA000_0E00);
+            std::fs::write("/tmp/sandal-exit.elf", &elf).unwrap();
+        }
+    }
+}

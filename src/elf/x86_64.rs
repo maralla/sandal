@@ -109,6 +109,7 @@ pub const fn mov_r_imm64(dst: u32, imm: u64) -> [u8; 10] {
 }
 
 /// `MOV r64, imm32` (sign-extended, C7 /0).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn mov_r_imm32(dst: u32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(7);
     b.push(rex(true, false, false, is_rex_high(dst)) as u8);
@@ -119,6 +120,7 @@ pub fn mov_r_imm32(dst: u32, imm: i32) -> Vec<u8> {
 }
 
 /// `MOV r64, r64` (89 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn mov_rr(dst: u32, src: u32) -> Vec<u8> {
     let b = vec![
         rex(true, is_rex_high(src), false, is_rex_high(dst)) as u8,
@@ -129,6 +131,7 @@ pub fn mov_rr(dst: u32, src: u32) -> Vec<u8> {
 }
 
 /// `MOV r64, [r64 + disp]` (8B /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn mov_r_mem(dst: u32, base: u32, disp: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(8);
     b.push(rex(true, is_rex_high(dst), false, is_rex_high(base)) as u8);
@@ -139,6 +142,7 @@ pub fn mov_r_mem(dst: u32, base: u32, disp: i32) -> Vec<u8> {
 }
 
 /// `MOV [r64 + disp], r64` (89 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn mov_mem_r(base: u32, disp: i32, src: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(8);
     b.push(rex(true, is_rex_high(src), false, is_rex_high(base)) as u8);
@@ -149,6 +153,7 @@ pub fn mov_mem_r(base: u32, disp: i32, src: u32) -> Vec<u8> {
 }
 
 /// `MOVZX r64, byte [r64 + disp]` (0F B6 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn movzx_r64_m8(dst: u32, base: u32, disp: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(9);
     b.push(rex(true, is_rex_high(dst), false, is_rex_high(base)) as u8);
@@ -161,6 +166,7 @@ pub fn movzx_r64_m8(dst: u32, base: u32, disp: i32) -> Vec<u8> {
 
 /// `MOVZX r64, word [r64 + disp]` (0F B7 /r) — the zero-extended 16-bit
 /// load (the record scan: a u16 field of the resize record).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn movzx_r64_m16(dst: u32, base: u32, disp: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(9);
     b.push(rex(true, is_rex_high(dst), false, is_rex_high(base)) as u8);
@@ -175,6 +181,7 @@ pub fn movzx_r64_m16(dst: u32, base: u32, disp: i32) -> Vec<u8> {
 /// 32-bit load: the 32-bit register write zeroes the upper half, so the
 /// full r64 carries the zero-extended 32-bit value (the record scan: the
 /// record's magic dword).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn movzx_r64_m32(dst: u32, base: u32, disp: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(8);
     b.push(rex(false, is_rex_high(dst), false, is_rex_high(base)) as u8);
@@ -185,6 +192,7 @@ pub fn movzx_r64_m32(dst: u32, base: u32, disp: i32) -> Vec<u8> {
 }
 
 /// `MOV dword [r64 + disp], imm32` (C7 /0) — sign-extended to 64.
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn mov_m_imm32(base: u32, disp: i32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(11);
     b.push(rex(true, false, false, is_rex_high(base)) as u8);
@@ -198,6 +206,7 @@ pub fn mov_m_imm32(base: u32, disp: i32, imm: i32) -> Vec<u8> {
 // ── Arithmetic / logic ──────────────────────────────────────────────────
 
 /// `ADD r64, imm32` (81/83 /0).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn add_r_imm(dst: u32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(7);
     b.push(rex(true, false, false, is_rex_high(dst)) as u8);
@@ -214,6 +223,7 @@ pub fn add_r_imm(dst: u32, imm: i32) -> Vec<u8> {
 }
 
 /// `SUB r64, imm32` (81/83 /5).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn sub_r_imm(dst: u32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(7);
     b.push(rex(true, false, false, is_rex_high(dst)) as u8);
@@ -230,6 +240,7 @@ pub fn sub_r_imm(dst: u32, imm: i32) -> Vec<u8> {
 }
 
 /// `ADD r64, r64` (01 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn add_rr(dst: u32, src: u32) -> Vec<u8> {
     let b = vec![
         rex(true, is_rex_high(src), false, is_rex_high(dst)) as u8,
@@ -240,6 +251,7 @@ pub fn add_rr(dst: u32, src: u32) -> Vec<u8> {
 }
 
 /// `SUB r64, r64` (29 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn sub_rr(dst: u32, src: u32) -> Vec<u8> {
     let b = vec![
         rex(true, is_rex_high(src), false, is_rex_high(dst)) as u8,
@@ -250,6 +262,7 @@ pub fn sub_rr(dst: u32, src: u32) -> Vec<u8> {
 }
 
 /// `CMP r64, imm32` (81/83 /7).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn cmp_r_imm(dst: u32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(7);
     b.push(rex(true, false, false, is_rex_high(dst)) as u8);
@@ -266,6 +279,7 @@ pub fn cmp_r_imm(dst: u32, imm: i32) -> Vec<u8> {
 }
 
 /// `CMP r64, r64` (39 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn cmp_rr(a: u32, b: u32) -> Vec<u8> {
     let v = vec![
         rex(true, is_rex_high(b), false, is_rex_high(a)) as u8,
@@ -276,6 +290,7 @@ pub fn cmp_rr(a: u32, b: u32) -> Vec<u8> {
 }
 
 /// `TEST r64, r64` (85 /r).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn test_rr(a: u32, b: u32) -> Vec<u8> {
     let v = vec![
         rex(true, is_rex_high(b), false, is_rex_high(a)) as u8,
@@ -286,6 +301,7 @@ pub fn test_rr(a: u32, b: u32) -> Vec<u8> {
 }
 
 /// `AND r64, imm32` (81/83 /4).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn and_r_imm(dst: u32, imm: i32) -> Vec<u8> {
     let mut b = Vec::with_capacity(7);
     b.push(rex(true, false, false, is_rex_high(dst)) as u8);
@@ -302,6 +318,7 @@ pub fn and_r_imm(dst: u32, imm: i32) -> Vec<u8> {
 }
 
 /// `SHL r64, imm8` (C1 /4).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn shl_r_imm(dst: u32, imm: u8) -> Vec<u8> {
     vec![
         rex(true, false, false, is_rex_high(dst)) as u8,
@@ -312,6 +329,7 @@ pub fn shl_r_imm(dst: u32, imm: u8) -> Vec<u8> {
 }
 
 /// `SHR r64, imm8` (C1 /5).
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn shr_r_imm(dst: u32, imm: u8) -> Vec<u8> {
     vec![
         rex(true, false, false, is_rex_high(dst)) as u8,
@@ -322,6 +340,7 @@ pub fn shr_r_imm(dst: u32, imm: u8) -> Vec<u8> {
 }
 
 /// `XOR r64, r64` — zero a register.
+#[must_use = "the encoded bytes must be e.emit()ted — a dropped call is a silent no-op in the binary"]
 pub fn xor_rr(dst: u32, src: u32) -> Vec<u8> {
     let b = vec![
         rex(true, is_rex_high(src), false, is_rex_high(dst)) as u8,
@@ -541,7 +560,7 @@ impl X86ElfBuilder {
 
         // ── Program header: one RWX PT_LOAD ────────────────────────
         elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        elf.extend_from_slice(&7u32.to_le_bytes()); // R|W|X
+        elf.extend_from_slice(&5u32.to_le_bytes()); // R|X (the W^X bisection)
         elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
         elf.extend_from_slice(&load_addr.to_le_bytes()); // p_vaddr
         elf.extend_from_slice(&load_addr.to_le_bytes()); // p_paddr

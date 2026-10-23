@@ -79,8 +79,8 @@ pub struct RunArgs {
     /// see tests/test_ssh_relay.py for the proven recipe); auth is
     /// whatever sshd allows — key-only for root by openssh's own
     /// defaults.
-    #[arg(long = "ssh-port", value_name = "[ADDR:]PORT")]
-    pub ssh_port: Option<String>,
+    #[arg(long = "port", value_name = "[ADDR:]PORT")]
+    pub port: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]

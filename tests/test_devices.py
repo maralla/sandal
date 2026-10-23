@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Feature test: every virtio device is wired and usable.
 
-Boots with the full device set (console, two virtio-blk, net, rng, virtiofs)
+Boots with the full device set (two virtio-blk, net, rng, virtiofs, vsock)
 and checks:
 
   * virtio device IDs visible in `/sys/bus/virtio/devices` (1 = net,
-    2 = blk x2, 3 = console, 4 = rng, 26 = fs),
+    2 = blk x2, 4 = rng, 19 = vsock, 26 = fs — the virtio-console (3)
+    is GONE: vsock is the drop-in replacement for every host-guest
+    channel, and the device inventory reflects it),
   * `/dev/vda`, `/dev/vdb`, `/dev/hwrng` exist,
   * virtio-blk queue geometry: `max_segments == 126` and
     `max_segment_size == 32768`.  `seg_max` must leave room for the request
@@ -30,8 +32,8 @@ from vm_harness import Vm, test_main  # noqa: E402
 VIRTIO_IDS = {
     "0x0001": "net",
     "0x0002": "blk",
-    "0x0003": "console",
     "0x0004": "rng",
+    "0x0013": "vsock",
     "0x001a": "fs",
 }
 

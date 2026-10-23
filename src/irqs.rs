@@ -13,7 +13,6 @@
 pub const IRQ_VTIMER: u32 = 27;
 
 pub const SPI_NET: u32 = 16;
-pub const SPI_CONSOLE: u32 = 17;
 pub const SPI_BLK: u32 = 18;
 pub const SPI_DATA_BLK: u32 = 19;
 pub const SPI_RNG: u32 = 20;

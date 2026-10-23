@@ -20,7 +20,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from vm_harness import Vm, test_main  # noqa: E402
+from vm_harness import PROMPTS, Vm, test_main  # noqa: E402
 
 
 def main() -> None:
@@ -93,7 +93,9 @@ def main() -> None:
         vm.send_line("exit()")
         time.sleep(1.5)
         vm.read_more(1.0)
-        if vm.buf.count(b"~ #") == 0:
+        # Either prompt form is the shell's own (both of the harness's
+        # PROMPTS are busybox ash's \w renderings).
+        if not any(p in vm.buf for p in PROMPTS):
             raise AssertionError("REPL exit() did not return to the shell")
         print("python-repl: interactive REPL ok (line editor + eval)")
     finally:

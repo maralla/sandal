@@ -22,3 +22,4 @@ sandal_trace*.log
 trace_hang.log
 __pycache__/
 *.pyc
+*.tar

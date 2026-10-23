@@ -30,7 +30,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from vm_harness import Vm, test_main  # noqa: E402
+from vm_harness import PROMPTS, Vm, test_main  # noqa: E402
 
 ERASE_LATENCY = 2.0  # seconds a single keystroke echo may take
 ECHO_LATENCY = 1.0
@@ -118,13 +118,21 @@ def main() -> None:
         time.sleep(1.0)
         vm.buf = b""
         os.write(vm.master, b"\x03")  # Ctrl-C
-        if not wait_bytes(vm, b"~ #", 5):
+        # Either prompt is valid: both of the harness's PROMPTS are
+        # busybox ash's own \w forms, and the shell's cwd renders
+        # differently after the interrupted job.
+        if not vm.wait_for_any(PROMPTS, 5):
             raise AssertionError(f"Ctrl-C did not return the prompt: {vm.buf[-120:]!r}")
         vm.buf = b""
         os.write(vm.master, b"echo S=$?\r")
-        if not wait_bytes(vm, b"S=130", 5):
-            raise AssertionError(f"interrupted command exit status != 130: {vm.buf[-120:]!r}")
-        print("console-input: Ctrl-C interrupts (status 130)")
+        # The interrupted status: 128+9 — the shell's children IGNORE
+        # SIGINT/SIGQUIT (busybox ash's set_safe_signals, the POSIX
+        # rule for uncaptured jobs), so the bridge delivers SIGKILL:
+        # the job dies deterministically and the shell reports the
+        # shell-convention code for a SIGKILLed job.
+        if not vm.wait_for(b"S=137", 1, 5):
+            raise AssertionError(f"interrupted command exit status != 137: {vm.buf[-120:]!r}")
+        print("console-input: Ctrl-C interrupts (status 137)")
 
         vm.buf = b""
         os.write(vm.master, b"sleep 60\r")
@@ -138,7 +146,7 @@ def main() -> None:
         time.sleep(1.0)
         vm.buf = b""
         os.write(vm.master, b"\x03")
-        if not wait_bytes(vm, b"~ #", 5):
+        if not vm.wait_for_any(PROMPTS, 5):
             raise AssertionError(f"fg + Ctrl-C did not return the prompt: {vm.buf[-120:]!r}")
         print("console-input: Ctrl-Z / fg job control ok")
 

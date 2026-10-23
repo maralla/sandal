@@ -18,16 +18,15 @@
 
 use super::GuestRam;
 use super::{
-    host_tty_size, Args, Vmm, HOST_WINCH, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_CONSOLE,
-    SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK,
+    Args, Vmm, MAX_FS_DEVICES, RAM_BASE, SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG,
+    SPI_VSOCK,
 };
 use crate::hypervisor::{KvmExit, Vm};
-use crate::virtio::console::VirtioConsoleDevice;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::virtio::net::VirtioNetDevice;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::virtio::vsock::VirtioVsockDevice;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,9 +42,6 @@ pub(super) struct KvmHost {
     /// Serializes poller threads' IRQ-line raises against the main loop's
     /// line updates and stdin/net draining (see `Vmm::run_loop_kvm`).
     pub(super) irq_lock: Arc<Mutex<()>>,
-    /// Write end of the pipe used to stop the stdin poller thread.
-    pub(super) stdin_stop_w: RawFd,
-    pub(super) stdin_thread: Option<JoinHandle<()>>,
     /// The eventfd that wakes the net kicker's epoll (its stop flag alone
     /// cannot return the 100 ms wait; see spawn_net_kicker).
     pub(super) stop_fd: libc::c_int,
@@ -78,72 +74,90 @@ pub(super) fn new_irq_levels() -> IrqLevels {
 pub(super) struct VsockHost {
     pub(super) device: Arc<Mutex<VirtioVsockDevice>>,
     /// Set at shutdown so both threads exit; the accepter is woken by
-    /// shutting its listener down (below), the bridge by its slice.
+    /// shutting its listener down (below), the bridge by the wake fd
+    /// (the bridge parks in poll on it — see spawn).
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    /// The listener's fd (woken at shutdown).
-    listener_fd: RawFd,
+    /// The listener's fd (woken at shutdown); None without --port (the
+    /// TCP proxy exists only when the operator named it).
+    listener_fd: Option<RawFd>,
+    /// The bridge's wake eventfd (the device writes it on progress;
+    /// shutdown writes it once to end the parked poll immediately).
+    wake_fd: RawFd,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl VsockHost {
+    /// The bridge core: the device + the exchange loop, ALWAYS (the
+    /// command execution line's own front end registers its stream
+    /// here); the TCP accepter only when the operator named --port.
+    /// One core, two front ends — the exchange loop is stream-agnostic.
     pub(super) fn spawn(
-        bind_addr: &str,
-        bind_port: u16,
         memory: Arc<GuestRam>,
         vm: Vm,
         irq_lock: Arc<Mutex<()>>,
         irq_levels: IrqLevels,
+        listener: Option<std::net::TcpListener>,
+        session: Option<super::session::SessionStream>,
     ) -> Result<Self> {
-        // A TCP listener on the operator's ADDR:PORT — nothing to
-        // discover, no port file. MEASURED in this environment (WSL2):
-        // a Unix-domain listener bound inside the VMM never returns
-        // pending connections from accept() — blocking, O_NONBLOCK and
-        // poll all miss them (a forked child and a standalone process
-        // behave identically, so it is not fixable from userspace
-        // here), while TCP accept works.
-        let listener = std::net::TcpListener::bind((bind_addr, bind_port))
-            .map_err(|error| anyhow!("vsock: bind {bind_addr}:{bind_port}: {error}"))?;
-        // The listener stays BLOCKING: the dedicated accepter's
-        // blocking accept() returns the pending connection the moment it
-        // lands — the kernel wakes the accepter per connection. MEASURED
-        // (the part-2 probe): the RST round trip itself completes with
-        // the unmodified kernel — the test failed only on the cold-start
-        // dequeue latency of the bridge's poll-slice accept loop. The
-        // old "a dedicated accepter misses pending connections" note was
-        // measured on Unix-domain listeners; TCP loopback accept provably
-        // returns pending connections (the same probe).
-        let listener_fd = {
-            use std::os::fd::AsRawFd;
-            listener.as_raw_fd()
-        };
         let device = Arc::new(Mutex::new(VirtioVsockDevice::new()));
+        // The bridge's wake eventfd: the device writes it on progress,
+        // the bridge's poll (below) watches it, and shutdown writes it
+        // once to end the parked poll without waiting out a slice.
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+        anyhow::ensure!(
+            wake_fd >= 0,
+            "vsock: eventfd: {}",
+            std::io::Error::last_os_error()
+        );
+        device.lock().unwrap().set_wake_fd(wake_fd);
         let stop = Arc::new(AtomicBool::new(false));
-        // The dedicated accepter: a blocking accept per connection —
-        // the immediate dequeue the bridge's poll-slice loop could not
-        // deliver on a cold start (see the listener note above).
-        let accepter_thread = std::thread::Builder::new()
-            .name("vsock-accepter".into())
-            .spawn({
-                let device = Arc::clone(&device);
-                let stop = Arc::clone(&stop);
-                move || vsock_accepter(listener, device, stop)
-            })?;
-        // The bridge: the live sockets only — the I/O and ONE device
-        // process pass per round (the accepter registers the
-        // connections).
-        let bridge_thread = std::thread::Builder::new()
-            .name("vsock-bridge".into())
-            .spawn({
-                let device = Arc::clone(&device);
-                let stop = Arc::clone(&stop);
-                move || vsock_bridge(memory, vm, irq_lock, irq_levels, device, stop)
-            })?;
+        // Front end 1: the session handler — the command execution
+        // line's own host side (the host stdio as a stream). Registered
+        // BEFORE the bridge starts: the bridge's first round takes it.
+        if let Some(session) = session {
+            device
+                .lock()
+                .unwrap()
+                .register_connection(Box::new(session));
+        }
+        let mut threads = Vec::new();
+        let mut listener_fd = None;
+        if let Some(listener) = listener {
+            // The listener stays BLOCKING: the dedicated accepter's
+            // blocking accept() returns the pending connection the
+            // moment it lands (MEASURED: see the accepter's note).
+            listener_fd = {
+                use std::os::fd::AsRawFd;
+                Some(listener.as_raw_fd())
+            };
+            threads.push(
+                std::thread::Builder::new()
+                    .name("vsock-accepter".into())
+                    .spawn({
+                        let device = Arc::clone(&device);
+                        let stop = Arc::clone(&stop);
+                        move || vsock_accepter(listener, device, stop)
+                    })?,
+            );
+        }
+        // The bridge: the live streams only — the I/O and ONE device
+        // process pass per round (the front ends register the streams).
+        threads.push(
+            std::thread::Builder::new()
+                .name("vsock-bridge".into())
+                .spawn({
+                    let device = Arc::clone(&device);
+                    let stop = Arc::clone(&stop);
+                    move || vsock_bridge(memory, vm, irq_lock, irq_levels, device, stop, wake_fd)
+                })?,
+        );
         Ok(Self {
             device,
             stop,
-            threads: vec![accepter_thread, bridge_thread],
+            threads,
             listener_fd,
+            wake_fd,
         })
     }
 
@@ -152,8 +166,19 @@ impl VsockHost {
         // Wake the accepter: its blocking accept() only returns when a
         // connection pends or the listener is shut down; the shutdown
         // makes it return an error, and the stop flag ends the loop.
-        unsafe {
-            let _ = libc::shutdown(self.listener_fd, libc::SHUT_RDWR);
+        if let Some(fd) = self.listener_fd {
+            unsafe {
+                let _ = libc::shutdown(fd, libc::SHUT_RDWR);
+            }
+        }
+        // Wake the bridge: its parked poll returns now, the round top's
+        // stop check ends the loop — the join below waits microseconds,
+        // not a slice.
+        {
+            let one = 1u64.to_ne_bytes();
+            unsafe {
+                let _ = libc::write(self.wake_fd, one.as_ptr().cast(), one.len());
+            }
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -221,14 +246,19 @@ fn vsock_accepter(
 /// happened (MEASURED: reproduced at will with a stream larger than one
 /// posted set; the loop is gone).
 ///
-/// The slice itself is completion-driven on the delivery chain: 0 while
-/// any outbox still holds bytes (each round delivers them, reports the
-/// consumption, and the report re-arms the peer's next window — at one
-/// 20 ms round per report a multi-megabyte stream drains at kilobytes
-/// per second while the guest driver's send backlog stands over its RX
-/// gate and any concurrent input stream hangs for good), the fixed
-/// 20 ms otherwise (the next event is the kernel's or the guest's own;
-/// an idle bridge costs 50 wakeups a second).
+/// The slice is a fixed 20 ms park: the next event is the kernel's or
+/// the guest's own; an idle bridge costs 50 wakeups a second. The
+/// poll's events are real — POLLIN always, POLLOUT only for a socket
+/// whose outbox failed to drain last round (a nonblocking host
+/// socket's EAGAIN; the session front end's stdout is blocking and
+/// never arms it) — the kernel wakes the round when it can take more
+/// output or when input lands. The timeout is never zero and the
+/// events never include an unconditional POLLOUT: the session front
+/// end's fd is the host stdin, whose POLLOUT is always ready, so the
+/// earlier POLLIN|POLLOUT shape returned from every poll instantly —
+/// the 20 ms slice never slept and the bridge spun a core at 100%
+/// for the whole VM lifetime (MEASURED), feeding whatever the device
+/// did with the extra process passes.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn vsock_bridge(
@@ -238,54 +268,102 @@ fn vsock_bridge(
     irq_levels: IrqLevels,
     device: Arc<Mutex<VirtioVsockDevice>>,
     stop: Arc<AtomicBool>,
+    wake_fd: RawFd,
 ) {
     use std::io::{Read, Write};
     let idx = (SPI_VSOCK - SPI_NET) as usize;
     let line = super::x86_64::x86_irq_for_slot(idx);
+    // The front ends whose stdin read side hit EOF (eof_is_hangup ==
+    // false): their POLLIN arm drops for the rest of the connection.
+    let mut read_eof: std::collections::HashSet<u32> = std::collections::HashSet::new();
     while !stop.load(Ordering::Relaxed) {
         // (a) Take the parked sockets and outboxes out of the device.
         let work = device.lock().unwrap().take_bridge_work();
         // (b) The park: one poll over every live socket, on a 20 ms
         // slice (the accepter owns the listener; see vsock_accepter).
-        // MEASURED on this kernel: poll() intermittently fails to
-        // report a ready fd (pending bytes on a socket), so the poll
-        // is the PARK ONLY — every round then attempts the nonblocking
-        // read/write unconditionally, and a missed revents costs one
-        // round of latency, never a stall.
-        let mut fds = Vec::with_capacity(work.len());
+        // POLLIN always; POLLOUT only where last round's outbox did
+        // not drain. After the poll, the read/write attempts run
+        // unconditionally anyway (the revents are the wake hint; a
+        // missed revents costs one round of latency, never a stall).
+        // The events are PER DIRECTION: POLLIN on the stream's read
+        // fd; POLLOUT on its WRITE fd (only while the outbox holds
+        // undelivered bytes). The session front end reads stdin and
+        // writes stdout — different fds, and polling the read fd for
+        // POLLOUT woke the round forever (a pty is always writable)
+        // while the pane pty stayed full: the outbox round-tripped
+        // undelivered and each round re-wrote the prefix that had
+        // landed — the flashing pane (MEASURED).
+        let mut fds = Vec::with_capacity(work.len() * 2);
         let mut parked = Vec::with_capacity(work.len());
         for (port, host, outbox) in work {
             let fd = host.as_raw_fd();
-            parked.push((port, host, outbox, fd));
-        }
-        for (_, _, _, fd) in &parked {
+            let wfd = host.write_fd().filter(|w| *w != fd);
+            let out_pending = !outbox.is_empty();
+            // A consumed EOF (see eof_is_hangup) stops the POLLIN arm:
+            // the read side is done, and an EOF-ready device (/dev/null,
+            // a closed terminal) would spin the park forever.
+            let mut events = if read_eof.contains(&port) {
+                0
+            } else {
+                libc::POLLIN
+            };
+            if out_pending && wfd.is_none() {
+                events |= libc::POLLOUT;
+            }
             fds.push(libc::pollfd {
-                fd: *fd,
-                events: libc::POLLIN | libc::POLLOUT,
+                fd,
+                events,
                 revents: 0,
             });
+            if out_pending {
+                if let Some(w) = wfd {
+                    fds.push(libc::pollfd {
+                        fd: w,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    });
+                }
+            }
+            parked.push((port, host, outbox, fd));
         }
-        // The poll timeout: 0 while any outbox still holds bytes —
-        // the completion-driven DELIVERY chain (the outbox → the client
-        // → the consumption report → the peer's next window) must run at
-        // the round rate, not the slice rate: at one 20 ms round per
-        // report a multi-megabyte stream drains at ~kilobytes per
-        // second, and the guest driver's own send backlog stands above
-        // its RX gate threshold (queued_replies ≥ vring_size) the whole
-        // time — its RX processing stops entirely, and any concurrent
-        // input stream wedges (MEASURED: a 2.8 MB output starved a
-        // concurrent 200 KB input to a permanent hang). Empty outboxes:
-        // the fixed 20 ms slice — the next event is the kernel waking
-        // this poll or the guest's own next exit, and an idle bridge
-        // costs 50 wakeups a second.
-        // MEASURED on this kernel: poll() intermittently fails to report
-        // a ready fd (pending bytes on a socket), so the poll is the
-        // PARK ONLY — every round then attempts the nonblocking
-        // read/write unconditionally, and a missed revents costs one
-        // round of latency, never a stall.
-        let outbox_pending = parked.iter().any(|(_, _, outbox, _)| !outbox.is_empty());
-        let timeout = if outbox_pending { 0 } else { 20 };
-        let _ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u64, timeout) };
+        // The wake eventfd: the device writes it when guest-visible
+        // progress lands on the run loop's thread (the outbox filling
+        // is the one that matters — the host sockets cannot see it).
+        // Always armed; drained once per round (the counter read resets
+        // it) so a write between the drain and the poll wakes the poll,
+        // and a write DURING the poll ends it now.
+        let wake_slot = fds.len();
+        fds.push(libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let _ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u64, 20) };
+        if std::env::var_os("SANDAL_VSOCK_DEBUG").is_some() {
+            let mut sum = String::new();
+            for fd in fds.iter() {
+                sum.push_str(&format!(" {:x}/{:x}", fd.fd, fd.revents));
+            }
+            crate::virtio::vsock::debug_print(format_args!("BRIDGE-POLL:{} ready={}", sum, _ready));
+        }
+        // Drain the wake counter (one read resets it; a zero read means
+        // the poll timed out on the slice).
+        if fds[wake_slot].revents & libc::POLLIN != 0 {
+            let mut counter = 0u64;
+            unsafe {
+                let _ = libc::read(
+                    wake_fd,
+                    (&mut counter as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                );
+            }
+            if std::env::var_os("SANDAL_VSOCK_DEBUG").is_some() {
+                crate::virtio::vsock::debug_print(format_args!(
+                    "WAKE-DRAIN: counter was {}",
+                    counter
+                ));
+            }
+        }
         let mut read: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut closed: Vec<u32> = Vec::new();
         let mut delivered: Vec<(u32, usize)> = Vec::new();
@@ -297,7 +375,12 @@ fn vsock_bridge(
             let mut port_delivered = 0usize;
             while !outbox.is_empty() {
                 match host.write(&outbox) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        // Nothing accepted and no error: leave the
+                        // outbox intact — it round-trips back into the
+                        // device and arms next round's POLLOUT.
+                        break;
+                    }
                     Ok(n) => {
                         port_delivered += n;
                         outbox.drain(..n);
@@ -320,11 +403,16 @@ fn vsock_bridge(
             let mut buffer = [0u8; 64 * 1024];
             loop {
                 match host.read(&mut buffer) {
-                    // EOF: the exit-code trailer was the last thing
-                    // read; the agent's connection is done — RST the
-                    // guest's socket.
+                    // EOF: a hangup (the agent closed) RSTs the guest's
+                    // socket; a session stdin's end just stops the read
+                    // side (the command's output must keep flowing —
+                    // see eof_is_hangup).
                     Ok(0) => {
-                        closed.push(port);
+                        if host.eof_is_hangup() {
+                            closed.push(port);
+                        } else {
+                            read_eof.insert(port);
+                        }
                         break;
                     }
                     Ok(n) => read.push((port, buffer[..n].to_vec())),
@@ -340,6 +428,19 @@ fn vsock_bridge(
                     }
                 }
             }
+            // Report the round's DELIVERED bytes only. The report is
+            // what re-arms the guest's send window (the credit update
+            // carries the new consumption counter), and bytes still in
+            // flight — in this hand or back in the device's outbox —
+            // are exactly what the window must stay closed over: the
+            // guest's has_space counts them as unsent-to-the-peer, and
+            // reporting them consumed would let it overrun the real
+            // sink. The earlier full-take report (delivered + the
+            // leftover, with the leftover returned to the outbox and
+            // re-taken next round) counted the same bytes twice and
+            // inflated the credit out of thin air; a real delivery
+            // stall now shows up as a closed window — the protocol's
+            // own backpressure — instead of a lie.
             if port_delivered > 0 {
                 delivered.push((port, port_delivered));
             }
@@ -420,71 +521,6 @@ impl Vmm {
     #[cfg(target_os = "linux")]
     pub(super) fn run_loop_kvm(&mut self, args: &Args) -> Result<i32> {
         loop {
-            // Host terminal resized: re-apply the geometry to the guest
-            // console and interrupt it (the virtio console driver feeds the
-            // config change to hvc_resize, so the guest tty tracks the host
-            // window live). The config path only ever lands when the guest
-            // driver's config work runs — on its own schedule — so the
-            // resize ALSO rides the port input stream as a record the
-            // session agent strips and applies (see portagent.rs's
-            // RESIZE_MAGIC): the input path is the one channel that is
-            // demonstrably up, and the kernel SIGWINCHs the session when
-            // the agent applies the record, so the session re-sizes itself
-            // exactly like a real terminal would.
-            // Host terminal geometry: the kernel's SIGWINCH, MEASURED
-            // (instrumented handler, run in a real tmux pane AND in the
-            // test harness after vm_harness.py's _claim_ctty setup):
-            // the signal fires wherever the console pty is the VMM's
-            // controlling terminal — tmux TIOCSCTTYs its panes (real
-            // panes), and the harness setsid + TIOCSCTTYs its pty —
-            // and NEVER elsewhere (a launch that inherits no ctty gets
-            // no live resize; the boot geometry stands, and host_tty_size
-            // falls back to 120x40 off-tty). set_size dedupes against
-            // the device's own config: a repeat signal for the same size
-            // produces no second record. No poll: a TIOCGWINSZ-per-
-            // iteration poll was measured redundant wherever the ctty
-            // holds and was removed — the harness now exercises the real
-            // signal path instead.
-            if HOST_WINCH.swap(false, Ordering::Relaxed) {
-                let (cols, rows) = host_tty_size();
-                let config_change = self.console.lock().unwrap().set_size(cols, rows);
-                if config_change {
-                    // The resize record: [u32 "RSZ1"][u16 cols][u16 rows],
-                    // little-endian — the resize record's magic
-                    // (0x315a5352 LE = the bytes "RSZ1"). Queued for the
-                    // port input stream: delivered whole, ahead of the
-                    // backlog (see set_resize_record — a split record
-                    // leaks its magic into the input stream).
-                    let mut record: [u8; 8] = [0; 8];
-                    record[0..4].copy_from_slice(&0x315a_5352u32.to_le_bytes());
-                    record[4..6].copy_from_slice(&cols.to_le_bytes());
-                    record[6..8].copy_from_slice(&rows.to_le_bytes());
-                    self.console
-                        .lock()
-                        .unwrap()
-                        .set_resize_record(crate::virtio::console::PORT_RX, record);
-                    // Deliver it RIGHT HERE, at the poll: a truly idle
-                    // session never generates the input pushes or kicks the
-                    // later drains ride on, and the resize must not depend
-                    // on them (a host zoom while the session sits at a
-                    // prompt would otherwise resize nothing, for as long as
-                    // the session stays idle — which is exactly when a
-                    // user zooms). The pulse below covers the delivery.
-                    self.console.lock().unwrap().drain_resize_record(
-                        self.memory.as_shared_slice(),
-                        RAM_BASE,
-                        crate::virtio::console::PORT_RX,
-                    );
-                    let _guard = self.host.irq_lock.lock();
-                    irq_pulse(
-                        &self.host.irq_levels,
-                        (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
-                        &self.vm,
-                        self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
-                    );
-                }
-            }
-
             match self.vcpu.run()? {
                 // EINTR (e.g. SIGWINCH): just re-enter the guest.
                 KvmExit::Unknown(code) if code == u32::MAX => continue,
@@ -500,32 +536,6 @@ impl Vmm {
                     }
                     self.handle_kvm_exit(exit)?
                 }
-            }
-
-            // Drain every console stream → host stdout. Each stream goes
-            // through its own SHARED filter (the same instances the
-            // net-kick thread uses — two independent trackers per stream
-            // would tear escape sequences apart at drain boundaries).
-            // The drain also applies the control replies (the session
-            // routing) and stores the export path on the device; the exit
-            // code comes from the EXIT hypercall in handle_kvm_exit.
-            let (pending, _) = drain_console_streams(
-                &self.console,
-                &self.memory,
-                &self.console_tx_filter,
-                &self.port_tx_filter,
-            );
-            if pending {
-                // The control sequence was delivered or a filter answered a
-                // terminal query: the reply went into an RX queue. Raise the
-                // line under the lock (a fresh edge, not the line update).
-                let _guard = self.host.irq_lock.lock();
-                irq_pulse(
-                    &self.host.irq_levels,
-                    (crate::irqs::SPI_CONSOLE - crate::irqs::SPI_NET) as usize,
-                    &self.vm,
-                    self.irq_line_for_spi(crate::irqs::SPI_CONSOLE),
-                );
             }
 
             // Drain host input and network data into the guest, then mirror
@@ -612,11 +622,6 @@ impl Vmm {
         if let Some(h) = self.host.net_thread.take() {
             let _ = h.join();
         }
-        let wake = [1u8];
-        let _ = unsafe { libc::write(self.host.stdin_stop_w, wake.as_ptr().cast(), wake.len()) };
-        if let Some(h) = self.host.stdin_thread.take() {
-            let _ = h.join();
-        }
         // The vsock listener/bridge (each polls its stop flag on a short
         // slice; the join waits out at most one slice).
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -659,7 +664,6 @@ impl Vmm {
     #[cfg(target_os = "linux")]
     fn device_irq_level(&self, spi: u32) -> bool {
         match spi {
-            SPI_CONSOLE => self.console.lock().unwrap().interrupt_status != 0,
             SPI_BLK => self.blk.as_ref().is_some_and(|d| d.interrupt_status != 0),
             SPI_DATA_BLK => self
                 .data_blk
@@ -723,10 +727,7 @@ impl Vmm {
 pub(super) fn spawn_net_kicker(
     vm: Vm,
     net: Arc<Mutex<Option<VirtioNetDevice>>>,
-    console: Arc<Mutex<VirtioConsoleDevice>>,
     memory: Arc<GuestRam>,
-    filter: Arc<Mutex<super::ConsoleTxFilter>>,
-    port_filter: Arc<Mutex<super::ConsoleTxFilter>>,
     irq_lock: Arc<Mutex<()>>,
     irq_levels: IrqLevels,
     stop: Arc<AtomicBool>,
@@ -737,8 +738,6 @@ pub(super) fn spawn_net_kicker(
 
     std::thread::spawn(move || {
         let line = super::x86_64::x86_irq_for_slot(0); // net = ISA pool slot 0
-        let console_line = console_irq_line();
-        let console_idx = (SPI_CONSOLE - SPI_NET) as usize;
 
         let epfd = unsafe { libc::epoll_create1(0) };
         if epfd < 0 {
@@ -756,13 +755,6 @@ pub(super) fn spawn_net_kicker(
             };
             libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, stop_fd, &mut ev);
         }
-        let mut wedged_empty_drains: u32 = 0;
-        // Only start counting empty drains after the guest produced console
-        // output once: the first TX proves the queue is live, so a subsequent
-        // silence is meaningful (apk/curl phases are quiet for many seconds
-        // without anything being wedged).
-        let mut saw_tx = false;
-
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -770,56 +762,7 @@ pub(super) fn spawn_net_kicker(
 
             // Pump: deliver anything pending, then sync + wait on the fds.
             {
-                // Drain every console stream: a guest writer blocked on a
-                // full TX virtqueue (full-screen apps like tmux) cannot
-                // generate exits, so the main loop alone would never drain
-                // it. Each stream goes through its own shared filter; the
-                // control handshake is what keeps the console alive at all.
-                let (console_irq_pending, progressed) =
-                    drain_console_streams(&console, &memory, &filter, &port_filter);
-                if !progressed {
-                    // Console wedge detection: every stream looks idle but a
-                    // guest console writer may be stuck (e.g. tmux's draw).
-                    // Once output has been seen this boot, dump the vring
-                    // state parsed straight from guest RAM (the only
-                    // guest-side view available when the vCPU is wedged in
-                    // the put_chars completion spin), plus any BAD_RING
-                    // (`id is not a head`) prints left in the kernel log ring.
-                    if saw_tx {
-                        wedged_empty_drains += 1;
-                    }
-                    if wedged_empty_drains >= 50 && (wedged_empty_drains - 50).is_multiple_of(100) {
-                        // Re-dump periodically: a later snapshot can catch
-                        // drift (e.g. a broken queue after a phantom
-                        // completion) that the first one missed.
-                        console
-                            .lock()
-                            .unwrap()
-                            .dump_vrings(memory.as_shared_slice(), RAM_BASE);
-                        crate::vmm_trace::dump_guest_ram_lines(
-                            memory.as_shared_slice(),
-                            "is not a head",
-                            "BAD_RING",
-                            8,
-                            120,
-                        );
-                    }
-                } else {
-                    saw_tx = true;
-                    wedged_empty_drains = 0;
-                }
                 let _guard = irq_lock.lock();
-                // The console completions (drained above) and any query
-                // replies pended the console vring interrupt: raise the line
-                // here. The main loop is blocked in KVM_RUN when the guest
-                // is halted and would never learn of them otherwise — its
-                // update_irq_lines only runs after an exit. Without this
-                // pulse the guest's vring_interrupt handler (hvc_kick →
-                // tty_wakeup) never runs and sleeping tty writers wedge
-                // forever (the tmux attached-client hang).
-                if console_irq_pending {
-                    irq_pulse(&irq_levels, console_idx, &vm, console_line);
-                }
                 let mut guard = net.lock().unwrap();
                 let delivered = match guard.as_mut() {
                     Some(net) => {
@@ -888,297 +831,4 @@ pub(super) fn spawn_net_kicker(
 
         unsafe { libc::close(epfd) };
     })
-}
-
-/// Drain every console stream and emit it (shared by the run loop and the
-/// net-kick thread — the only two places the console device is pumped on
-/// Linux). One filter instance per stream, shared between both callers:
-/// two independent escape-sequence trackers would tear sequences apart at
-/// drain boundaries and corrupt the protocol-marker state.
-///
-/// Streams, in pump order:
-///   - the control handshake: the port-instantiation sequence, delivered
-///     once — without it the guest driver instantiates NO console at all
-///     (hvc0 exists only after CONSOLE_PORT), so this is what keeps every
-///     console alive;
-///   - the console port's stream (the guest init and kernel output):
-///     markers + terminal-query answering, with the \n → \r\n translation
-///     applied once, here (the host terminal runs with output processing
-///     disabled);
-///   - the host device port's stream (the interactive session): verbatim
-///     (the guest pty already formed those bytes), with terminal-query
-///     answering — the replies go back through the port's own RX queue so
-///     the guest agent reads them as input;
-///   - the control replies: completing the driver's posts (its control path
-///     spins until the completion lands, exactly like the console TX); the
-///     payload is the driver's own bookkeeping — logged, emitted nowhere.
-///
-/// Returns `(pending, progressed)`: `pending` means the caller must raise
-/// the console interrupt line (the control sequence was delivered, or a
-/// filter answered a terminal query into an RX queue); `progressed` means
-/// some stream produced bytes (the net-kick thread's wedge detector
-/// inverts it).
-///
-/// The shutdown/export protocol markers are matched by the shared filters
-/// but NOT consumed here: the filter instances are shared with the run
-/// loop, which is the only place with a shutdown path — whatever this
-/// drain matches stays set in the filter until the run loop takes it.
-#[cfg(target_os = "linux")]
-fn drain_console_streams(
-    console: &Arc<Mutex<VirtioConsoleDevice>>,
-    memory: &Arc<GuestRam>,
-    console_filter: &Arc<Mutex<super::ConsoleTxFilter>>,
-    port_filter: &Arc<Mutex<super::ConsoleTxFilter>>,
-) -> (bool, bool) {
-    use std::io::Write;
-    let mut pending = false;
-    let mut progressed = false;
-
-    // The console port's stream.
-    let console_tx = console.lock().unwrap().process_tx(
-        memory.as_shared_slice(),
-        RAM_BASE,
-        crate::virtio::console::CONSOLE_TX,
-    );
-    let console_completed = !console_tx.is_empty();
-    if !console_tx.is_empty() {
-        progressed = true;
-        // The \n → \r\n translation, once, for this stream only.
-        let tx = crate::virtio::onlcr(console_tx);
-        let mut out = Vec::new();
-        let replied = {
-            let mut f = console_filter.lock().unwrap();
-            f.feed(&tx, console, memory, RAM_BASE, &mut out);
-            let replied = f.replied;
-            f.replied = false;
-            replied
-        };
-        if !out.is_empty() {
-            let _ = std::io::stdout().write_all(&out);
-            let _ = std::io::stdout().flush();
-        }
-        // A TX completion landed (a post was captured): the guest driver's
-        // vq callback must reclaim it and wake the blocked writer, or the
-        // next write parks until an unrelated timer exit — the ~80 ms
-        // per post pacer.
-        if replied || console_completed {
-            pending = true;
-        }
-    }
-
-    // The host device port's stream: verbatim.
-    let port_tx = console.lock().unwrap().process_tx(
-        memory.as_shared_slice(),
-        RAM_BASE,
-        crate::virtio::console::PORT_TX,
-    );
-    let port_completed = !port_tx.is_empty();
-    if !port_tx.is_empty() {
-        progressed = true;
-        let mut out = Vec::new();
-        let replied = {
-            let mut f = port_filter.lock().unwrap();
-            f.feed(&port_tx, console, memory, RAM_BASE, &mut out);
-            let replied = f.replied;
-            f.replied = false;
-            replied
-        };
-        if !out.is_empty() {
-            let _ = std::io::stdout().write_all(&out);
-            let _ = std::io::stdout().flush();
-        }
-        // Same as the console stream: a landed completion must pulse, or
-        // the port's bulk stream paces at the timer's period.
-        if replied || port_completed {
-            pending = true;
-        }
-    }
-
-    // The control replies FIRST: complete the driver's pending post — its
-    // control path spins until the completion lands, exactly like the
-    // console TX. The payload carries the session signal (PORT_OPEN(1) —
-    // the marker-free session routing; see process_control_tx), applied
-    // inside; the rest is the driver's own bookkeeping — logged, emitted
-    // nowhere.
-    let control_tx = console
-        .lock()
-        .unwrap()
-        .process_control_tx(memory.as_shared_slice(), RAM_BASE);
-    if !control_tx.is_empty() {
-        progressed = true;
-        crate::vmm_trace::write_console_io(format_args!(
-            "CONTROL_TX bytes={} preview=\"{}\"",
-            control_tx.len(),
-            crate::vmm_trace::bytes_preview(&control_tx, 32)
-        ));
-    }
-
-    // The export path port: the whole stream is the export path (see
-    // process_export_tx — the marker-free export protocol). Stored on the
-    // device; handle_export_done takes it.
-    console
-        .lock()
-        .unwrap()
-        .process_export_tx(memory.as_shared_slice(), RAM_BASE);
-
-    // The control handshake LAST, in the same pump call: the driver reads
-    // the control buffer at get_buf time, so message k must be written in
-    // the very call that completes the driver's reply for message k-1 —
-    // otherwise the buffer holds the LAST message by the time the driver
-    // finally runs, and every earlier message is lost.
-    let pumped = console
-        .lock()
-        .unwrap()
-        .pump_control_sequence(memory.as_shared_slice(), RAM_BASE);
-    // NOTE: pulse only on a NEW event (a delivery or a capture) — pulsing
-    // on every call while the sequence is merely DELIVERED is an IRQ
-    // storm: the kernel's storm detector disables the line ("nobody
-    // cared"), the driver's work never runs again, and the port session
-    // parks on an unprocessed host_connected bit forever.
-    if pumped {
-        pending = true;
-        progressed = true;
-    }
-
-    (pending, progressed)
-}
-
-/// Console interrupt line (the same mapping the main loop uses).
-#[cfg(target_os = "linux")]
-fn console_irq_line() -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        32 + SPI_CONSOLE
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        super::x86_64::x86_irq_for_slot(1) // console = ISA pool slot 1
-    }
-}
-
-/// Spawn the KVM stdin poller thread.
-///
-/// Blocks on poll(2) for host stdin (the interactive pty). On input, injects
-/// the bytes directly into the guest console RX virtqueue and requests a
-/// console interrupt pulse — the main thread blocks in KVM_RUN and cannot
-/// drain a host-side buffer. Exits when a byte arrives on `stop_r` or
-/// stdin reaches EOF.
-#[cfg(target_os = "linux")]
-pub(super) fn spawn_stdin_poller(
-    console: Arc<Mutex<VirtioConsoleDevice>>,
-    memory: Arc<GuestRam>,
-    irq_levels: IrqLevels,
-    vm: Vm,
-) -> Result<(JoinHandle<()>, RawFd)> {
-    let mut pipe_fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return Err(anyhow!(
-            "pipe() failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let (stop_r, stop_w) = (pipe_fds[0], pipe_fds[1]);
-
-    let handle = std::thread::spawn(move || {
-        loop {
-            let mut pfds = [
-                libc::pollfd {
-                    fd: 0,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stop_r,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                break;
-            }
-            if n == 0 {
-                continue;
-            }
-            if pfds[1].revents != 0 {
-                break; // stop requested
-            }
-
-            let mut chunk = [0u8; 4096];
-            let n = unsafe { libc::read(0, chunk.as_mut_ptr() as *mut _, chunk.len()) };
-            if n > 0 {
-                // Inject and raise right here, on this thread: deferring
-                // the injection to the main loop paces input at the main
-                // loop's own iteration rate — seconds per command. The
-                // console lock is held only for the injection (the main
-                // loop holds it only briefly for its TX drain), and the
-                // pulse needs no lock: the main loop's line update mirrors
-                // the device state, so a lock-free pulse is simply the
-                // last write and can never be reordered behind a lowering
-                // decision.
-                let dropped = {
-                    let mut console = console.lock().unwrap();
-                    // The session target: the console RX queue until the
-                    // guest init moves the session onto the host device
-                    // port (the SESSION:port marker, parsed by the console
-                    // TX filter) — then the port RX queue.
-                    let rxq = if console.session_input_on_port {
-                        crate::virtio::console::PORT_RX
-                    } else {
-                        crate::virtio::console::CONSOLE_RX
-                    };
-                    let (_, dropped) = console.push_rx_and_drain(
-                        memory.as_shared_slice(),
-                        RAM_BASE,
-                        rxq,
-                        &chunk[..n as usize],
-                    );
-                    dropped
-                };
-                if dropped > 0 {
-                    crate::vm::console_eprintln(&format!(
-                        "sandal: dropped {dropped} bytes of console input the guest \
-                         refused for too long (a full tty or a busy guest): re-send it"
-                    ));
-                }
-                let line = console_irq_line();
-                let idx = (SPI_CONSOLE - SPI_NET) as usize;
-                irq_pulse(&irq_levels, idx, &vm, line);
-                continue;
-            }
-            if n == 0 {
-                // EOF on stdin: no more input will ever arrive. Park until
-                // shutdown so we do not spin on a permanently-readable fd.
-                let mut pfd = [libc::pollfd {
-                    fd: stop_r,
-                    events: libc::POLLIN,
-                    revents: 0,
-                }];
-                loop {
-                    let n = unsafe { libc::poll(pfd.as_mut_ptr(), 1, -1) };
-                    if n > 0 {
-                        break;
-                    }
-                    if n < 0
-                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                    {
-                        break;
-                    }
-                }
-                break;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        unsafe { libc::close(stop_r) };
-    });
-
-    Ok((handle, stop_w))
 }

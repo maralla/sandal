@@ -57,10 +57,7 @@ impl Vmm {
                 // mmio_write; the export path and the session routing ride
                 // their own channels (see process_export_tx /
                 // process_control_tx).
-                self.console
-                    .lock()
-                    .unwrap()
-                    .process_export_tx(self.memory.as_shared_slice(), RAM_BASE);
+                self.console.lock().unwrap();
                 if replied {
                     // The filter answered a terminal query: the reply is in
                     // the console RX — raise the console IRQ line.

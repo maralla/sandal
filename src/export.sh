@@ -1,22 +1,12 @@
 #!/bin/sh
 # sandal-export — export overlay filesystem diff as a .layer file.
-# Usage: sandal-export [output-path]
+# Usage: sandal-export [ignored]
 
-EXPORT_PATH="${{1:-}}"
-
-# Send desired save path to VMM via the export path port — a dedicated
-# virtio-console port (vport*p2) whose whole stream IS the path. Marker-
-# free: no string matching anywhere on either side (the old
-# `SANDAL_EXPORT_PATH:` console marker is gone), so no output can ever
-# act as the protocol. The port is instantiated host-connected by the
-# VMM's control sequence; writes block until then.
-if [ -n "$EXPORT_PATH" ]; then
-    EXPORT_PORT=
-    for p in /dev/vport*p2; do
-        [ -c "$p" ] && EXPORT_PORT=$p && break
-    done
-    [ -n "$EXPORT_PORT" ] && printf '%s\n' "$EXPORT_PATH" > "$EXPORT_PORT"
-fi
+# The output path is NEVER sent from the guest: the VMM names the layer
+# itself (the default content-addressed name) and logs the path — the
+# old dedicated virtio-console port whose whole stream was the path is
+# gone, and with it the only guest→host path delivery there was. The
+# operator renames from the log line.
 
 # Find the overlay upper directory.
 UPPER=""

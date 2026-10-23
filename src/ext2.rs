@@ -2683,17 +2683,16 @@ pub fn inject_runtime_files(
     inject_chardev(image, &sb, &bgdt, &mut alloc, "dev/null", 0o666, 1, 3)?;
     inject_chardev(image, &sb, &bgdt, &mut alloc, "dev/zero", 0o666, 1, 5)?;
     inject_chardev(image, &sb, &bgdt, &mut alloc, "dev/tty", 0o666, 5, 0)?;
-    // hvc0: virtio-console device (major 229, minor 0)
-    inject_chardev(image, &sb, &bgdt, &mut alloc, "dev/hvc0", 0o666, 229, 0)?;
 
-    // Terminal database: the guest console runs with the host's terminal
-    // type (passed through the boot config like COLS/ROWS; TERM=linux caps
-    // every TUI at 8 colors, which is what broke colorschemes), with linux
-    // as the fallback. The python REPL's readline (ncurses) needs the
-    // matching entry too — without it the REPL falls back to dumb settings
-    // (no line editing). The terminfo format is arch-independent, so the
-    // host's entries work; a name missing from the host database is
-    // skipped (the guest keeps its linux fallback).
+    // Terminal database: the pty session runs REAL terminal software —
+    // readline (ncurses), vim, tmux — and every one of them needs the
+    // terminfo entry matching the guest terminal type, or it falls back
+    // to dumb settings (MEASURED: the python REPL lost its line editor
+    // the moment this injection was dropped). The host's terminal type
+    // (sanitized by the caller; see Vmm::boot) plus the guest's own
+    // linux fallback; a name missing from the host database is skipped
+    // (the guest keeps its linux fallback). The terminfo format is
+    // arch-independent, so the host's entries work as-is.
     for term in [host_term, "linux"] {
         if term.is_empty() {
             continue;
@@ -2736,58 +2735,28 @@ pub fn inject_runtime_files(
         }
     }
 
-    // Session agent: /bin/portagent moves the interactive session onto the
-    // virtio-console host device port (a pty bridged to the port — real
-    // tty semantics at port throughput). THE session transport: there is
-    // no console-session fallback anymore (the init script runs the
-    // portagent or nothing). A crafted x86_64 ELF — pure machine code
-    // built with the per-arch DSL (see portagent.rs) — no toolchain,
-    // no sibling binary.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        &mut alloc,
-        "bin/portagent",
-        initramfs::tools::x86_64::portagent::portagent_helper(),
-        0o755,
-    )?;
-
-    // The SSH channel's guest-side forwarder: /bin/vsockrelay listens on
+    // The command execution line's guest side: /bin/vsockd listens on
     // the guest's vsock (the VMM's own channel bridges each client
-    // connection to it) and forwards to the guest's TCP loopback — sshd
-    // there, unmodified (OpenSSH has no AF_VSOCK listen support). One
-    // forked pump child per connection; SIGCHLD is SIG_IGN inside it
-    // (auto-reaped), and every refusal funnels through one paced retry.
-    // Injected wherever the portagent is: nothing runs it unless the
-    // init script does (the VMM's relay mode passes VSOCKRELAY below),
-    // so the other builds carry a dormant binary and nothing else.
+    // connection to it) and runs what each connection carries — the
+    // general command execution proxy. One forked child per connection;
+    // SIGCHLD is SIG_IGN inside it (auto-reaped), and every refusal
+    // funnels through one paced retry. Nothing runs it
+    // unless the init script does (the VMM's own
+    // channel passes VSOCKD below), so the other builds carry a
+    // dormant binary and nothing else.
     #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
+    let vsockd_elf = initramfs::tools::bin::vsockd_helper();
+    log::info!(
+        "vsockd: injecting the Rust guest helper ({} bytes)",
+        vsockd_elf.len()
+    );
     inject_file(
         image,
         &sb,
         &bgdt,
         &mut alloc,
-        "bin/vsockrelay",
-        initramfs::tools::x86_64::vsockrelay::vsockrelay_helper(),
-        0o755,
-    )?;
-
-    // The relay test's echo endpoint: /bin/vsockecho listens on the
-    // guest's TCP loopback and echoes every connection straight back —
-    // sshd's stand-in for the channel's measurement (the python
-    // stand-in's startup pegs the single emulated vCPU for minutes and
-    // blocks the whole guest; this one is up in milliseconds). Dormant
-    // until the test starts it: nothing else runs it, ever.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "x86_64"))]
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        &mut alloc,
-        "bin/vsockecho",
-        initramfs::tools::x86_64::vsockecho::vsockecho_helper(),
+        "bin/vsockd",
+        &vsockd_elf,
         0o755,
     )?;
 

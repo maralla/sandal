@@ -22,6 +22,7 @@ Usage (from the repo root, after `make`):
 """
 
 import pathlib
+import re
 import subprocess
 import sys
 import tarfile
@@ -41,7 +42,15 @@ def phase_export(
     guest_path: str,
     marker: bytes,
 ) -> pathlib.Path:
-    layer = tmp / layer_name
+    """Export a layer and return the path the VMM actually saved it to.
+
+    The output path is NEVER sent from the guest (the dedicated console
+    port whose whole stream was the path is gone): the VMM names the
+    layer content-addressed, in its own working directory, and logs the
+    path ("Layer saved to: ...") — the operator renames from the log
+    line. This test IS the operator: parse the log line and use the
+    named path.
+    """
     vm = Vm(extra_args)
     try:
         vm.boot("export boot")
@@ -49,10 +58,20 @@ def phase_export(
             f"echo {marker.decode()} > {guest_path}; echo WRITE\"\"_DONE",
             "WRITE_DONE",
         )
-        vm.run(f"sandal-export {layer}", "Layer exported", count=1)
+        vm.run(f"sandal-export {tmp / layer_name}", "Layer exported", count=1)
     finally:
+        # The VMM's own log line names the saved layer; it rides the same
+        # pty as everything else, and vm.buf retains the whole transcript.
+        # (console_eprintln terminates the line with \r — strip it.)
+        saved = re.findall(rb"Layer saved to: ([^\s\r]+)", vm.buf)
         vm.close()
 
+    if not saved:
+        raise AssertionError(
+            "export: the VMM never named a saved layer (no \"Layer saved "
+            f"to\" line): {vm.buf[-300:]!r}"
+        )
+    layer = pathlib.Path.cwd() / saved[-1].decode()
     if not layer.is_file():
         raise AssertionError(f"export: {layer} was not created on the host")
     return layer

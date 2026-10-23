@@ -6,9 +6,8 @@
 //! and the KVM setup in [`super::Vmm::new`]).
 
 use super::{
-    resolve_data_path, Args, Vmm, DATA_BLK_BASE, SPI_BLK, SPI_CONSOLE, SPI_DATA_BLK, SPI_FS_START,
-    SPI_NET, SPI_RNG, VIRTIOFS_BASE_START, VIRTIOFS_SIZE, VIRTIO_BLK_BASE, VIRTIO_CONSOLE_BASE,
-    VIRTIO_NET_BASE, VIRTIO_RNG_BASE,
+    resolve_data_path, Args, Vmm, DATA_BLK_BASE, SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET,
+    SPI_RNG, VIRTIOFS_BASE_START, VIRTIOFS_SIZE, VIRTIO_BLK_BASE, VIRTIO_NET_BASE, VIRTIO_RNG_BASE,
 };
 use crate::devicetree::DeviceTree;
 use crate::hypervisor::Reg;
@@ -100,7 +99,6 @@ impl Vmm {
                 .map(|_| (DATA_BLK_BASE, SPI_DATA_BLK)), // vdb (overlay upper)
             self.rng.as_ref().map(|_| (VIRTIO_RNG_BASE, SPI_RNG)),
             &virtiofs_dt,
-            Some((VIRTIO_CONSOLE_BASE, SPI_CONSOLE)),
             args.verbose,
             None,             // overlay bootarg handled by the guest init from the config
             Some(&[0u8; 64]), // rng-seed so CRNG never blocks at boot

@@ -23,6 +23,7 @@ pub mod nr {
     pub const EXIT: u32 = 60;
     pub const WAIT4: u32 = 61;
     pub const KILL: u32 = 62;
+    pub const GETPID: u32 = 39;
     pub const CHDIR: u32 = 80;
     pub const SETSID: u32 = 112;
     pub const NANO_SLEEP: u32 = 35;
@@ -35,6 +36,8 @@ pub mod nr {
     pub const DUP3: u32 = 292;
     /// pipe2(2) — the pipe-mode session transport's pipe pairs.
     pub const PIPE2: u32 = 293;
+    /// fcntl(2) — F_GETFL/F_SETFL live here (the bridge's O_NONBLOCK).
+    pub const FCNTL: u32 = 72;
     /// rt_sigaction(2) — the bridge ignores SIGPIPE (a pipe write after
     /// the session dies would kill the bridge before the reaper forwards
     /// the session's own status).
@@ -53,13 +56,29 @@ pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_CREAT: u32 = 0x40;
 pub const O_TRUNC: u32 = 0x200;
-pub const MS_BIND: u32 = 0x1000;
+pub const O_NONBLOCK: u32 = 0o4000;
+/// fcntl commands (the bridge's nonblocking fds).
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
+/// ioctl(FIONBIO) — set/clear O_NONBLOCK by pointer (the fds the bridge
+/// touches are fresh; no F_GETFL round trip is needed).
+pub const FIONBIO: u32 = 0x5421;
+/// Errno values the crafted binaries compare syscalls against (a failed
+/// syscall returns -errno in rax).
+pub const EINTR: i64 = 4;
+pub const EAGAIN: i64 = 11;
+/// MAP_SHARED for the /dev/mem hypercall stores.
+pub const MAP_SHARED: i32 = 1;
+pub const PROT_READ_WRITE: i32 = 3;
 
 // ── Signals ───────────────────────────────────────────────────────────
 pub const SIGCHLD: u32 = 17;
 pub const SIGKILL: u32 = 9;
 /// SIGPIPE — ignored by the bridge (see nr::RT_SIGACTION).
 pub const SIGPIPE: u32 = 13;
+/// SIGTSTP — the ^Z (VSUSP) translation (the vsockd bridge: its
+/// default action is STOP, which the shell's children do NOT ignore).
+pub const SIGTSTP: u32 = 20;
 /// SIG_IGN — the rt_sigaction handler value.
 pub const SIG_IGN: u64 = 1;
 
@@ -75,9 +94,14 @@ pub const TIOCSPTLCK: u32 = 0x4004_5431;
 pub const TIOCGPTPEER: u32 = 0x5441;
 /// Apply a winsize {rows, cols, 0, 0} to the pair.
 pub const TIOCSWINSZ: u32 = 0x5414;
+/// Set the tty's foreground process group (the arg is a POINTER to the
+/// pgrp — the session leader's own, so the tty's VINTR path (Ctrl-C)
+/// has a target and the exec'd shell's job-control check passes).
+pub const TIOCSPGRP: u32 = 0x5410;
 
 // ── poll(2) ───────────────────────────────────────────────────────────
 pub const POLLIN: u32 = 0x001;
+pub const POLLOUT: u32 = 0x004;
 
 // ── Networking ────────────────────────────────────────────────────────
 pub const AF_INET: u32 = 2;
@@ -109,3 +133,9 @@ pub const EXPORT_RESIZE_PORT: u16 = 0x5D2;
 pub const EXPORT_DONE_PORT: u16 = 0x5D3;
 pub const EXIT_PORT: u16 = 0x5D5; // "SanDal 5": the low half selects the
                                   // signal; the high half carries the code.
+/// The command execution line's readiness signal: /bin/vsockd stores
+/// this once its listener is bound, and the VMM's vsock device reacts
+/// by connecting every parked front end (the REQUEST goes out exactly
+/// then — no retry loop, no RST cycle against a guest that cannot
+/// listen yet; see virtio::vsock).
+pub const VSOCKD_READY_PORT: u16 = 0x5D6;

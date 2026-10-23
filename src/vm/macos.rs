@@ -181,10 +181,7 @@ impl Vmm {
             // The export path port: the whole stream is the export path
             // (marker-free; stored on the device, handle_export_done takes
             // it).
-            self.console
-                .lock()
-                .unwrap()
-                .process_export_tx(self.memory.as_shared_slice(), RAM_BASE);
+            self.console.lock().unwrap();
             self.console
                 .lock()
                 .unwrap()

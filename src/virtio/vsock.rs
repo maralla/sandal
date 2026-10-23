@@ -39,6 +39,16 @@
 //! far above any command's output — so the guest's send side never
 //! blocks in practice.
 //!
+//! Interrupt discipline: the device raises the IRQ only when a used
+//! entry was written — data actually moved. Anything left pending (a
+//! closed credit window, an exhausted ring) waits for the next event:
+//! the guest's own completion processing, the bridge's round, or a
+//! vCPU exit. No synthetic retry pulses — an IRQ without a new used
+//! entry returns IRQ_NONE in the guest's virtio core and runs no
+//! driver callback, so a pulse can only burn both sides (MEASURED: a
+//! self-re-arming blocked pulse livelocked the transport at ~215 IRQs
+//! a second and froze a session's input for good).
+//!
 //! Threading: this file is the device only. The listener thread (accept
 //! → [`register_connection`]) and the bridge thread (the host sockets ↔
 //! this device's channels, plus ONE [`process`] pass + IRQ pulse per
@@ -64,6 +74,30 @@ use std::collections::{HashMap, VecDeque};
 pub trait HostStream: std::io::Read + std::io::Write + Send {
     fn shutdown_both(&self);
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd;
+    /// The fd the bridge must watch for POLLOUT when this stream's
+    /// output backs up. None: the read fd serves both directions (a
+    /// socket). The session front end writes to stdout — a DIFFERENT
+    /// fd than it reads (stdin) — and the session stream reports it
+    /// (see [`super::super::session::SessionStream`]): polling stdin
+    /// for POLLOUT instead woke the round forever (a pty is always
+    /// writable) while stdout stayed blocked — the outbox then
+    /// round-tripped undelivered, and each round re-wrote the prefix
+    /// that had landed: the terminal flashed with duplicated output
+    /// (MEASURED).
+    fn write_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
+    /// What a zero-byte read means. True (the default): the peer hung up
+    /// — the bridge RSTs the guest side. False: EOF is just "no more
+    /// input" (the session front end's stdin — a terminal that went
+    /// away, /dev/null) — the command's output must keep flowing, so
+    /// the bridge stops polling the read side and lets the session run.
+    /// Reporting EOF as hangup here spun the poll forever: a masked
+    /// EOF kept the read fd POLLIN-ready every round (MEASURED: 240k
+    /// polls in 2 s with stdin on /dev/null).
+    fn eof_is_hangup(&self) -> bool {
+        true
+    }
 }
 
 impl HostStream for std::os::unix::net::UnixStream {
@@ -93,11 +127,13 @@ impl HostStream for std::net::TcpStream {
 /// pty's own buffer, and the run loop wedging on it stalls the vCPU
 /// (the debug session then measures its own artifact — the transport
 /// looks broken while only the diagnostics were).
-fn debug_print(args: std::fmt::Arguments) {
+pub fn debug_print(args: std::fmt::Arguments) {
     use std::io::Write;
     use std::sync::Mutex;
     use std::sync::OnceLock;
     static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    let t0 = T0.get_or_init(std::time::Instant::now);
     let sink = SINK.get_or_init(|| {
         let path = std::env::var_os("SANDAL_VSOCK_DEBUG")?;
         let bytes = path.as_encoded_bytes();
@@ -115,10 +151,10 @@ fn debug_print(args: std::fmt::Arguments) {
     match sink {
         Some(file) => {
             if let Ok(mut file) = file.lock() {
-                let _ = writeln!(file, "{args}");
+                let _ = writeln!(file, "{:?} {args}", t0.elapsed());
             }
         }
-        None => eprintln!("{args}"),
+        None => eprintln!("{:?} {args}", t0.elapsed()),
     }
 }
 
@@ -171,13 +207,38 @@ pub const HOST_CID: u64 = 2;
 /// connects out — the value only has to be stable and non-host.
 pub const GUEST_CID: u64 = 3;
 
-/// The vsock port the channel forwards (`/bin/vsockrelay`'s listen
-/// port — see initramfs/tools/x86_64/vsockrelay.rs): the VMM
-/// synthesizes its REQUESTs with this dst_port, and the guest's
-/// vsockrelay — started by the init script off the VMM's own config —
-/// binds it and forwards each connection to the guest's TCP loopback
-/// (sshd there, unmodified: OpenSSH has no AF_VSOCK listen support).
-pub const RELAY_VSOCK_PORT: u32 = 22;
+/// The vsock port the command execution line forwards (`/bin/vsockd`'s
+/// listen port — see initramfs/tools/x86_64/vsockd.c): the VMM
+/// synthesizes its REQUESTs with this dst_port, and the guest's vsockd
+/// — started by the init script off the VMM's own config — binds it
+/// and runs what each connection carries (the general command
+/// execution proxy: the connection's own bytes decide what runs).
+/// Nothing real ever listened here; the value is fixed by this design
+/// and never user input.
+pub const VSOCKD_PORT: u32 = 2200;
+
+/// The refused-connect retry's pacing: the READY hypercall replaced
+/// the retry loop on the happy path (the REQUEST goes out exactly when
+/// the guest's listener exists — see [`VirtioVsockDevice
+/// ::set_guest_listening`]); what remains is the RST backstop for a
+/// listener that died after announcing itself (vsockd crashed, the
+/// accept backlog overflowed): the re-queue runs no faster than this,
+/// so the backstop never spins.
+const CONNECT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// The refused-connect retry's cap: after this many RST refusals the
+/// connection gives up (the host stream closes; the client sees EOF).
+/// 8000 × 2 ms = 16 s of patience for a listener that announced
+/// itself and then died; a healthy accept never retries at all.
+const CONNECT_RETRY_CAP: u32 = 8000;
+
+/// How long a front end may sit parked waiting for the guest's READY
+/// event: the guest boots vsockd in ~125 ms (MEASURED); 16 s covers a
+/// loaded machine many times over, and a guest that never announces
+/// (the boot failed before vsockd, the build is broken) fails the
+/// front end with a clean EOF instead of hanging it forever. Checked
+/// per pass — no timer, no sleep.
+const GUEST_READY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(16);
 
 /// Queue indices (the guest driver's VSOCK_VQ_* order).
 pub const RX_QUEUE: usize = 0;
@@ -236,6 +297,31 @@ struct Connection {
     /// True once the host side closed: the RST is queued, and no
     /// further host bytes are read.
     host_closed: bool,
+    /// True once the guest closed its end (its SHUTDOWN landed): no
+    /// more guest output is coming. The close itself is GRACEFUL —
+    /// the outbox drains to the client first, and the host socket
+    /// shuts down only once it is empty (a close that beat the
+    /// delivery raced the bridge's take/park round trip and dropped
+    /// the command's whole output: a fast one-shot's output AND its
+    /// SHUTDOWN land inside one bridge round — the connection
+    /// vanished out from under the parked socket, and the client read
+    /// EOF with zero bytes, MEASURED).
+    guest_closed: bool,
+    /// True while the bridge thread holds this connection's host
+    /// socket (between [`VirtioVsockDevice::take_bridge_work`] and the
+    /// next [`VirtioVsockDevice::bridge_exchange`]). The sweep never
+    /// drops a checked-out connection — the park must find its entry,
+    /// or the socket is shut down with its outbox undelivered.
+    checked_out: bool,
+    /// The refused-connect retry state (see [`CONNECT_RETRY_INTERVAL`]):
+    /// how many RST refusals this connection has eaten, and when the
+    /// last REQUEST re-queue went out. Only ever exercised AFTER the
+    /// guest's READY event — pre-ready, no REQUEST exists to refuse.
+    connect_retries: u32,
+    last_request: Option<std::time::Instant>,
+    /// When the front end registered: the never-ready deadline's
+    /// anchor (see [`GUEST_READY_DEADLINE`]).
+    registered_at: std::time::Instant,
 
     /// True once either side is done: dropped at the next sweep.
     closed: bool,
@@ -263,6 +349,25 @@ pub struct VirtioVsockDevice {
     connections: HashMap<u32, Connection>,
     /// The next per-connection host port.
     next_host_port: u32,
+    /// One-shot: the guest driver's first status write (the probe proof).
+    probed: bool,
+    /// The guest's command-execution listener announced itself (the
+    /// READY hypercall: vsockd stores it right after listen()). The
+    /// event replaces the old connect-retry loop: front ends register
+    /// BEFORE this and sit parked (no REQUEST — the guest would only
+    /// RST it); when the event lands, every parked connection's
+    /// REQUEST goes out, exactly once, at the moment the guest can
+    /// accept it.
+    guest_listening: bool,
+    /// The bridge's wake eventfd: written on every guest-visible
+    /// progress, read (drained) by the bridge at each round start.
+    /// The bridge parks in poll on its host sockets — which know
+    /// nothing about the device's outbox filling on the run loop's
+    /// thread — and without this event the command's output (and the
+    /// status trailer with it) waited out the poll's full slice
+    /// (MEASURED: 20 ms on every `sandal -- ls`, the completion
+    /// delivery arriving exactly one slice late).
+    wake_fd: Option<std::os::unix::io::RawFd>,
 }
 
 impl VirtioVsockDevice {
@@ -279,16 +384,28 @@ impl VirtioVsockDevice {
             work_gen_at_read: 0,
             connections: HashMap::new(),
             next_host_port: 1024,
+            guest_listening: false,
+            wake_fd: None,
+            probed: false,
         }
     }
 
-    /// The relay mode, for the VMM's own config plumbing (the guest
-    /// init starts /bin/vsockrelay off it — see vm/mod.rs). Always
-    /// true: the per-command mode is gone (the SSH channel is the only
-    /// consumer), kept as a method so the config plumbing reads the
-    /// same.
-    pub fn relay_mode(&self) -> bool {
-        true
+    /// Give the device the bridge's wake eventfd (see the field note).
+    pub fn set_wake_fd(&mut self, fd: std::os::unix::io::RawFd) {
+        self.wake_fd = Some(fd);
+    }
+
+    /// One write to the wake eventfd: the bridge's poll returns
+    /// immediately, the next round delivers what just landed. The
+    /// counter semantics make this idempotent (the bridge drains once
+    /// per round), and a lost write costs one slice — never progress.
+    fn wake_bridge(&self) {
+        if let Some(fd) = self.wake_fd {
+            let one = 1u64.to_ne_bytes();
+            unsafe {
+                let _ = libc::write(fd, one.as_ptr().cast(), one.len());
+            }
+        }
     }
 
     /// Driver reset (STATUS = 0): the queues and every connection go —
@@ -303,12 +420,16 @@ impl VirtioVsockDevice {
         for queue in &mut self.queues {
             *queue = VirtqState::new(QUEUE_SIZE);
         }
-        let connections = std::mem::take(&mut self.connections);
-        for connection in connections.into_values() {
-            if let Some(host) = connection.host {
-                host.shutdown_both();
-            }
-        }
+        // The QUEUES go (above); the CONNECTIONS stay: the front ends'
+        // host streams survive the driver's own probe sequence (reset →
+        // re-init), which is exactly when front end 1 (the session
+        // handler) is registered — a reset that dropped it left the
+        // bridge with ZERO streams forever (MEASURED: the bridge looped
+        // empty every round; nothing ever flowed). The old contract
+        // closed the host sockets here (the guest's af_vsock was gone);
+        // the guest's vsockd re-binds after the re-probe and the
+        // connection re-arms with it — the host stream was never the
+        // guest's to close.
     }
 
     /// Register one accepted host connection (the listener thread): the
@@ -329,11 +450,53 @@ impl VirtioVsockDevice {
     /// stalls (MEASURED: a 900 KB command wedged its leg at ~a quarter
     /// of the stream; the protocol's own flow control is what keeps the
     /// stream intact, one window per credit round-trip).
+    /// The guest's vsockd listener announced itself (the READY
+    /// hypercall — the guest-side store lands right after listen()).
+    /// Every parked front end connects NOW: its REQUEST queues and
+    /// rides the next inject pass, exactly once, at the moment the
+    /// guest can accept it. No retry loop, no RST cycle, no wait.
+    /// Idempotent (the guest stores once; a stray second store is
+    /// absorbed).
+    pub fn set_guest_listening(&mut self) {
+        if self.guest_listening {
+            return;
+        }
+        self.guest_listening = true;
+        for connection in self.connections.values_mut() {
+            if connection.guest_accepted || connection.closed {
+                continue;
+            }
+            let queued = matches!(
+                connection.rx_control.front(),
+                Some(packet) if parse_header(packet).map(|h| h.op) == Some(OP_REQUEST)
+            );
+            if !queued {
+                connection.rx_control.push_back(guest_header(
+                    VSOCKD_PORT,
+                    connection.host_port,
+                    0,
+                    OP_REQUEST,
+                    0,
+                ));
+            }
+        }
+    }
+
+    /// Register one accepted host connection (the listener thread): the
+    /// per-connection host port and — only when the guest's listener
+    /// has already announced itself — the synthesized REQUEST. Before
+    /// the READY event the connection parks with nothing in flight:
+    /// a REQUEST against a guest that cannot listen would be RST'd,
+    /// and the old design answered that with a timed retry loop; the
+    /// READY event (see [`VirtioVsockDevice::set_guest_listening`])
+    /// removed the race this loop existed to paper over.
     pub fn register_connection(&mut self, host: Box<dyn HostStream>) {
         let host_port = self.next_host_port;
         self.next_host_port = self.next_host_port.wrapping_add(1).max(1024);
         let mut control = VecDeque::new();
-        control.push_back(guest_header(RELAY_VSOCK_PORT, host_port, 0, OP_REQUEST, 0));
+        if self.guest_listening {
+            control.push_back(guest_header(VSOCKD_PORT, host_port, 0, OP_REQUEST, 0));
+        }
         self.connections.insert(
             host_port,
             Connection {
@@ -350,6 +513,17 @@ impl VirtioVsockDevice {
                 tx_outbox: Vec::new(),
                 guest_accepted: false,
                 host_closed: false,
+                guest_closed: false,
+                checked_out: false,
+                connect_retries: 0,
+                // The initial REQUEST counts as the last one sent:
+                // without this, the first pass after its delivery saw
+                // an empty front, `due` fired on the None, and a SECOND
+                // REQUEST queued beside the in-flight one — the guest
+                // RST'd both (MEASURED: two REQUESTs 4 µs apart, two
+                // RSTs back).
+                last_request: Some(std::time::Instant::now()),
+                registered_at: std::time::Instant::now(),
                 closed: false,
             },
         );
@@ -378,12 +552,21 @@ impl VirtioVsockDevice {
         if self.inject_pending(memory, ram_base) {
             progressed = true;
         }
-        // Drop finished connections: their host sockets were closed above
-        // (the bridge parks nothing back into a closed connection). A host
-        // side that closed finishes closing once its RST has landed — the
-        // entry goes the moment nothing is left to deliver.
+        // Drop finished connections. Order matters:
+        //   - A host-side close finishes closing once its RST has
+        //     landed (rx_control drained).
+        //   - A guest-side close finishes closing once the outbox has
+        //     drained to the client (the graceful close — see the
+        //     guest_closed note) — and never while the bridge holds
+        //     the socket (the park must find its entry).
+        //   - A closed connection's host socket shuts down here (or,
+        //     for a checked-out abort, at the park — see OP_RST).
         self.connections.retain(|_, connection| {
             if connection.host_closed && connection.rx_control.is_empty() {
+                connection.closed = true;
+            }
+            if connection.guest_closed && connection.tx_outbox.is_empty() && !connection.checked_out
+            {
                 connection.closed = true;
             }
             if connection.closed {
@@ -403,6 +586,11 @@ impl VirtioVsockDevice {
         if progressed {
             self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
             self.work_gen += 1;
+            // The bridge parks on its host sockets — blind to this
+            // device's outbox filling on the run loop's thread. Wake it
+            // (see the wake_fd note): the output delivery drops from
+            // "one poll slice" to "now".
+            self.wake_bridge();
         }
         progressed
     }
@@ -553,7 +741,7 @@ impl VirtioVsockDevice {
                 connection.guest_fwd_cnt = header.fwd_cnt;
                 connection.guest_buf_alloc = header.buf_alloc;
                 let update = guest_header(
-                    RELAY_VSOCK_PORT,
+                    VSOCKD_PORT,
                     connection.host_port,
                     0,
                     OP_CREDIT_UPDATE,
@@ -562,10 +750,49 @@ impl VirtioVsockDevice {
                 connection.rx_control.push_back(update);
                 true
             }
-            OP_SHUTDOWN | OP_RST => {
-                connection.closed = true;
-                if let Some(host) = connection.host.take() {
-                    host.shutdown_both();
+            OP_SHUTDOWN => {
+                // The guest closed its end (the session's vsockd exited
+                // after its trailer). GRACEFUL: mark the end, and let
+                // the sweep close only once the outbox has drained to
+                // the client — a close here would drop whatever output
+                // is still in flight (MEASURED: a fast one-shot's whole
+                // output lost to the race; the client read EOF with
+                // zero bytes).
+                if connection.guest_accepted {
+                    connection.guest_closed = true;
+                } else {
+                    // A refusal to CONNECT (the guest's kernel resets
+                    // the half-open connection): same paced retry as
+                    // the RST branch (the re-queue lives in
+                    // [`inject_pending`]; this only counts it).
+                    connection.connect_retries = connection.connect_retries.saturating_add(1);
+                    if connection.connect_retries > CONNECT_RETRY_CAP {
+                        connection.closed = true;
+                        if let Some(host) = connection.host.take() {
+                            host.shutdown_both();
+                        }
+                    }
+                }
+                true
+            }
+            OP_RST => {
+                // An ABORT: the guest's socket is reset — no delivery
+                // guarantee (the protocol's own semantics). Close now;
+                // if the bridge holds the socket, the sweep drops the
+                // entry and the park shuts the stray down.
+                if connection.guest_accepted {
+                    connection.closed = true;
+                    if let Some(host) = connection.host.take() {
+                        host.shutdown_both();
+                    }
+                } else {
+                    connection.connect_retries = connection.connect_retries.saturating_add(1);
+                    if connection.connect_retries > CONNECT_RETRY_CAP {
+                        connection.closed = true;
+                        if let Some(host) = connection.host.take() {
+                            host.shutdown_both();
+                        }
+                    }
                 }
                 true
             }
@@ -610,7 +837,19 @@ impl VirtioVsockDevice {
         let mut heads_budget = MAX_HEADS_PER_SLICE;
         let mut progressed = false;
         // The per-connection loop: each connection gets whole packets
-        // until its window closes or the head budget runs out.
+        // until its window closes or the head budget runs out. A
+        // connection with NOTHING to inject consumes no buffer and no
+        // budget — the loop just moves on (the blocked-inject retry
+        // pulse this once ended with was removed altogether: an IRQ
+        // with no new used-ring entries returns IRQ_NONE in the guest's
+        // virtio core and never reaches the driver's callbacks, so it
+        // ran no deferred worker — it only made the guest spin through
+        // status/ack MMIO exits while the device counted each pulse as
+        // progress and re-armed itself, a livelock that starved the
+        // very worker it was trying to feed. The real recovery drivers
+        // are the completion IRQs already sent with every used entry
+        // and the next pass on any event — the bridge's round or a
+        // vCPU exit).
         let connections: Vec<u32> = self.connections.keys().copied().collect();
         for host_port in connections {
             while heads_budget > 0 && last_avail != avail_idx {
@@ -620,9 +859,68 @@ impl VirtioVsockDevice {
                 if connection.closed {
                     break;
                 }
+                if !connection.guest_accepted {
+                    // The connect handshake has not completed. Two
+                    // regimes, and neither polls:
+                    //
+                    // - Pre-READY: nothing is in flight and nothing is
+                    //   queued — the REQUEST goes out only on the
+                    //   guest's READY event (see
+                    //   [`VirtioVsockDevice::set_guest_listening`]).
+                    //   The connection just waits here; if the guest
+                    //   never announces (a boot that died before
+                    //   vsockd), [`GUEST_READY_DEADLINE`] fails it with
+                    //   a clean EOF instead of hanging it forever —
+                    //   checked per pass, no timer, no sleep.
+                    // - Post-READY refusals (the listener died after
+                    //   announcing, the accept backlog overflowed): the
+                    //   RST backstop re-queues, paced by
+                    //   [`CONNECT_RETRY_INTERVAL`], bounded by
+                    //   [`CONNECT_RETRY_CAP`] (the RST handler counts).
+                    if !self.guest_listening {
+                        if connection.registered_at.elapsed() > GUEST_READY_DEADLINE {
+                            connection.closed = true;
+                            if let Some(host) = connection.host.take() {
+                                host.shutdown_both();
+                            }
+                        }
+                    } else {
+                        let due = connection
+                            .last_request
+                            .map(|t| t.elapsed() >= CONNECT_RETRY_INTERVAL)
+                            .unwrap_or(true);
+                        let queued = matches!(
+                            connection.rx_control.front(),
+                            Some(packet) if parse_header(packet).map(|h| h.op) == Some(OP_REQUEST)
+                        );
+                        if due && !queued {
+                            connection.last_request = Some(std::time::Instant::now());
+                            connection.rx_control.push_back(guest_header(
+                                VSOCKD_PORT,
+                                connection.host_port,
+                                0,
+                                OP_REQUEST,
+                                0,
+                            ));
+                        }
+                    }
+                }
+                if connection.rx_control.is_empty() && connection.rx_pending.is_empty() {
+                    // Nothing to inject for this connection: leave the
+                    // buffer posted, move to the next connection. Never
+                    // complete a buffer with zero length — the guest's
+                    // driver drops and re-posts it, and a zero-length
+                    // completion per pass burns the ring dry.
+                    break;
+                }
                 let Some(desc_head) =
                     read_avail_ring(memory, ram_base, qs.avail_addr, last_avail, qs.num)
                 else {
+                    // The RING is exhausted: the driver's own postings
+                    // are drained. The pending data waits for the next
+                    // pass (the completion IRQs already sent drive the
+                    // guest's reaping and re-posting; no pulse here —
+                    // see the loop note).
                     break;
                 };
                 // Measure this head's writable capacity (the mapped
@@ -647,17 +945,14 @@ impl VirtioVsockDevice {
                     }
                     idx = next;
                 }
-                {
-                    let in_flight = connection.injected.wrapping_sub(connection.guest_fwd_cnt);
-                    let _ = in_flight;
-                }
                 // Control first, whole: never window-counted (no payload).
                 let mut wrote = 0usize;
                 if let Some(packet) = connection.rx_control.front() {
+                    let delivered_op = parse_header(packet).map(|h| h.op);
                     {
                         vdbg!(
                             "VDBG INJECT-CTRL: op={} len={} cap={} -> {}",
-                            parse_header(packet).map(|h| h.op).unwrap_or(0),
+                            delivered_op.unwrap_or(0),
                             packet.len(),
                             capacity,
                             if packet.len() <= capacity {
@@ -671,6 +966,16 @@ impl VirtioVsockDevice {
                         copy_across(memory, &buffers, packet);
                         wrote = packet.len();
                         connection.rx_control.pop_front();
+                        // A REQUEST's retry clock anchors at its DELIVERY,
+                        // not its queueing: the initial REQUEST sits in
+                        // rx_control until the guest's RX ring exists
+                        // (~10 ms into the probe), and a clock set at
+                        // registration fired the first re-queue while the
+                        // first REQUEST was still in flight — two
+                        // REQUESTs 5 µs apart, both RST'd (MEASURED).
+                        if delivered_op == Some(OP_REQUEST) {
+                            connection.last_request = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 // Then the stream, as the window allows.
@@ -681,7 +986,8 @@ impl VirtioVsockDevice {
                     let window = connection.guest_buf_alloc.saturating_sub(in_flight) as usize;
                     if window == 0 {
                         // Credit closed: consume no buffer — the guest's
-                        // next credit update reopens it.
+                        // own accounting (the reaping) reopens it, and
+                        // its CREDIT_UPDATE rides the next pass.
                         break;
                     }
                     let chunk = connection
@@ -706,11 +1012,12 @@ impl VirtioVsockDevice {
                         // the guest drop and re-post it, and doing that
                         // every round burns the ring dry — the inject then
                         // stalls with nothing ever delivered. Leave it
-                        // posted; the next round retries.
+                        // posted; the guest's own reaping re-opens the
+                        // gate.
                         break;
                     }
                     let packet = guest_header(
-                        RELAY_VSOCK_PORT,
+                        VSOCKD_PORT,
                         connection.host_port,
                         chunk as u32,
                         OP_RW,
@@ -724,8 +1031,9 @@ impl VirtioVsockDevice {
                     wrote = framed.len();
                 }
                 if wrote == 0 {
-                    // Nothing fit: leave the buffer posted; the next
-                    // round (or a fresh post) retries.
+                    // The control packet did not fit either (capacity
+                    // below the header size): leave the buffer posted,
+                    // retry on the next pass.
                     break;
                 }
                 let _ = write_used_ring(
@@ -752,6 +1060,13 @@ impl VirtioVsockDevice {
                 used_idx_start.wrapping_add(used_count as u16),
             );
         }
+        // True only when a used entry was written — data actually
+        // moved. Data left pending (a closed credit window, an
+        // exhausted ring, a control packet too big for the head) waits
+        // for the next pass on any event; no synthetic pulse here (see
+        // the loop note: an IRQ without a new used entry runs nothing
+        // in the guest, and counting one as progress livelocked the
+        // whole transport).
         progressed
     }
 
@@ -773,7 +1088,7 @@ impl VirtioVsockDevice {
             if !connection.host_closed {
                 connection.host_closed = true;
                 let rst = guest_header(
-                    RELAY_VSOCK_PORT,
+                    VSOCKD_PORT,
                     connection.host_port,
                     0,
                     OP_RST,
@@ -796,14 +1111,36 @@ impl VirtioVsockDevice {
         }
         if let Some(connection) = self.connections.get_mut(&host_port) {
             connection.tx_reported = connection.tx_reported.wrapping_add(delivered as u32);
+            // COALESCED, never appended: the update carries the
+            // CUMULATIVE tx_reported, so the latest subsumes every
+            // earlier one — and one RX buffer per pass (not one per
+            // bridge round) is the difference between a long session's
+            // ring surviving and the ring draining in seconds of any
+            // sustained output (MEASURED: a per-round update ate the
+            // 256-entry posted ring at the output flow rate — a vi
+            // session scrolling, a tmux pane redrawing — and the input
+            // froze with it; the short test sessions never flow enough
+            // output to drain it, which is why every test passed while
+            // a real session froze). Replace the pending update in
+            // place; the REQUESTs and the RSTs keep their places.
             let update = guest_header(
-                RELAY_VSOCK_PORT,
+                VSOCKD_PORT,
                 connection.host_port,
                 0,
                 OP_CREDIT_UPDATE,
                 connection.tx_reported,
             );
-            connection.rx_control.push_back(update);
+            let coalesce = matches!(
+                connection.rx_control.back(),
+                Some(last) if parse_header(last).map(|h| h.op) == Some(OP_CREDIT_UPDATE)
+            );
+            if coalesce {
+                if let Some(last) = connection.rx_control.back_mut() {
+                    *last = update;
+                }
+            } else {
+                connection.rx_control.push_back(update);
+            }
         }
     }
 
@@ -820,8 +1157,14 @@ impl VirtioVsockDevice {
         delivered: Vec<(u32, usize)>,
     ) {
         for (host_port, host, leftover) in work {
+            vdbg!(
+                "VDBG BRIDGE-PARK: port={} leftover={}",
+                host_port,
+                leftover.len()
+            );
             if let Some(connection) = self.connections.get_mut(&host_port) {
                 connection.host = Some(host);
+                connection.checked_out = false;
                 if !leftover.is_empty() {
                     connection.tx_outbox.extend_from_slice(&leftover);
                 }
@@ -841,8 +1184,10 @@ impl VirtioVsockDevice {
     }
 
     /// Take the bridge thread's work: every live connection's host socket
-    /// plus its outbox (the command output). The sockets are parked on
-    /// the device between rounds.
+    /// plus its outbox (the command output), CAPPED at the advertised
+    /// window ([`HOST_WINDOW`]). A guest-closed connection is still
+    /// taken — its final outbox bytes must reach the client before the
+    /// graceful close (see [`Connection::guest_closed`]).
     pub fn take_bridge_work(&mut self) -> Vec<(u32, Box<dyn HostStream>, Vec<u8>)> {
         let mut work = Vec::new();
         for connection in self.connections.values_mut() {
@@ -850,11 +1195,15 @@ impl VirtioVsockDevice {
                 continue;
             }
             if let Some(host) = connection.host.take() {
-                work.push((
+                let take = connection.tx_outbox.len().min(HOST_WINDOW as usize);
+                let outbox: Vec<u8> = connection.tx_outbox.drain(..take).collect();
+                vdbg!(
+                    "VDBG BRIDGE-TAKE: port={} outbox={}",
                     connection.host_port,
-                    host,
-                    std::mem::take(&mut connection.tx_outbox),
-                ));
+                    outbox.len()
+                );
+                connection.checked_out = true;
+                work.push((connection.host_port, host, outbox));
             }
         }
         work
@@ -923,6 +1272,11 @@ impl VirtioVsockDevice {
     /// Returns Some(queue) if QueueNotify was written (the caller drives
     /// [`process`] on its own schedule — the run loop, after the exit).
     pub fn mmio_write(&mut self, offset: u64, value: u32) -> Option<u32> {
+        if !self.probed && offset == 0x70 {
+            // the driver's status write: the probe reached this device
+            self.probed = true;
+            vdbg!("VDBG PROBED: the guest's vsock driver is alive");
+        }
         {
             vdbg!("VDBG MMIO-WRITE: offset={offset:#x} value={value:#x}");
         }
@@ -1256,7 +1610,7 @@ mod tests {
             HOST_CID,
             0x1122_3344_5566_7788,
             1024,
-            RELAY_VSOCK_PORT,
+            VSOCKD_PORT,
             4096,
             TYPE_STREAM,
             OP_REQUEST,
@@ -1269,7 +1623,7 @@ mod tests {
         assert_eq!(parsed.src_cid, HOST_CID);
         assert_eq!(parsed.dst_cid, 0x1122_3344_5566_7788);
         assert_eq!(parsed.src_port, 1024);
-        assert_eq!(parsed.dst_port, RELAY_VSOCK_PORT);
+        assert_eq!(parsed.dst_port, VSOCKD_PORT);
         assert_eq!(parsed.len, 4096);
         assert_eq!(parsed.vtype, TYPE_STREAM);
         assert_eq!(parsed.op, OP_REQUEST);
@@ -1281,13 +1635,16 @@ mod tests {
     }
 
     /// The whole connection lifecycle through the real surfaces: the
-    /// REQUEST lands in a posted buffer (one used entry, whole packet),
-    /// the window starts CLOSED (the guest admitted nothing yet — the
-    /// pre-open would let a pass blow past the guest's budget and the
-    /// guest would DROP the excess, silently), the guest's RESPONSE
-    /// then opens it to the guest's real window, the command stream is
-    /// chunked per posted buffer and never split mid-packet, the output
-    /// lands in the outbox, and the host close queues the RST.
+    /// READY event connects the parked front end (pre-ready, nothing
+    /// is in flight — the old design's REQUEST raced the guest's bind
+    /// and burned RST cycles), the REQUEST lands in a posted buffer
+    /// (one used entry, whole packet), the window starts CLOSED (the
+    /// guest admitted nothing yet — the pre-open would let a pass blow
+    /// past the guest's budget and the guest would DROP the excess,
+    /// silently), the guest's RESPONSE then opens it to the guest's
+    /// real window, the command stream is chunked per posted buffer
+    /// and never split mid-packet, the output lands in the outbox, and
+    /// the host close queues the RST.
     #[test]
     fn connection_lifecycle() {
         let mut device = VirtioVsockDevice::new();
@@ -1296,13 +1653,23 @@ mod tests {
         guest.setup_queue(&mut device, TX_QUEUE);
         guest.setup_queue(&mut device, EVENT_QUEUE);
 
-        // ── Phase 1: the REQUEST (a control packet) ──────────────────
+        // ── Phase 0: pre-ready, the front end parks silent ───────────
         // The host socket is a dummy: the queue machinery never touches
         // it (the bridge paths are the bridge's own, tested below only
         // through the device's public methods).
         device.register_connection(dummy_socket());
         let host_port = *device.connections.keys().next().unwrap();
         guest.post_rx(&device);
+        assert!(!device.process(&mut guest.ram, guest.ram_base));
+        assert!(device
+            .connections
+            .get(&host_port)
+            .unwrap()
+            .rx_control
+            .is_empty());
+
+        // ── Phase 1: the READY event → the REQUEST ──────────────────
+        device.set_guest_listening();
         let progressed = device.process(&mut guest.ram, guest.ram_base);
         assert!(progressed);
         assert_eq!(
@@ -1317,7 +1684,7 @@ mod tests {
         assert_eq!(landed_header.op, OP_REQUEST);
         assert_eq!(landed_header.src_cid, HOST_CID);
         assert_eq!(landed_header.dst_cid, GUEST_CID);
-        assert_eq!(landed_header.dst_port, RELAY_VSOCK_PORT);
+        assert_eq!(landed_header.dst_port, VSOCKD_PORT);
         assert_eq!(landed_header.src_port, host_port);
         // The control packet is consumed: nothing else pending.
         // The connection is NOT accepted and the window is CLOSED: the
@@ -1336,7 +1703,7 @@ mod tests {
         let response = build_header(
             GUEST_CID,
             HOST_CID,
-            RELAY_VSOCK_PORT,
+            VSOCKD_PORT,
             host_port,
             0,
             TYPE_STREAM,
@@ -1393,7 +1760,7 @@ mod tests {
         let output = build_header(
             GUEST_CID,
             HOST_CID,
-            RELAY_VSOCK_PORT,
+            VSOCKD_PORT,
             host_port,
             8,
             TYPE_STREAM,

@@ -5,11 +5,6 @@
 set --
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
-# Terminal type: the boot config passes the host's TERM through (like
-# COLS/ROWS); linux (8 colors) is only the fallback. Reassignment below
-# (config parse) updates the exported value.
-TERM=${TERM:-linux}
-export TERM
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 mount -t proc proc /proc
@@ -21,24 +16,22 @@ DISK_MODE=
 NETWORK=0
 CLOCK=0
 SHARES_TEXT=
-COLS=80
-ROWS=24
 MEMCAP=0
-VSOCKRELAY=
+VSOCKD=
+HYPERCALL=
 while IFS= read -r line; do
     case $line in
-        ARG=*) set -- "$@" "${line#ARG=}" ;;
         DISK_MODE=*) DISK_MODE=${line#DISK_MODE=} ;;
         NETWORK=*) NETWORK=${line#NETWORK=} ;;
         CLOCK=*) CLOCK=${line#CLOCK=} ;;
         SHARE=*) SHARES_TEXT="$SHARES_TEXT${line#SHARE=}\n" ;;
         TERM=*) TERM=${line#TERM=} ;;
-        COLS=*) COLS=${line#COLS=} ;;
-        ROWS=*) ROWS=${line#ROWS=} ;;
         MEMCAP=*) MEMCAP=${line#MEMCAP=} ;;
-        VSOCKRELAY=*) VSOCKRELAY=${line#VSOCKRELAY=} ;;
+        VSOCKD=*) VSOCKD=${line#VSOCKD=} ;;
+        HYPERCALL=*) HYPERCALL=${line#HYPERCALL=} ;;
     esac
 done < /etc/sandal.conf
+
 
 # ── Wall clock (the VMM snapshots the host time at boot) ──────────────
 [ "$CLOCK" != 0 ] && date -s @"$CLOCK" >/dev/null 2>&1
@@ -110,20 +103,34 @@ printf '%b' "$SHARES_TEXT" | while IFS= read -r line; do
     mount -t virtiofs "$tag" "$path"
 done
 
-# ── The vsock relay: the SSH channel's guest-side forwarder ──────────
-# /bin/vsockrelay listens on the guest's vsock (the VMM's own channel
-# bridges each client connection to it) and forwards every connection to
-# the guest's own TCP loopback — sshd there, unmodified: OpenSSH has no
-# AF_VSOCK listen support, so the relay IS the difference. One forked
-# pump child per connection (concurrent sessions are the point); SIGCHLD
-# is SIG_IGN inside it (the kernel auto-reaps — no zombies), and every
-# refusal funnels through one paced retry — a persistent refusal (no
-# sshd: ECONNREFUSED) degrades to ten attempts a second, never a spin.
-# No VSOCKRELAY line (the per-command channel, or no vsock at all):
-# nothing starts, and the vsock port answers nothing.
-if [ -n "$VSOCKRELAY" ] && [ -x /bin/vsockrelay ]; then
-    /bin/vsockrelay "${VSOCKRELAY%%:*}" "${VSOCKRELAY##*:}" &
-fi
+# ── The home directory is the default ────────────────────────────────
+# Every session the command execution line forks inherits THIS cwd:
+# the line starts below, so the cd must come first — a cd after the
+# start left the line (and every session it forked) on the pivoted
+# root's `/`, and the shell's own prompt rendered it (MEASURED: `pwd`
+# printed `/`, the prompt `/ # `).
+cd /root
+
+# ── The command execution line: the general command execution proxy ──
+# /bin/vsockd listens on the guest's vsock (the VMM's own channel
+# bridges each client connection to it) and runs what each connection
+# carries: the connection's own bytes decide what runs — a command
+# execution line, not a fixed forward. One forked child per connection
+# (concurrent connections are the point); SIGCHLD is SIG_IGN inside it
+# (the kernel auto-reaps — no zombies), and every refusal funnels
+# through one paced retry — a persistent refusal degrades to ten
+# attempts a second, never a spin.
+# The start is UNCONDITIONAL and it is the init's OWN LAST COMMAND:
+# no background child, no park — PID 1 IS the accept loop. The build
+# guarantees the binary (build.rs compiles it and asserts success) and
+# the VMM guarantees the port (it always creates the host on this
+# architecture — the session line always registers), so a conditional
+# was dead code that could only ever fail SILENTLY: the exec skipped,
+# the init parked, and the port answered nothing forever (MEASURED: a
+# broken injection hung every boot past every bound). Without the line
+# the guest is useless — so there is no case for the condition, and a
+# genuinely broken build now fails LOUDLY: the exec fails, PID 1 dies,
+# the kernel panics — visible, not parked.
 
 # ── Memory hotplug: the floor is online; the cap arrives on demand ──
 # The VMM maps the whole cap as one lazy slot but declares only a RAM
@@ -177,54 +184,30 @@ if [ "$MEMCAP" -gt 0 ] && [ -w /sys/devices/system/memory/probe ]; then
     ) &
 fi
 
-cd /root
+# ── The command execution line IS the init's last command ───────────
+# exec, not a background child and not the wait/sleep park this once
+# was: the park parked PID 1 in a blocking wait or a billion-second
+# nanosleep — a vCPU-halting dead end that left the guest's deferred
+# transport workers (the send worker and the receive worker — each
+# scheduled only while the vCPU is executing something) with nothing
+# to be scheduled around, and the transport's gates never opened. As
+# the exec'd last command PID 1 IS the accept loop: the socket setup,
+# the accept, the fork per connection, the paced refusal nap, every
+# connection's children and their teardowns — the vCPU's own activity
+# is the transport's driver, and the host's own exit kills the VM (the
+# accept loop never exits; the exit helper below is for BOOT failures
+# only — a failed mount, a failed overlay — and is never reached while
+# the line runs).
+echo VSOCKD_ABOUT_TO_EXEC
+# The hypercall page's guest-physical address: vsockd stores the READY
+# signal there once its listener is bound (the event the VMM's vsock
+# device connects parked front ends on).
+export HYPERCALL
 
-# ── Run the command on the session transport ──────────────────────────
-# The console device is init/kernel output only — never a session: no
-# console-session fallback exists anymore, so nothing here configures it.
-# The crafted helper has no PATH search — resolve the command first.
-#
-# The session transport: the virtio-console host device port
-# (/dev/vport*p1 — the chardev the multiport console device creates),
-# bridged to a pty by /bin/portagent — real tty semantics (job control,
-# signals, line editing) at port throughput. THE session: no fallback
-# transport exists. The crafted helper has no PATH search — resolve the
-# command first.
-CMD="$(command -v "$1")"
-[ -n "$CMD" ] || CMD="$1"
-# busybox's `command -v` prints the bare applet name for shell builtins
-# (true, false, echo) — a relative path execve(2) refuses (ENOENT: no cwd
-# search). Force an absolute path: applet-name hits are the busybox
-# symlink farm, /bin first.
-case "$CMD" in
-    /*) ;;
-    *) CMD="/bin/$CMD" ;;
-esac
-shift
-PORT=
-for p in /dev/vport*p1; do
-    [ -c "$p" ] && PORT=$p && break
-done
-if [ -n "$PORT" ] && [ -x /bin/portagent ]; then
-    # Tell the VMM the session layout (the token-authenticated marker;
-    # each stream's own filter suppresses the line like the exit protocol):
-    # the WHOLE session — input, echo, and output — rides the host device
-    # port (the portagent bridges a pty to it: real tty semantics at port
-    # throughput). Host stdin must move to the port RX queue. ONE copy,
-    # on the port: the control sequence is BATCHED (one message per posted
-    # head, one pulse — see src/virtio/console.rs), so the port opened
-    # during kernel boot, deterministically, BEFORE this script runs — the
-    # device node above exists iff that happened. The session routing is
-    # marker-free: opening the port is the signal (the kernel driver sends
-    # PORT_OPEN(1) on the control queue; the VMM reads it there).
-    /bin/portagent "$PORT" "$ROWS" "$COLS" "$CMD" "$@"
-    STATUS=$?
-else
-    # No session transport (the port never opened, or the helper is
-    # missing): NO session — no console-session fallback, ever. The
-    # exit helper below forwards the status; the VMM tears the VM down.
-    STATUS=126
-fi
+exec /bin/vsockd "$VSOCKD"
+# Unreachable while the line runs (the exec never returns); a broken
+# build fails loudly here — the exec fails, PID 1 dies, the kernel
+# panics — never a silent park.
 
 # The session child was a session leader on a real tty: its death
 # disassociates the controlling terminal and vhangups it — every
@@ -234,8 +217,14 @@ fi
 # console anymore: sandal-exit is a /dev/mem MMIO store to the VMM's
 # hypercall page (marker-free — no string can ever act as the
 # protocol; the low half of the store selects EXIT_PORT, the high
-# half carries the code). A missing helper just loses the code.
-[ -x /usr/sbin/sandal-exit ] && /usr/sbin/sandal-exit "$STATUS"
+# half carries the code). UNCONDITIONAL, same as the command execution
+# line above: the BUILD guarantees the helper (the injection is
+# unconditional on this architecture), so an existence check was dead
+# code that could only ever fail SILENTLY — the code lost, the boot
+# sailing into poweroff with nothing delivered. A genuinely broken
+# build fails loudly instead (the helper is missing, the store never
+# lands, the VMM names it).
+/usr/sbin/sandal-exit "$STATUS"
 poweroff -f
 # Fallback if poweroff is not serviced.
 sleep 5
