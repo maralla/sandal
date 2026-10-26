@@ -39,7 +39,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from vm_harness import Vm, test_main  # noqa: E402
+from vm_harness import SANDAL, Vm, test_main  # noqa: E402
 
 # The listener port the test names in --port (PID-offset: any fixed port
 # works — nothing real listens here — but a PID offset keeps concurrent
@@ -48,6 +48,8 @@ PORT = 20000 + os.getpid() % 20000
 # The daemon VM's own listener: a second PID-offset port, so concurrent
 # test runs never share it.
 DAEMON_PORT = 21000 + os.getpid() % 20000
+# The --script sandbox VM's listener: a third PID-offset port.
+SCRIPT_PORT = 22000 + os.getpid() % 20000
 
 # The 17-byte status trailer: 16 magic bytes + the status byte.
 MAGIC = b"VSOCKD:EXIT:01\n\0"
@@ -372,9 +374,139 @@ def main_daemon() -> None:
         daemon.close()
 
 
+def main_script() -> None:
+    """`--script`: the whole script file is delivered and executed.
+
+    `sandal <options> --script FILE` boots the VM, sends the script
+    whole through the command line (mode 4: no shell quoting, no
+    command-size cap), streams the run back to the host's stdout, and
+    powers the VM off with the script's own exit status. A positional
+    command is rejected at the CLI; while a script sandbox lives, its
+    line rejects command connections outright (the named refusal + the
+    126 trailer). The script's stdin is /dev/null, the same contract as
+    the one-shot command's.
+    """
+    import subprocess
+    import tempfile
+
+    sandal = str(SANDAL)
+
+    def write_script(body: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        return path
+
+    # ── 1. The one-shot: the output streams back, the exit status rides ──
+    path = write_script("echo one\necho two\nexit 7\n")
+    try:
+        r = subprocess.run(
+            [sandal, "--script", path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 7 or "one" not in r.stdout or "two" not in r.stdout:
+            raise AssertionError(
+                f"--script one-shot failed: rc={r.returncode}, out={r.stdout!r}"
+            )
+    finally:
+        os.unlink(path)
+    print("--script: the one-shot runs and carries the exit status (7): OK", flush=True)
+
+    # ── 2. The positional command is rejected ──
+    path = write_script("echo unused\n")
+    try:
+        r = subprocess.run(
+            [sandal, "--script", path, "--", "echo", "hi"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 or "rejects the command" not in r.stderr:
+            raise AssertionError(
+                f"--script accepted a command: rc={r.returncode}, err={r.stderr!r}"
+            )
+    finally:
+        os.unlink(path)
+    print("--script: the positional command is rejected: OK", flush=True)
+
+    # ── 3. The size cap: a script far past the command line's CMD_MAX ──
+    body = "\n".join(f"echo line-{i}" for i in range(20000)) + "\necho BIG-DONE\n"
+    path = write_script(body)  # ~260 KB
+    try:
+        r = subprocess.run(
+            [sandal, "--script", path],
+            capture_output=True, text=True, timeout=180,
+        )
+        if (
+            r.returncode != 0
+            or "BIG-DONE" not in r.stdout
+            or "line-0" not in r.stdout
+            or "line-19999" not in r.stdout
+        ):
+            raise AssertionError(f"--script big failed: rc={r.returncode}")
+    finally:
+        os.unlink(path)
+    print("--script: a 260 KB script runs (past the command cap): OK", flush=True)
+
+    # ── 4. The script's stdin is /dev/null: a bare cat EOFs, not parks ──
+    path = write_script("cat\necho after-cat\n")
+    try:
+        r = subprocess.run(
+            [sandal, "--script", path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0 or "after-cat" not in r.stdout:
+            raise AssertionError(
+                f"--script stdin hung or broke: rc={r.returncode}, out={r.stdout!r}"
+            )
+    finally:
+        os.unlink(path)
+    print("--script: the script's stdin is /dev/null: OK", flush=True)
+
+    # ── 5. The line rejects command connections while the script runs ──
+    path = write_script("sleep 12\necho SLEEP-DONE\n")
+    vm = Vm(
+        extra_args=["--port", f"127.0.0.1:{SCRIPT_PORT}", "--script", path],
+        command=(),
+    )
+    try:
+        # Readiness is the port itself, but the bind lands ~a boot into
+        # the VM's life: retry the connect like the daemon section does.
+        deadline = time.monotonic() + 30
+        out = status = None
+        while True:
+            try:
+                out, status = vsockd_run(
+                    SCRIPT_PORT, "echo should-be-refused", CMD_DEADLINE
+                )
+                break
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.5)
+        if status != 126 or b"rejected" not in out:
+            raise AssertionError(
+                f"the command connection was not refused: {status}, {out[-160:]!r}"
+            )
+        # The script still finishes and powers the VM off with its code.
+        deadline = time.monotonic() + 60
+        while vm.proc.poll() is None:
+            if time.monotonic() > deadline:
+                raise AssertionError("the script VM never quit after the script")
+            time.sleep(0.5)
+        if vm.proc.returncode != 0:
+            raise AssertionError(f"the script VM exited {vm.proc.returncode}, want 0")
+    finally:
+        vm.close()
+        os.unlink(path)
+    print(
+        "--script: the line rejects commands; the VM carries the script's status: OK",
+        flush=True,
+    )
+
+
 def all_tests() -> None:
     main()
     main_daemon()
+    main_script()
 
 
 main_ok = test_main("vsockd", all_tests)

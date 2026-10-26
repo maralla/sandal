@@ -75,6 +75,7 @@ pub fn build_init_config_text(
     mem_cap: u64,
     vsockd_port: Option<u32>,
     hypercall_addr: Option<u64>,
+    script_only: bool,
 ) -> Vec<u8> {
     let mut out = String::new();
     if disk_mode.is_some() {
@@ -99,6 +100,12 @@ pub fn build_init_config_text(
         if let Some(addr) = hypercall_addr {
             out.push_str(&format!("HYPERCALL={addr}\n"));
         }
+    }
+    // The script sandbox (--script): the line rejects command lines and
+    // serves whole script files; the VM powers off with the script's own
+    // exit status.
+    if script_only {
+        out.push_str("SCRIPT=1\n");
     }
     // The guest terminal type: the host's own, sanitized by the caller
     // (see Vmm::boot). The pty session is a REAL terminal — the guest

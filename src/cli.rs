@@ -31,6 +31,14 @@ pub struct RunArgs {
     #[arg(required = false)]
     pub command: Vec<String>,
 
+    /// Execute a script file in the VM: the whole file is delivered
+    /// through the command line and run as `sh <file>` — multi-line,
+    /// no shell quoting, no command-size cap. Rejects a positional
+    /// command (the script IS the workload); the VM powers off with the
+    /// script's own exit status.
+    #[arg(long = "script", value_name = "FILE")]
+    pub script: Option<PathBuf>,
+
     /// Shared directories from host (format: host_path:guest_path)
     #[arg(short = 's', long = "share", value_name = "HOST:GUEST")]
     pub shared_dirs: Vec<String>,

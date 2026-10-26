@@ -299,9 +299,36 @@ fn mode_pty(conn: i32, cmd: &[u8], envp: usize, rows: u32, cols: u32,
 
 // ── The connection child: the header, the command, the dispatch ────
 
+/// The script mode's payload cap (mode 4): the whole point of the mode —
+/// a script file is not bounded by the 64 KiB command line. One MiB
+/// covers any generated script; the buffer is a static because each
+/// connection is its own forked process and the daemon never touches it.
+const SCRIPT_MAX: usize = 1024 * 1024;
+static mut SCRIPT_BUF: [u8; SCRIPT_MAX] = [0; SCRIPT_MAX];
+
+fn script_buf() -> &'static mut [u8; SCRIPT_MAX] {
+    unsafe { &mut SCRIPT_BUF }
+}
+
+/// The --script sandbox's policy, from the init's env (SCRIPT_ONLY=1):
+/// command lines are rejected, scripts are served, and the script's own
+/// exit status powers the VM off.
+fn script_only() -> bool {
+    env_get(b"SCRIPT_ONLY").is_some()
+}
+
+/// The command line's refusal in a --script sandbox: the line's own
+/// protocol carries it (the message + the 126 trailer), so the caller
+/// sees a named refusal — never a hang or a bare EOF.
+fn refuse_command(conn: i32) -> ! {
+    let msg: &[u8] = b"sandal: this sandbox serves --script files; command lines are rejected\n";
+    let _ = write_chunk_blocking(conn, msg);
+    write_trailer(conn, false, 126);
+    exit(126)
+}
+
 fn child(conn: i32, envp: usize) {
     let mut hdr = [0u8; 9];
-    let mut cmd = [0u8; CMD_MAX + 1];
 
     debug_event(0x1);
     // The header and the command ride one transport packet the moment
@@ -313,22 +340,140 @@ fn child(conn: i32, envp: usize) {
     let rows = u16::from_le_bytes([hdr[1], hdr[2]]) as u32;
     let cols = u16::from_le_bytes([hdr[3], hdr[4]]) as u32;
     let cmd_len = u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) as usize;
-    if cmd_len == 0 || cmd_len > CMD_MAX {
+
+    // The payload cap is the mode's own: the command line answers to
+    // CMD_MAX, the script file to SCRIPT_MAX.
+    let cap = if mode == 4 { SCRIPT_MAX } else { CMD_MAX };
+    if cmd_len == 0 || cmd_len > cap {
         exit(124);
     }
     debug_event(0x2);
-    read_whole(conn, &mut cmd[..cmd_len]);
-    debug_event(0x3);
-    // the NUL: the command is a C string for execve's argv
-    cmd[cmd_len] = 0;
 
     match mode {
-        1 => mode_oneshot(conn, &cmd[..cmd_len], envp),
-        2 => mode_pty(conn, &cmd[..cmd_len], envp, rows, cols, false),
-        3 => mode_pty(conn, &cmd[..cmd_len], envp, rows, cols, true),
+        1 => {
+            // A --script sandbox rejects the command outright.
+            if script_only() {
+                refuse_command(conn);
+            }
+            let mut cmd = [0u8; CMD_MAX + 1];
+            read_whole(conn, &mut cmd[..cmd_len]);
+            debug_event(0x3);
+            // the NUL: the command is a C string for execve's argv
+            cmd[cmd_len] = 0;
+            mode_oneshot(conn, &cmd[..cmd_len], envp)
+        }
+        2 | 3 => {
+            let mut cmd = [0u8; CMD_MAX + 1];
+            read_whole(conn, &mut cmd[..cmd_len]);
+            debug_event(0x3);
+            cmd[cmd_len] = 0;
+            mode_pty(conn, &cmd[..cmd_len], envp, rows, cols, mode == 3)
+        }
+        4 => {
+            read_whole(conn, &mut script_buf()[..cmd_len]);
+            debug_event(0x3);
+            mode_script(conn, cmd_len, envp)
+        }
         _ => exit(124),
     }
     exit(124);
+}
+
+// ── mode 0x04: the script file ──────────────────────────────────
+//
+// The payload is a whole script: the child writes it to a file under
+// /tmp and runs `sh <file>` — multi-line, no shell quoting, no command
+// cap. stdout/stderr are the connection; stdin is /dev/null (the same
+// contract as the one-shot). The trailer carries the script's own exit
+// status; a --script sandbox then powers the VM off with it.
+fn mode_script(conn: i32, script_len: usize, envp: usize) {
+    let _ = rt_sigaction(SIGCHLD, SIG_DFL);
+
+    // /tmp/sandal-script-<pid>.sh — the pid namespaces the name across
+    // the daemon's forked children. The slice keeps the NUL: open,
+    // execve's argv and unlink all want the C string.
+    let mut path_buf = [0u8; 40];
+    let path = {
+        const HEAD: &[u8] = b"/tmp/sandal-script-";
+        path_buf[..HEAD.len()].copy_from_slice(HEAD);
+        let mut i = HEAD.len();
+        let mut v = getpid() as u32;
+        let mut digits = [0u8; 10];
+        let mut n = 0usize;
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            path_buf[i] = digits[n];
+            i += 1;
+        }
+        const TAIL: &[u8] = b".sh\0";
+        path_buf[i..i + TAIL.len()].copy_from_slice(TAIL);
+        &path_buf[..i + TAIL.len()]
+    };
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o700);
+    if fd < 0 {
+        exit(124);
+    }
+    let mut off = 0usize;
+    while off < script_len {
+        let n = write(fd, &script_buf()[off..script_len]);
+        if n <= 0 && n != -EINTR {
+            exit(124);
+        }
+        if n > 0 {
+            off += n as usize;
+        }
+    }
+    close(fd);
+
+    let sh = b"/bin/sh\0";
+    let argv = [sh.as_ptr(), path.as_ptr(), core::ptr::null()];
+    let pid = fork();
+    if pid < 0 {
+        exit(124);
+    }
+    if pid == 0 {
+        // the grandchild: the connection is its stdout/stderr; stdin is
+        // /dev/null (the script reads nothing from the line)
+        let _ = dup3(conn, 1);
+        let _ = dup3(conn, 2);
+        let null = open(b"/dev/null\0", O_RDWR, 0);
+        if null >= 0 {
+            let _ = dup3(null, 0);
+            if null > 2 {
+                let _ = close(null);
+            }
+        } else {
+            let _ = close(0);
+        }
+        if conn > 2 {
+            let _ = close(conn);
+        }
+        let _ = execve(sh, &argv, envp);
+        exit(125);
+    }
+    // the child: the wait, the trailer, the close, the script file's
+    // cleanup. The close is the caller's EOF: without it the socket
+    // lingers open while the VM powers off underneath it.
+    let mut status = 0i32;
+    while wait4(pid, &mut status) == -EINTR {}
+    let code = status_byte(status);
+    write_trailer(conn, false, code);
+    close(conn);
+    unlink(path);
+    if script_only() {
+        // a --script sandbox is one-shot: the script's status IS the
+        // VM's exit code
+        exit_vm(code);
+    }
+    exit(0);
 }
 
 // ── The init power signals: the daemon's power switch ──────────────

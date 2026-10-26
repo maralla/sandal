@@ -64,7 +64,7 @@ fn run_pack(pack_args: &PackArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_vm(args: Args) -> Result<()> {
+fn run_vm(mut args: Args) -> Result<()> {
     env_logger::Builder::new()
         .filter_level(if args.verbose {
             log::LevelFilter::Debug
@@ -83,11 +83,38 @@ fn run_vm(args: Args) -> Result<()> {
     // The command is optional only with --port: a commandless VM is the
     // pure command daemon (everything rides the port), and without the
     // port there is nothing to run and nothing to serve.
-    if args.command.is_empty() && args.port.is_none() {
+    if args.command.is_empty() && args.port.is_none() && args.script.is_none() {
         anyhow::bail!(
             "sandal: nothing to run: give a command, or add --port ADDR:PORT \
              to serve commands as a daemon"
         );
+    }
+
+    // --script rejects the command: the script IS the workload, delivered
+    // whole through the command line — a shell line alongside it has no
+    // meaning and the old foot-guns (quoting, the 64 KiB cap) none either.
+    if let Some(path) = &args.script {
+        if !args.command.is_empty() {
+            anyhow::bail!(
+                "sandal: --script rejects the command: pass the script file, \
+                 not a command line"
+            );
+        }
+        if !path.is_file() {
+            anyhow::bail!(
+                "sandal: the script file {} does not exist",
+                path.display()
+            );
+        }
+        // The script rides the command line: an ephemeral local port when
+        // the caller named none.
+        if args.port.is_none() {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .map_err(|e| anyhow::anyhow!("--script: no local port: {e}"))?;
+            let port = probe.local_addr()?.port();
+            drop(probe);
+            args.port = Some(format!("127.0.0.1:{port}"));
+        }
     }
 
     // Check we're running on a supported host.

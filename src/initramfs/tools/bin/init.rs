@@ -71,6 +71,7 @@ const S_MEMAVAIL: &[u8] = b"MemAvailable:";
 const ENV_HOME: &[u8] = b"HOME=/root\0";
 const ENV_PATH: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
 const ENV_SSL: &[u8] = b"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\0";
+const ENV_SCRIPT: &[u8] = b"SCRIPT_ONLY=1\0";
 
 // The overlay mount options (data= for the overlay fs type).
 const OVL_OPTS_DISK: &[u8] =
@@ -101,6 +102,10 @@ struct Config {
     memcap: u64,
     vsockd: u32,
     hypercall: Option<&'static [u8]>,
+    /// The script sandbox (--script): the line rejects command lines and
+    /// serves whole script files; the VM powers off with the script's
+    /// own exit status.
+    script: bool,
 }
 
 /// Read and parse /etc/sandal.conf: one KEY=VALUE per line. The values'
@@ -146,6 +151,7 @@ fn config_load() -> Config {
         memcap: 0,
         vsockd: 0,
         hypercall: None,
+        script: false,
     };
     let mut p = 0usize;
     while p < conf.len() {
@@ -208,6 +214,7 @@ fn config_load() -> Config {
                 c.vsockd = v;
             }
             b"HYPERCALL" => c.hypercall = Some(val),
+            b"SCRIPT" => c.script = true,
             _ => {}
         }
     }
@@ -630,6 +637,15 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
                 n_env += 1;
                 env_ptrs[n_env - 1] = p.sub(9); // "HYPERCALL" + '='
             }
+        }
+    }
+    if c.script {
+        // The script sandbox's policy flag: the daemon rejects command
+        // lines, serves whole script files, and powers the VM off with
+        // the script's own exit status.
+        if n_env < env_ptrs.len() - 1 {
+            n_env += 1;
+            env_ptrs[n_env - 1] = ENV_SCRIPT.as_ptr();
         }
     }
 

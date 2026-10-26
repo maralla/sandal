@@ -637,9 +637,93 @@ pub(crate) fn console_eprintln(msg: &str) {
 /// Process-start timestamp for BOOT_TIMING diagnostics.
 pub static BOOT_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-pub fn run(args: Args) -> Result<i32> {
+/// The --script client's own copy of the guest's trailer magic (the
+/// guest's protocol constant; the two must never diverge).
+const SCRIPT_TRAILER_MAGIC: &[u8; 16] = b"VSOCKD:EXIT:01\n\0";
+
+/// Deliver the script through the command line and stream the run back
+/// to the host's stdout: mode 4 (the script), payload = the whole file.
+/// Everything but the trailing 17-byte trailer is the script's output;
+/// the trailer's last byte is its exit status. The last 17 bytes are
+/// withheld from the stream until EOF, so the trailer is verified whole
+/// and never displayed.
+fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
+    let port_num: u16 = port
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .unwrap_or(port)
+        .parse()
+        .map_err(|e| anyhow!("--script: bad port {port:?}: {e}"))?;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port_num))?;
+
+    let mut hdr = [0u8; 9];
+    hdr[0] = 4; // the script mode
+    hdr[5..9].copy_from_slice(&(script.len() as u32).to_le_bytes());
+    stream.write_all(&hdr)?;
+    stream.write_all(script)?;
+
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut stream, &mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > SCRIPT_TRAILER_MAGIC.len() + 1 {
+            let cut = tail.len() - SCRIPT_TRAILER_MAGIC.len() - 1;
+            std::io::stdout().write_all(&tail[..cut])?;
+            tail.drain(..cut);
+        }
+        // The trailer IS the run's end: the guest writes it, closes the
+        // connection and powers the VM off. Waiting for the stream's EOF
+        // here would deadlock the teardown (the socket closes only when
+        // the process does), so the run returns the moment the trailer
+        // lands.
+        if tail.len() == SCRIPT_TRAILER_MAGIC.len() + 1
+            && tail[..SCRIPT_TRAILER_MAGIC.len()] == *SCRIPT_TRAILER_MAGIC
+        {
+            break;
+        }
+    }
+    std::io::stdout().flush()?;
+
+    if tail.len() != SCRIPT_TRAILER_MAGIC.len() + 1
+        || &tail[..SCRIPT_TRAILER_MAGIC.len()] != SCRIPT_TRAILER_MAGIC
+    {
+        anyhow::bail!(
+            "the script's output ended without a status trailer ({} bytes)",
+            tail.len()
+        );
+    }
+    Ok(tail[SCRIPT_TRAILER_MAGIC.len()] as i32)
+}
+
+/// Joins the --script sender on the way out: the run loop ends when the
+/// guest powers off (the script's exit_vm), and the sender's output
+/// drain must finish before the process does.
+struct ScriptJoin(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for ScriptJoin {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub fn run(mut args: Args) -> Result<i32> {
     let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
     let t0 = BOOT_T0.get_or_init(std::time::Instant::now);
+
+    // The script payload reads early: a missing/unreadable file fails
+    // before any VM exists.
+    let script_payload = match &args.script {
+        Some(path) => Some(fs::read(path).map_err(|e| {
+            anyhow!("--script: read {}: {e}", path.display())
+        })?),
+        None => None,
+    };
 
     let mut vmm = Vmm::new(&args)?;
     if timing {
@@ -651,6 +735,22 @@ pub fn run(args: Args) -> Result<i32> {
     if timing {
         eprintln!("BOOT_TIMING boot (disks+rootfs+kernel): {:?}", t0.elapsed());
     }
+
+    // The --script delivery: the whole file goes through the command
+    // line once the listener is up (connections park until the guest's
+    // vsockd signals ready, so an immediate connect is safe). The
+    // guest's script sandbox powers the VM off with the script's own
+    // exit status, so the run loop below ends with it; the join guard
+    // only makes sure the output drain finishes before the process.
+    let _script_join = ScriptJoin(script_payload.map(|script| {
+        let port = args.port.clone().expect("--script forces the port");
+        std::thread::spawn(move || {
+            if let Err(error) = run_script_client(&port, &script) {
+                eprintln!("sandal: --script: {error}");
+                std::process::exit(124);
+            }
+        })
+    }));
 
     #[cfg(target_os = "linux")]
     {
@@ -1223,6 +1323,7 @@ impl Vmm {
             mem_cap,
             vsockd_port,
             hypercall_addr,
+            args.script.is_some(),
         );
 
         // ── Root filesystem (vda): busybox ext2 + runtime files ───────
