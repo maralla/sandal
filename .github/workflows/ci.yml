@@ -53,14 +53,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # guest_target: the bare-metal target build.rs compiles the
+          # guest helper binaries for (the host arch's `*-unknown-none`
+          # — not part of the default toolchain install, hence the
+          # targets: input below).
           - name: Linux x86_64
             os: ubuntu-latest
+            guest_target: x86_64-unknown-none
           - name: Linux aarch64
             os: ubuntu-24.04-arm
+            guest_target: aarch64-unknown-none
           - name: macOS aarch64
             os: macos-latest
+            guest_target: aarch64-unknown-none
           - name: Windows x86_64
             os: windows-latest
+            guest_target: x86_64-unknown-none
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -70,6 +78,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: ${{ matrix.guest_target }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
