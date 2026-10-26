@@ -50,6 +50,7 @@ fn main() {
         ("vsockd", true),
         ("export_resize", true),
         ("export_done", true),
+        ("export", true),
         ("sandal_exit", arch == "x86_64"),
         ("init", true),
     ];

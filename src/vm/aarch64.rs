@@ -191,7 +191,8 @@ impl Vmm {
         self.vcpu.write_register(Reg::Pc, pc + 4)?;
         match imm {
             initramfs::EXPORT_RESIZE_IMM => self.handle_export_resize(),
-            initramfs::EXPORT_DONE_IMM => self.handle_export_done(),
+            initramfs::EXPORT_DONE_IMM => self.handle_export_done(false),
+            initramfs::EXPORT_DONE_FULL_IMM => self.handle_export_done(true),
             // The exit protocol: the code rides x15 (marker-free — the old
             // fixed `SANDAL_EXIT:<code>` stdout marker is gone).
             initramfs::EXIT_IMM => {

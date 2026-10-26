@@ -87,6 +87,12 @@ pub mod nr {
     pub const SETTIMEOFDAY: usize = 164;
     pub const PIVOT_ROOT: usize = 155;
     pub const REBOOT: usize = 169;
+    pub const LSEEK: usize = 8;
+    pub const GETDENTS64: usize = 217;
+    pub const STATX: usize = 332;
+    pub const READLINKAT: usize = 267;
+    pub const SYNC: usize = 162;
+    pub const NANOSLEEP: usize = 35;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -121,6 +127,12 @@ pub mod nr {
     pub const SETTIMEOFDAY: usize = 164;
     pub const PIVOT_ROOT: usize = 51;
     pub const REBOOT: usize = 142;
+    pub const LSEEK: usize = 62;
+    pub const GETDENTS64: usize = 61;
+    pub const STATX: usize = 291;
+    pub const READLINKAT: usize = 78;
+    pub const SYNC: usize = 81;
+    pub const NANOSLEEP: usize = 101;
 }
 
 // ── The raw syscall entry (per arch) ────────────────────────────────
@@ -291,6 +303,67 @@ pub fn symlink(target: &[u8], link: &[u8]) -> isize {
 /// that redirects every ptmx open into the devpts instance.
 pub fn unlink(path: &[u8]) -> isize {
     syscall(nr::UNLINKAT, [AT_FDCWD, path.as_ptr() as usize, 0, 0, 0, 0])
+}
+
+/// lseek(2): the whence constants are the ABI's own (0 set, 1 cur, 2 end).
+pub fn lseek(fd: i32, offset: isize, whence: usize) -> isize {
+    syscall(nr::LSEEK, [fd as usize, offset as usize, whence, 0, 0, 0])
+}
+
+/// sync(2): flush the guest's dirty page cache to its block devices.
+pub fn sync() {
+    let _ = syscall(nr::SYNC, [0, 0, 0, 0, 0, 0]);
+}
+
+/// nanosleep(2): the export's resize poll pace.
+pub fn nanosleep(secs: u64, nanos: u64) {
+    let mut ts = [secs as usize, nanos as usize];
+    let _ = syscall(nr::NANOSLEEP, [ts.as_mut_ptr() as usize, 0, 0, 0, 0, 0]);
+}
+
+/// statx(2): the arch-independent stat (the buffer layout is fixed by
+/// the ABI, unlike struct stat). Returns the raw fill mask; the caller
+/// reads the fields it asked for.
+pub const STATX_SYMLINK_NOFOLLOW: usize = 0x100; // AT_SYMLINK_NOFOLLOW
+
+pub fn statx(dirfd: i32, path: &[u8], flags: usize, mask: u32, buf: &mut [u8; 256]) -> isize {
+    syscall(
+        nr::STATX,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            flags,
+            mask as usize,
+            buf.as_mut_ptr() as usize,
+            0,
+        ],
+    )
+}
+
+// struct statx's fixed fields (the ABI layout, arch-independent):
+// stx_mask @0, stx_mode @28 (u16), stx_size @40 (u64), stx_mtime @112
+// (statx_timestamp: s64 sec + u32 nsec + s32 pad).
+pub const STATX_MODE_OFF: usize = 28;
+pub const STATX_SIZE_OFF: usize = 40;
+
+/// getdents64(2): one batch of directory entries into `buf`.
+pub fn getdents64(fd: i32, buf: &mut [u8]) -> isize {
+    syscall(nr::GETDENTS64, [fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0])
+}
+
+/// readlinkat(2): the symlink target into `buf` (not NUL-terminated).
+pub fn readlinkat(dirfd: i32, path: &[u8], buf: &mut [u8]) -> isize {
+    syscall(
+        nr::READLINKAT,
+        [
+            dirfd as usize,
+            path.as_ptr() as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            0,
+            0,
+        ],
+    )
 }
 
 pub fn chmod(path: &[u8], mode: u32) -> isize {
@@ -569,6 +642,10 @@ pub const VM_SIGNAL_RESIZE: u32 = 0x5D2;
 /// x86_64: the export done signal.
 #[cfg(target_arch = "x86_64")]
 pub const VM_SIGNAL_DONE: u32 = 0x5D3;
+/// x86_64: the export done signal, full-export variant (the VMM merges
+/// the base rootfs with the upper). 0x5D7: 0x5D4 is the config delivery.
+#[cfg(target_arch = "x86_64")]
+pub const VM_SIGNAL_DONE_FULL: u32 = 0x5D7;
 /// The aarch64 BRK immediates (the VMM's handle_brk dispatch matches them).
 /// The config blob delivery: brk #0x5d4, the size returned in x0, the bytes
 /// over the console RX.
@@ -671,6 +748,20 @@ pub fn signal_done() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         asm!("brk #0x5d3", options(nomem, nostack));
+    }
+}
+
+/// The VM signal: the export data is ready AND the export is a FULL one
+/// (the VMM merges the base rootfs with the upper into one complete
+/// filesystem layer). A distinct signal, not a flag bit: the aarch64
+/// side signals by BRK immediate and has no flag bits. 0x5D7: 0x5D4 is
+/// the config delivery.
+pub fn signal_done_full() {
+    #[cfg(target_arch = "x86_64")]
+    hyper_store(VM_SIGNAL_DONE_FULL);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!("brk #0x5d7", options(nomem, nostack));
     }
 }
 

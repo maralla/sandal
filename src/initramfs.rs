@@ -48,6 +48,7 @@ pub const EXPORT_RESIZE_IMM: u32 = 0x5D2; // "SanDal 2"
 /// VMM reads the ext2 `upper/` subtree; in tmpfs mode the guest has written
 /// an uncompressed tar to /dev/vdb and the VMM reads it from there.
 pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
+pub const EXPORT_DONE_FULL_IMM: u32 = 0x5D7; // the full-export done
 
 /// Exit protocol signal (aarch64): the init BRKs with the session's exit
 /// code in x15; the VMM reads the register at the trap (the marker-free
@@ -118,23 +119,8 @@ pub fn build_init_config_text(
     out.into_bytes()
 }
 
-/// Generate the `sandal-export` shell script for the guest.
-///
-/// Usage: sandal-export [path]
-///
-/// 1. Optionally sends the export save path to the VMM via the export path
-///    port (a dedicated virtio-console port whose whole stream IS the path).
-/// 2. Disk mode (ext2 overlay upper): signals EXPORT_DONE directly; the VMM
-///    extracts the ext2 `upper/` subtree into a `.layer` file.
-/// 3. Tmpfs mode: signals EXPORT_RESIZE to grow /dev/vdb, tars the overlay
-///    upper dir onto it, then signals EXPORT_DONE.
-pub fn generate_export_script() -> String {
-    let data_dev_name = DATA_DEV.strip_prefix("/dev/").unwrap_or(DATA_DEV);
-    format!(
-        include_str!("export.sh"),
-        MNT_DISK = MNT_DISK,
-        MNT_TMP = MNT_TMP,
-        DATA_DEV = DATA_DEV,
-        DATA_DEV_NAME = data_dev_name,
-    )
-}
+// The `sandal-export` guest command is a compiled binary, not a
+// generated script: the flow (the overlay-upper walk, the ustar, the
+// resize/done hypercalls) lives in
+// src/initramfs/tools/bin/export.rs, injected at ext2.rs's runtime
+// files (usr/sbin/sandal-export).

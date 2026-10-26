@@ -44,12 +44,13 @@ def phase_export(
 ) -> pathlib.Path:
     """Export a layer and return the path the VMM actually saved it to.
 
-    The output path is NEVER sent from the guest (the dedicated console
-    port whose whole stream was the path is gone): the VMM names the
-    layer content-addressed, in its own working directory, and logs the
-    path ("Layer saved to: ...") — the operator renames from the log
-    line. This test IS the operator: parse the log line and use the
-    named path.
+    The requested name travels as a marker file in the overlay upper
+    (.sandal-layer-name) and is honored when it survives the VMM's
+    sanitization (a single path component, a strict charset); this test
+    passes full host paths (with '/'), which are deliberately unusable —
+    the layer falls back to the content-addressed name. Either way the
+    VMM logs the saved path ("Layer saved to: ...") and this test IS
+    the operator: parse the log line and use the named path.
     """
     vm = Vm(extra_args)
     try:
@@ -103,6 +104,57 @@ def validate_layer(layer: pathlib.Path, guest_path: str, marker: bytes) -> None:
         raise AssertionError(f"export: unexpected layer content {content!r}")
 
 
+def phase_named_export(extra_args: list[str], requested: str, expected: str) -> None:
+    """A usable requested name lands as <name>.layer in the VMM's cwd."""
+    # The test owns its names: a stale target (an earlier aborted run)
+    # would trip the never-overwrite rule and fall back.
+    target = pathlib.Path.cwd() / expected
+    target.unlink(missing_ok=True)
+    vm = Vm(extra_args)
+    try:
+        vm.boot("named export boot")
+        vm.run("echo NAMED_MAGIC > /root/named.txt; echo WRITE\"\"_DONE", "WRITE_DONE")
+        vm.run(f"sandal-export {requested}", "Layer exported", count=1)
+        saved = re.findall(rb"Layer saved to: ([^\s\r]+)", vm.buf)
+    finally:
+        vm.close()
+    if not saved or saved[-1].decode() != expected:
+        raise AssertionError(
+            f"export: requested {requested!r}, saved {saved[-1:]!r}, want {expected!r}"
+        )
+    layer = pathlib.Path.cwd() / expected
+    if not layer.is_file():
+        raise AssertionError(f"export: {layer} was not created on the host")
+    validate_layer(layer, "/root/named.txt", b"NAMED_MAGIC")
+    layer.unlink()
+
+
+def phase_fallback_export(extra_args: list[str], requested: str) -> None:
+    """An unusable requested name (traversal, bad charset) falls back to
+    the content-addressed name and nothing named like the request lands
+    in the VMM's cwd."""
+    vm = Vm(extra_args)
+    try:
+        vm.boot("fallback export boot")
+        vm.run("echo FALLBACK_MAGIC > /root/fallback.txt; echo WRITE\"\"_DONE", "WRITE_DONE")
+        vm.run(f"sandal-export {requested}", "Layer exported", count=1)
+        saved = re.findall(rb"Layer saved to: ([^\s\r]+)", vm.buf)
+    finally:
+        vm.close()
+    if not saved:
+        raise AssertionError("export: the VMM never named a saved layer")
+    saved_name = saved[-1].decode()
+    if not re.fullmatch(r"layer-[0-9a-f]{16}\.layer", saved_name):
+        raise AssertionError(
+            f"export: requested {requested!r} saved as {saved_name!r} — "
+            "the content-addressed fallback did not fire"
+        )
+    if (pathlib.Path.cwd() / saved_name).is_file():
+        (pathlib.Path.cwd() / saved_name).unlink()
+    for p in pathlib.Path.cwd().glob("evil*"):
+        raise AssertionError(f"export: a traversal name escaped: {p}")
+
+
 def phase_load(layer: pathlib.Path, guest_path: str, marker: bytes) -> None:
     vm = Vm(["--disk-size", "64", "--layer", str(layer)])
     try:
@@ -135,6 +187,48 @@ def main() -> None:
         phase_load(disk_layer, guest_path, MARKER)
         print("load: booting with the tmpfs-mode layer...")
         phase_load(tmpfs_layer, guest_path, TMPFS_MARKER)
+
+        print("export (named): honoring a sanitized requested name...")
+        phase_named_export(["--disk-size", "64"], "foo.layer", "foo.layer")
+        print("export (named): .layer appended when missing...")
+        phase_named_export([], "mylayer", "mylayer.layer")
+        print("export (named): a traversal attempt falls back, nothing escapes...")
+        phase_fallback_export(["--disk-size", "64"], "../evil")
+
+        print("export (full): the specified layers + the upper, no base rootfs...")
+        vm = Vm(["--disk-size", "64", "--layer", str(disk_layer)])
+        try:
+            vm.boot("full boot")
+            vm.run(
+                'echo FULL_MAGIC > /root/full.txt; echo WRITE""_DONE',
+                "WRITE_DONE",
+            )
+            vm.run("sandal-export --full consolidated.layer", "Layer exported", count=1)
+            saved = re.findall(rb"Layer saved to: ([^\s\r]+)", vm.buf)
+        finally:
+            vm.close()
+        if not saved or saved[-1].decode() != "consolidated.layer":
+            raise AssertionError(
+                f"export full: saved {saved[-1:]!r}, want consolidated.layer"
+            )
+        layer = pathlib.Path.cwd() / "consolidated.layer"
+        import layer_ref
+
+        raw = layer.with_suffix(".tar")
+        raw.write_bytes(layer_ref.decompress_layer(layer))
+        with tarfile.open(raw, "r:") as tf:
+            names = [m.name.lstrip("./") for m in tf.getmembers()]
+        raw.unlink()
+        layer.unlink()
+        if "root/full.txt" not in names:
+            raise AssertionError(f"export full: the runtime file missing: {names}")
+        if "root/roundtrip.txt" not in names:
+            raise AssertionError(
+                f"export full: the specified layer's file missing: {names}"
+            )
+        if any(n == "bin" or n.startswith("bin/") or n == "usr" for n in names):
+            raise AssertionError("export full: the base rootfs leaked into the layer")
+        print("export (full): the layers + the upper, the base ignored: OK", flush=True)
 
 
 if __name__ == "__main__":

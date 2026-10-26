@@ -2517,6 +2517,10 @@ pub fn inject_tar_entries_ref(
         let path = format!("upper/{}", raw_path);
 
         match entry.entry_type {
+            TarEntryType::Whiteout => {
+                // A deletion marker relative to the base: nothing to
+                // inject into a fresh upper (its base is empty).
+            }
             TarEntryType::Directory => {
                 ensure_dir_path(image, &sb, &bgdt, &mut alloc, &path)?;
             }
@@ -2588,6 +2592,58 @@ pub fn read_upper_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
             }),
             S_IFLNK => out.push(TarEntry {
                 path: rel_path.to_string(),
+                mode,
+                entry_type: TarEntryType::Symlink,
+                link_target: String::from_utf8_lossy(&entry.data).into_owned(),
+                data: Vec::new(),
+            }),
+            // The overlayfs whiteout: a char 0:0 device in the upper —
+            // "this path is deleted relative to the base". Surfaced as
+            // Whiteout so the full-export merge can consume it.
+            S_IFCHR => out.push(TarEntry {
+                path: rel_path.to_string(),
+                mode,
+                entry_type: TarEntryType::Whiteout,
+                link_target: String::new(),
+                data: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// Read the ROOTFS image (vda, the overlay's lower/base) as tar entries
+/// with root-relative paths. The base side of the --full export's
+/// merge. Device nodes (the image's baked /dev, shadowed by devtmpfs
+/// at runtime) are skipped — they never belong in a layer.
+pub fn read_rootfs_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
+    let sb = Ext2Superblock::parse(image)?;
+    let bgdt = Ext2BgdTable::parse(image, &sb)?;
+    let mut out = Vec::new();
+
+    for entry in walk_ext2(image, &sb, &bgdt)? {
+        let mode = (entry.mode as u16) & 0o7777;
+        let file_type = (entry.mode as u16) & 0xF000;
+        match file_type {
+            S_IFDIR => out.push(TarEntry {
+                path: entry.path.clone(),
+                mode,
+                entry_type: TarEntryType::Directory,
+                link_target: String::new(),
+                data: Vec::new(),
+            }),
+            S_IFREG => out.push(TarEntry {
+                path: entry.path.clone(),
+                mode,
+                entry_type: TarEntryType::File,
+                link_target: String::new(),
+                data: entry.data,
+            }),
+            S_IFLNK => out.push(TarEntry {
+                path: entry.path.clone(),
                 mode,
                 entry_type: TarEntryType::Symlink,
                 link_target: String::from_utf8_lossy(&entry.data).into_owned(),
@@ -2754,9 +2810,11 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         0o755,
     )?;
 
-    // Export helpers: resize + done signal binaries, and the sandal-export
-    // script. Used by the guest `sandal-export [path]` command to turn the
-    // overlay upper directory into a host-side gzip-compressed .layer file.
+    // Export helpers: the resize + done signal binaries, and
+    // sandal-export itself (the Rust export flow: the overlay-upper
+    // walk, the ustar onto the export device, the resize/done signals).
+    // Used by the guest `sandal-export [name]` command to turn the
+    // overlay upper directory into a host-side .layer file.
     inject_file(
         image,
         &sb,
@@ -2775,6 +2833,15 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         initramfs::tools::bin::export_done_helper(),
         0o755,
     )?;
+    inject_file(
+        image,
+        &sb,
+        &bgdt,
+        &mut alloc,
+        "usr/sbin/sandal-export",
+        initramfs::tools::bin::export_helper(),
+        0o755,
+    )?;
     // The exit protocol helper: the init script runs `sandal-exit <status>`
     // once the session is reaped — a /dev/mem MMIO store of
     // `EXIT_PORT | (code << 16)` to the hypercall page (marker-free exit
@@ -2788,16 +2855,6 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         &mut alloc,
         "usr/sbin/sandal-exit",
         initramfs::tools::bin::sandal_exit_helper(),
-        0o755,
-    )?;
-    let export_script = initramfs::generate_export_script();
-    inject_file(
-        image,
-        &sb,
-        &bgdt,
-        &mut alloc,
-        "usr/sbin/sandal-export",
-        export_script.as_bytes(),
         0o755,
     )?;
 

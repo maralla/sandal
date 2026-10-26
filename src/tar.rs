@@ -13,6 +13,10 @@ pub enum TarEntryType {
     File,
     Directory,
     Symlink,
+    /// An overlayfs whiteout (a char 0:0 device in the upper): "this
+    /// path is deleted relative to the base". The export's merge
+    /// consumes it; the serializer never writes it.
+    Whiteout,
 }
 
 /// A single entry in a tar archive.
@@ -190,11 +194,19 @@ pub fn find_tar_end(data: &[u8]) -> usize {
 pub fn write_tar(entries: &[TarEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
+        // Whiteouts are the merge's own currency: consumed where the
+        // entries were assembled, never serialized.
+        if e.entry_type == TarEntryType::Whiteout {
+            continue;
+        }
         let (name, prefix) = split_ustar_path(&e.path);
         let typeflag = match e.entry_type {
             TarEntryType::File => b'0',
             TarEntryType::Directory => b'5',
             TarEntryType::Symlink => b'2',
+            // Unreachable: the whiteouts are consumed where the entries
+            // are assembled (the merge) and skipped above.
+            TarEntryType::Whiteout => unreachable!(),
         };
         let link = e.link_target.as_bytes();
         let size = if e.entry_type == TarEntryType::File {

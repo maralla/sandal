@@ -34,6 +34,16 @@ pub fn export_done_helper() -> &'static [u8] {
     EXPORT_DONE
 }
 
+/// The compiled `sandal-export` guest binary (the whole export flow:
+/// the upper walk, the ustar, the resize/done signals — the busybox
+/// script it replaced is gone).
+pub static EXPORT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/export.bin"));
+
+/// The compiled `sandal-export` guest binary.
+pub fn export_helper() -> &'static [u8] {
+    EXPORT
+}
+
 /// The compiled `sandal-exit` guest binary (the exit protocol: the
 /// /dev/mem store of `EXIT_PORT | (code << 16)`). x86_64 only — the
 /// aarch64 init's session exit rides the EXIT BRK from vsockd itself.

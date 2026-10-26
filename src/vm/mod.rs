@@ -491,6 +491,9 @@ struct Vmm {
     device_threads: Option<crate::vm::windows::DeviceThreads>,
     blk: Option<VirtioBlkDevice>,
     data_blk: Option<VirtioBlkDevice>,
+    /// The specified layer archives' paths (the --full export's
+    /// consolidation inputs; re-read at export time).
+    layer_paths: Vec<PathBuf>,
     /// Net device behind a mutex: the Linux net-kick thread pumps the
     /// backend and raises the net IRQ independently of the run loop (an
     /// idle guest would otherwise wait for its own delayed-ACK exit before
@@ -647,6 +650,13 @@ const SCRIPT_TRAILER_MAGIC: &[u8; 16] = b"VSOCKD:EXIT:01\n\0";
 /// the trailer's last byte is its exit status. The last 17 bytes are
 /// withheld from the stream until EOF, so the trailer is verified whole
 /// and never displayed.
+///
+/// The guest's output is LF-only (its stdout is a socket — no tty line
+/// discipline), and the VMM runs the host terminal raw (the session
+/// console needs OPOST off): left alone, every line staircases. On a
+/// terminal the stream is translated LF→CRLF statefully (an existing
+/// CRLF never doubles) — exactly the kernel's ONLCR, which the raw
+/// mode disabled. Piped output stays byte-exact.
 fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
     let port_num: u16 = port
         .rsplit_once(':')
@@ -662,8 +672,29 @@ fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
     stream.write_all(&hdr)?;
     stream.write_all(script)?;
 
+    // The host stdout's own line discipline was disabled by the VMM's
+    // raw-mode setup; a terminal needs the translation back.
+    let to_tty = unsafe { libc::isatty(1) == 1 };
+    let mut last_was_cr = false;
+    let mut emit = |out: &mut std::io::Stdout, chunk: &[u8], last_was_cr: &mut bool| {
+        if !to_tty {
+            let _ = out.write_all(chunk);
+            return;
+        }
+        let mut translated = Vec::with_capacity(chunk.len() + 8);
+        for &b in chunk {
+            if b == b'\n' && !*last_was_cr {
+                translated.push(b'\r');
+            }
+            *last_was_cr = b == b'\r';
+            translated.push(b);
+        }
+        let _ = out.write_all(&translated);
+    };
+
     let mut tail: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
+    let mut out = std::io::stdout();
     loop {
         let n = std::io::Read::read(&mut stream, &mut chunk)?;
         if n == 0 {
@@ -672,7 +703,7 @@ fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
         tail.extend_from_slice(&chunk[..n]);
         if tail.len() > SCRIPT_TRAILER_MAGIC.len() + 1 {
             let cut = tail.len() - SCRIPT_TRAILER_MAGIC.len() - 1;
-            std::io::stdout().write_all(&tail[..cut])?;
+            emit(&mut out, &tail[..cut], &mut last_was_cr);
             tail.drain(..cut);
         }
         // The trailer IS the run's end: the guest writes it, closes the
@@ -686,7 +717,7 @@ fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
             break;
         }
     }
-    std::io::stdout().flush()?;
+    out.flush()?;
 
     if tail.len() != SCRIPT_TRAILER_MAGIC.len() + 1
         || &tail[..SCRIPT_TRAILER_MAGIC.len()] != SCRIPT_TRAILER_MAGIC
@@ -1198,6 +1229,7 @@ impl Vmm {
             device_threads: None,
             blk: None,
             data_blk: None,
+            layer_paths: args.layers.clone(),
             #[cfg(not(target_os = "windows"))]
             net,
             rng: Some(VirtioRngDevice::new()),
@@ -1429,11 +1461,109 @@ impl Drop for Vmm {
 /// /tmp rides the overlay root (it shares the data disk), so without
 /// this filter every export would carry the guest's scratch — the
 /// invariant: sandal-export NEVER delivers /tmp content.
+/// The overlay-upper marker file that carries the guest's requested
+/// layer name (see export.sh): consumed by the export, filtered from
+/// the layer content.
+const LAYER_NAME_MARKER: &str = ".sandal-layer-name";
+
+/// Pull the requested layer name out of the export entries: the marker
+/// file's content IS the name; the marker itself never reaches the
+/// layer.
+fn take_requested_layer_name(
+    entries: Vec<crate::tar::TarEntry>,
+) -> (Option<String>, Vec<crate::tar::TarEntry>) {
+    let mut name = None;
+    let mut kept = Vec::with_capacity(entries.len());
+    for e in entries {
+        if name.is_none() && e.path.trim_start_matches("./") == LAYER_NAME_MARKER {
+            name = Some(String::from_utf8_lossy(&e.data).trim().to_string());
+        } else {
+            kept.push(e);
+        }
+    }
+    (name, kept)
+}
+
+/// The --full consolidation: the specified layers (in command-line
+/// order, the later shadowing the earlier) under the current upper —
+/// the upper's files replace the layers', its whiteouts delete layer
+/// paths, its dirs merge over them. The BASE ROOTFS IS IGNORED: the
+/// layer = the specified layers + the runtime state, consolidated, the
+/// ignore rules applied by the caller's filter.
+fn merge_full_entries(
+    layers: Vec<Vec<crate::tar::TarEntry>>,
+    upper: Vec<crate::tar::TarEntry>,
+) -> Vec<crate::tar::TarEntry> {
+    use std::collections::BTreeMap;
+
+    fn apply(map: &mut BTreeMap<String, crate::tar::TarEntry>, e: crate::tar::TarEntry) {
+        let path = e.path.trim_start_matches("./").to_string();
+        match e.entry_type {
+            // The deletion: the path and its whole subtree drop.
+            crate::tar::TarEntryType::Whiteout => {
+                let prefix = format!("{path}/");
+                map.retain(|k, _| k != &path && !k.starts_with(&prefix));
+            }
+            // A file replaces the path and any directory subtree under
+            // it (the overlay's own shadowing rule).
+            crate::tar::TarEntryType::File => {
+                let prefix = format!("{path}/");
+                map.retain(|k, _| !k.starts_with(&prefix));
+                map.insert(path, e);
+            }
+            // A dir/symlink shadows the same path; the base's children
+            // of a dir merge through (the overlay's own dir semantics).
+            _ => {
+                map.insert(path, e);
+            }
+        }
+    }
+
+    let mut map: BTreeMap<String, crate::tar::TarEntry> = BTreeMap::new();
+    for layer in layers {
+        for e in layer {
+            apply(&mut map, e);
+        }
+    }
+    for e in upper {
+        apply(&mut map, e);
+    }
+    map.into_values().collect()
+}
+
+/// Sanitize a guest-requested layer name: a single path component, a
+/// strict charset, at most 64 bytes, `.layer` appended when missing.
+/// Anything else is unusable — the guest never names a host path
+/// directly, so no separator, no dot-prefix, no traversal ever lands.
+fn sanitize_layer_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return None;
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    if name.starts_with('-') || name.starts_with('.') {
+        return None;
+    }
+    Some(if name.ends_with(".layer") {
+        name.to_string()
+    } else {
+        format!("{name}.layer")
+    })
+}
+
 fn filter_export_entries(entries: Vec<crate::tar::TarEntry>) -> Vec<crate::tar::TarEntry> {
     let mut entries = entries;
     entries.retain(|e| {
         let p = e.path.trim_start_matches("./");
-        !p.ends_with("/.ash_history") && p != "tmp" && !p.starts_with("tmp/")
+        !p.ends_with("/.ash_history")
+            && p != "tmp"
+            && !p.starts_with("tmp/")
+            && p != LAYER_NAME_MARKER
     });
     entries
 }
@@ -1609,11 +1739,13 @@ impl Vmm {
                 // numbers are the shared "SanDal N" signals (initramfs.rs).
                 const RESIZE: u16 = initramfs::EXPORT_RESIZE_IMM as u16;
                 const DONE: u16 = initramfs::EXPORT_DONE_IMM as u16;
+                const DONE_FULL: u16 = initramfs::EXPORT_DONE_FULL_IMM as u16;
                 const EXIT: u16 = initramfs::EXIT_IMM as u16;
                 const READY: u16 = initramfs::VSOCKD_READY_IMM as u16;
                 match val as u16 {
                     RESIZE => self.handle_export_resize(),
-                    DONE => self.handle_export_done(),
+                    DONE => self.handle_export_done(false),
+                    DONE_FULL => self.handle_export_done(true),
                     // The exit protocol: the low half selects the signal,
                     // the high half carries the session's exit code (the
                     // init script's `sandal-exit <status>` helper).
@@ -1662,14 +1794,25 @@ impl Vmm {
         dev.interrupt_status |= crate::virtio::VIRTIO_MMIO_INT_CONFIG;
     }
 
-    /// `export done`: turn the guest's overlay upper tree into a
-    /// zstd-compressed `.layer` file on the host.
+    /// `export done`: turn the export into a zstd-compressed `.layer`
+    /// file on the host.
     ///
+    /// The upper side (the export's payload):
     /// Disk mode: the data disk is an ext2 image; its `upper/` subtree is
     /// extracted and serialized as a ustar archive.
     /// Tmpfs mode: the guest wrote an uncompressed tar to the raw device.
-    fn handle_export_done(&mut self) {
-        log::info!("export: DONE hypercall (the default content-addressed name)");
+    ///
+    /// `full`: merge the SPECIFIED layers (the command line's --layer
+    /// archives) with the upper into one consolidated layer — the upper
+    /// shadows the layers, its whiteouts delete layer paths. `false`:
+    /// the upper alone (the diff, whiteouts included). The base rootfs
+    /// is ignored either way.
+    ///
+    /// The saved name: the guest's requested one (the `.sandal-layer-name`
+    /// marker in the upper, sanitized hard, never overwriting) or the
+    /// content-addressed default.
+    fn handle_export_done(&mut self, full: bool) {
+        log::info!("export: DONE hypercall (full={full})");
         let Some(dev) = self.data_blk.as_mut() else {
             log::warn!("export done: no data disk");
             return;
@@ -1681,28 +1824,93 @@ impl Vmm {
         // (it is exactly the copy the boot path skipped).
         dev.flatten_sparse();
 
-        let tar_data =
-            match crate::ext2::read_upper_tar_entries(&dev.disk_image).map(filter_export_entries) {
-                Ok(entries) if !entries.is_empty() => crate::tar::write_tar(&entries),
-                _ => {
-                    // Fall back to a raw tar the guest wrote to the device
-                    // (tmpfs-mode export). Parse and re-serialize so the shell
-                    // history filter above applies to this path too; if the tar
-                    // is not parseable, forward it verbatim.
-                    let end = crate::tar::find_tar_end(&dev.disk_image);
-                    if end == 0 {
-                        log::warn!("export done: no exportable data found");
-                        console_eprintln("sandal: export failed: no exportable data found");
-                        return;
-                    }
-                    let raw = &dev.disk_image[..end];
-                    match crate::tar::read_tar(raw) {
-                        Ok(entries) => crate::tar::write_tar(&filter_export_entries(entries)),
-                        Err(_) => raw.to_vec(),
-                    }
+        // The upper side, both export modes: the ext2 upper (disk mode)
+        // or the guest's raw tar (tmpfs mode). The name marker rides the
+        // entries in either.
+        let mut requested_name: Option<String> = None;
+        let mut upper_entries: Option<Vec<crate::tar::TarEntry>> = None;
+        let mut raw_tar: Option<Vec<u8>> = None;
+        match crate::ext2::read_upper_tar_entries(&dev.disk_image) {
+            Ok(entries) if !entries.is_empty() => {
+                let (name, entries) = take_requested_layer_name(entries);
+                if requested_name.is_none() {
+                    requested_name = name;
                 }
-            };
+                upper_entries = Some(entries);
+            }
+            _ => {
+                // Fall back to a raw tar the guest wrote to the device
+                // (tmpfs-mode export). Parsed and re-serialized below so
+                // the shell history filter applies to this path too.
+                let end = crate::tar::find_tar_end(&dev.disk_image);
+                if end == 0 {
+                    log::warn!("export done: no exportable data found");
+                    console_eprintln("sandal: export failed: no exportable data found");
+                    return;
+                }
+                raw_tar = Some(dev.disk_image[..end].to_vec());
+            }
+        }
 
+        let mut entries = match (upper_entries, raw_tar) {
+            (Some(entries), _) => entries,
+            (None, Some(raw)) => match crate::tar::read_tar(&raw) {
+                Ok(entries) => {
+                    let (name, entries) = take_requested_layer_name(entries);
+                    if requested_name.is_none() {
+                        requested_name = name;
+                    }
+                    entries
+                }
+                // Not parseable: forward it verbatim — nothing
+                // user-output can ever act as the protocol.
+                Err(_) => {
+                    return self.save_export_layer(raw.to_vec(), None);
+                }
+            },
+            (None, None) => unreachable!(),
+        };
+
+        if full {
+            // The consolidation: the SPECIFIED layers (in command-line
+            // order, the later shadowing the earlier) under the current
+            // upper — the upper's files replace the layers', its
+            // whiteouts delete layer paths, its dirs merge. The base
+            // rootfs is ignored: the layer = the layers + the runtime
+            // state, consolidated, the ignore rules applied below.
+            let mut layers = Vec::new();
+            for path in &self.layer_paths {
+                match std::fs::read(path)
+                    .map_err(|e| anyhow!("read: {e}"))
+                    .and_then(|zst| crate::tar::read_tar_zst_ref(&zst))
+                {
+                    Ok((tar_data, refs)) => layers.push(
+                        refs.into_iter()
+                            .map(|r| crate::tar::TarEntry {
+                                path: r.path,
+                                mode: r.mode,
+                                entry_type: r.entry_type,
+                                link_target: r.link_target,
+                                data: tar_data[r.data].to_vec(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Err(e) => console_eprintln(&format!(
+                        "sandal: export full: layer {} unreadable: {e}",
+                        path.display()
+                    )),
+                }
+            }
+            entries = merge_full_entries(layers, entries);
+        }
+
+        let tar_data = crate::tar::write_tar(&filter_export_entries(entries));
+        self.save_export_layer(tar_data, requested_name.as_deref());
+    }
+
+    /// Compress + save the layer payload under the requested (sanitized)
+    /// or the content-addressed name.
+    fn save_export_layer(&self, tar_data: Vec<u8>, requested_name: Option<&str>) {
         // The chunked container: compression parallelizes across cores
         // too (see crate::zchunk) — the export's slow direction.
         let layer_data = match crate::zchunk::compress_chunked(&tar_data, 3) {
@@ -1712,15 +1920,36 @@ impl Vmm {
                 return;
             }
         };
-
-        // The default content-addressed name, always: the output path is
-        // never sent from the guest (the dedicated console port whose
-        // whole stream was the path is gone), the operator renames from
-        // the log line below, and nothing user-output can ever act as the
-        // protocol.
-        let mut hasher = DefaultHasher::new();
-        layer_data.hash(&mut hasher);
-        let save_path = PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()));
+        let content_addressed = |layer_data: &[u8]| {
+            let mut hasher = DefaultHasher::new();
+            layer_data.hash(&mut hasher);
+            PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()))
+        };
+        let save_path = match requested_name.as_deref() {
+            Some(raw) => match sanitize_layer_name(raw) {
+                Some(name) => {
+                    let path = PathBuf::from(&name);
+                    if path.exists() {
+                        console_eprintln(&format!(
+                            "sandal: export: {} exists; using the content-addressed name",
+                            name
+                        ));
+                        content_addressed(&layer_data)
+                    } else {
+                        path
+                    }
+                }
+                None => {
+                    console_eprintln(&format!(
+                        "sandal: export: the requested layer name {:?} is not usable; \
+                         using the content-addressed name",
+                        raw
+                    ));
+                    content_addressed(&layer_data)
+                }
+            },
+            None => content_addressed(&layer_data),
+        };
 
         match fs::write(&save_path, &layer_data) {
             Ok(()) => console_eprintln(&format!("Layer saved to: {}", save_path.display())),
