@@ -478,6 +478,10 @@ struct Vmm {
     /// x86_64: base of the MMIO device window (above the guest RAM).
     #[cfg(target_arch = "x86_64")]
     mmio_base: u64,
+    /// x86_64: the emulated 8250's register file (the printk console's
+    /// port — see Vmm::uart_pio).
+    #[cfg(target_arch = "x86_64")]
+    uart_regs: [u8; 8],
 
     /// Windows: the HLT park for the run loop + the device-thread wake.
     #[cfg(target_os = "windows")]
@@ -1086,6 +1090,8 @@ impl Vmm {
             gic: Gic::new(),
             #[cfg(target_arch = "x86_64")]
             mmio_base,
+            #[cfg(target_arch = "x86_64")]
+            uart_regs: [0u8; 8],
             #[cfg(target_os = "windows")]
             halt: Arc::new(crate::hypervisor::whp::HaltWaker::default()),
             #[cfg(target_os = "windows")]

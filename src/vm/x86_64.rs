@@ -250,8 +250,14 @@ impl Vmm {
         // loglevel=3: the pane is the user's console, not a kernel log —
         // probe noise (i8042, WMI, ...) stays in dmesg, not on screen.
         // (err-level and below are hidden; emerg/alert/crit still show.)
+        // No virtio-console device: the session transport is vsock. The
+        // printk console is the SERIAL port (console=ttyS0): the VMM's 8250
+        // stub serves LSR=TX-ready and either mirrors the bytes at -v or
+        // absorbs them — kernel messages never ride the session stream.
+        // The earlycon carries the earliest boot output and hands over to
+        // ttyS0 when the driver comes up.
         let mut cmdline = String::from(
-            "console=hvc0 earlycon=uart8250,io,0x3f8 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on",
+            "earlycon=uart8250,io,0x3f8 console=ttyS0 root=/dev/vda rw init=/init loglevel=3 random.trust_cpu=on",
         );
         let mb = self.mmio_base;
         // The virtiofs pushes below are Unix-only; on Windows the vec
@@ -474,16 +480,7 @@ impl Vmm {
     #[cfg(target_arch = "x86_64")]
     pub(super) fn handle_pio(&mut self, port: u16, len: usize, is_write: bool, value: u64) {
         if (SERIAL_BASE..SERIAL_BASE + 8).contains(&port) {
-            if is_write {
-                // THR: absorb (verbose mode mirrors the HVF PL011 stub).
-                if port == SERIAL_BASE && self.verbose_uart {
-                    eprint!("{}", (value & 0xff) as u8 as char);
-                }
-            } else {
-                // IN: LSR reads report TX ready; everything else reads 0.
-                let val: u64 = if port == SERIAL_BASE + 5 { 0x60 } else { 0 };
-                self.vcpu.fill_io_read(self.vcpu.io_data_offset(), len, val);
-            }
+            self.uart_pio(port - SERIAL_BASE, is_write, value, len);
             return;
         }
         // Rate-limit: some probes (PCI conf, i8042, RTC) poll repeatedly.
@@ -499,6 +496,63 @@ impl Vmm {
                 if is_write { "write" } else { "read" }
             );
         }
+    }
+
+    /// The 8250 stub: a register file with just enough semantics for the
+    /// kernel's autoconfig to classify the port as a 16550A and drive it
+    /// as the printk console. The tty layer and /dev/console then work
+    /// (the guest's init gets a working system console on the serial).
+    ///
+    /// Semantics served:
+    ///   - the data registers store what is written (IER, DLL/DLM, SCR,
+    ///     the divisor...), so the IER read-back test and the divisor
+    ///     setup behave;
+    ///   - LSR reads 0x60 (TX ready, no RX data) — the console's polled
+    ///     transmit loop;
+    ///   - MSR echoes MCR in loopback mode (RTS→CTS, DTR→DSR, OUT1→RI,
+    ///     OUT2→DCD) — the autoconfig's port-presence test;
+    ///   - IIR reports the FIFO-enabled idle state (0xc1) once FCR bit0
+    ///     is set, 0x01 otherwise — the FIFO classification probe.
+    fn uart_pio(&mut self, off: u16, is_write: bool, value: u64, len: usize) {
+        const LSR: u16 = 5;
+        const MSR: u16 = 6;
+        const IIR: u16 = 2;
+        const MCR: u16 = 4;
+        const FCR: u16 = 2; // IIR and FCR share the slot (as in hardware)
+
+        if is_write {
+            if off == 0 && self.verbose_uart {
+                // THR: absorb (verbose mode mirrors the HVF PL011 stub).
+                eprint!("{}", (value & 0xff) as u8 as char);
+            }
+            self.uart_regs[(off & 7) as usize] = (value & 0xff) as u8;
+            return;
+        }
+
+        let val: u64 = match off & 7 {
+            LSR => 0x60, // THRE | TEMT: the transmitter is always ready
+            MSR => {
+                // The modem inputs: floating (0) unless the UART is in
+                // loopback mode, where the modem outputs echo back.
+                let mcr = self.uart_regs[MCR as usize] as u64;
+                if mcr & 0x10 != 0 {
+                    let rts_dtr = (mcr & 0x03) << 4; // RTS→CTS, DTR→DSR
+                    let out12 = (mcr & 0x0c) << 4; // OUT1→RI, OUT2→DCD
+                    rts_dtr | out12
+                } else {
+                    0
+                }
+            }
+            IIR => {
+                if self.uart_regs[FCR as usize] & 0x01 != 0 {
+                    0xc1 // the FIFO enabled, no interrupt pending
+                } else {
+                    0x01
+                }
+            }
+            other => self.uart_regs[other as usize] as u64,
+        };
+        self.vcpu.fill_io_read(self.vcpu.io_data_offset(), len, val);
     }
 }
 

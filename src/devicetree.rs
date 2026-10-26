@@ -41,7 +41,6 @@ impl DeviceTree {
         data_blk: Option<(u64, u32)>,
         virtio_rng: Option<(u64, u32)>,
         virtiofs: &[(u64, u32)],
-        virtio_console: Option<(u64, u32)>,
         verbose: bool,
         overlay_bootarg: Option<&str>,
         rng_seed: Option<&[u8]>,
@@ -60,11 +59,15 @@ impl DeviceTree {
         // Chosen node (boot arguments)
         dt.begin_node("chosen");
         {
-            // earlycon=pl011 for early boot / panic messages on the MMIO UART.
-            // console=hvc0 makes the virtio-console the primary interactive console.
+            // earlycon=pl011 for the earliest boot output; console=ttyAMA0
+            // is the printk console — both ride the MMIO UART, whose VMM
+            // stub mirrors the bytes at -v or absorbs them (kernel
+            // messages never ride the session stream — vsock is the
+            // session transport). The PL011 node carries its fixed 24MHz
+            // clocks so the driver probes and ttyAMA0 comes up.
             // random.trust_bootloader=on: seed CRNG at boot so getrandom() never blocks.
             // random.trust_cpu=on: trust CPU RNG (RNDR on ARMv8.5+) as additional entropy.
-            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=hvc0 random.trust_bootloader=on random.trust_cpu=on nohz=off highres=off";
+            let earlycon = "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0 random.trust_bootloader=on random.trust_cpu=on nohz=off highres=off";
             let rootfs = if virtio_blk.is_some() {
                 " root=/dev/vda rw init=/init"
             } else {
@@ -220,11 +223,6 @@ impl DeviceTree {
 
         // Virtiofs MMIO nodes (shared directories)
         for &(base, spi) in virtiofs {
-            Self::virtio_mmio_node(&mut dt, base, spi);
-        }
-
-        // Virtio-console MMIO node (interactive terminal I/O — hvc0)
-        if let Some((base, spi)) = virtio_console {
             Self::virtio_mmio_node(&mut dt, base, spi);
         }
 
