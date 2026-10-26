@@ -33,9 +33,14 @@ fn panic_handler(_: &core::panic::PanicInfo) -> ! {
 
 // ── mode 0x01: the one-shot ─────────────────────────────────────────
 //
-// The command runs as a grandchild with the connection as its stdio;
-// the child waits and writes the trailer (the BLOCKING fd: the write
-// blocks until it lands — the kernel does the pacing).
+// The command runs as a grandchild with the connection as its
+// stdout/stderr; stdin is /dev/null — the harness never writes after
+// the payload, so a command that reads stdin (a bare `grep`/`cat`, or
+// one whose command substitution collapsed to no file arguments)
+// would block on the socket forever: no trailer, no close, and the
+// caller hangs until its own timeout. The child waits and writes the
+// trailer (the BLOCKING fd: the write blocks until it lands — the
+// kernel does the pacing).
 
 fn mode_oneshot(conn: i32, cmd: &[u8], envp: usize) {
     let _ = rt_sigaction(SIGCHLD, SIG_DFL);
@@ -47,10 +52,19 @@ fn mode_oneshot(conn: i32, cmd: &[u8], envp: usize) {
         exit(124);
     }
     if pid == 0 {
-        // the grandchild: the connection IS its stdio
-        let _ = dup3(conn, 0);
+        // the grandchild: the connection is its stdout/stderr; stdin
+        // is /dev/null (see the mode header)
         let _ = dup3(conn, 1);
         let _ = dup3(conn, 2);
+        let null = open(b"/dev/null\0", O_RDWR, 0);
+        if null >= 0 {
+            let _ = dup3(null, 0);
+            if null > 2 {
+                let _ = close(null);
+            }
+        } else {
+            let _ = close(0);
+        }
         if conn > 2 {
             let _ = close(conn);
         }
@@ -290,6 +304,10 @@ fn child(conn: i32, envp: usize) {
     let mut cmd = [0u8; CMD_MAX + 1];
 
     debug_event(0x1);
+    // The header and the command ride one transport packet the moment
+    // the connection is bridged; a plain blocking read is the whole
+    // contract (the stall that once motivated a deadline here was the
+    // stdin-owns-the-socket hang below, not a lost setup race).
     read_whole(conn, &mut hdr);
     let mode = hdr[0] as usize;
     let rows = u16::from_le_bytes([hdr[1], hdr[2]]) as u32;

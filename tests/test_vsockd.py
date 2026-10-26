@@ -176,7 +176,22 @@ def main() -> None:
             raise AssertionError(f"the spoof probe failed: {status}, {out[-40:]!r}")
         print("vsockd: the trailer is the child's, not the output's: OK", flush=True)
 
-        # ── 3. Concurrent connections ───────────────────────────────
+        # ── 3. stdin is /dev/null ───────────────────────────────────
+        # The harness never writes after the payload, so a command that
+        # reads stdin with the connection as its stdin would block
+        # forever: no trailer, no EOF, and the caller hangs until its
+        # own timeout (the qa-0 stall of 2026-10-26: a grep whose
+        # command substitution collapsed to no file arguments). stdin
+        # is /dev/null — a bare `cat` sees EOF at once and the trailer
+        # still carries the command's own exit status.
+        out, status = vsockd_run(PORT, "cat; echo stdin-eof=$?", CMD_DEADLINE)
+        if status != 0 or b"stdin-eof=0" not in out:
+            raise AssertionError(
+                f"stdin is not /dev/null: status {status}, {out[-200:]!r}"
+            )
+        print("vsockd: stdin is /dev/null (bare cat EOFs): OK", flush=True)
+
+        # ── 4. Concurrent connections ───────────────────────────────
         # Many commands at once, each its own attributed stream: the
         # fork-per-connection design, measured as a wall-clock win over
         # serial execution (each command sleeps 2 s; four concurrent
@@ -208,7 +223,7 @@ def main() -> None:
             f"vsockd: 4 concurrent commands in {elapsed:.1f}s: OK", flush=True
         )
 
-        # ── 4. The throughput ───────────────────────────────────────
+        # ── 5. The throughput ─────────────────────────────────────
         # (DROPPED: the command execution line is a CONTROL PLANE by
         # design — bulk goes to virtio-fs/blk, never this channel. The
         # outbox is window-capped per round — the advertised window
@@ -218,7 +233,7 @@ def main() -> None:
         # chain's own gate. The control plane's own pace is measured
         # above: verbatim output, four concurrent commands in 2.0 s.)
 
-        # ── 5. The interactive pty (mode 0x02) ─────────────────────
+        # ── 6. The interactive pty (mode 0x02) ─────────────────────
         # The pty's REAL semantics, verified at the boundary the kernel
         # allows, in ONE session (the session must END for the trailer:
         # the reaper's status is the only EOF there is): the input echo
@@ -248,7 +263,7 @@ def main() -> None:
             flush=True,
         )
 
-        # ── 6. The teardown ─────────────────────────────────
+        # ── 7. The teardown ─────────────────────────────────
         # The clients closed above (every vsockd_run closes its socket);
         # the child per connection exited (auto-reaped); the accept loop
         # survives and serves again — one more command after the storm.
@@ -291,6 +306,16 @@ def main_daemon() -> None:
         if status != 0 or b"daemon-mode" not in out:
             raise AssertionError(f"the daemon refused a command: {status}, {out[-200:]!r}")
         print("vsockd: the daemon serves the port: OK", flush=True)
+
+        # The daemon path gets the same stdin contract: a bare `cat`
+        # (stdin reader, no file arguments) must EOF, not park on the
+        # socket until the caller's timeout.
+        out, status = vsockd_run(DAEMON_PORT, "cat; echo daemon-stdin=$?", 30)
+        if status != 0 or b"daemon-stdin=0" not in out:
+            raise AssertionError(
+                f"the daemon's stdin is not /dev/null: {status}, {out[-200:]!r}"
+            )
+        print("vsockd: the daemon's stdin is /dev/null: OK", flush=True)
 
         # Concurrent commands, one connection each — the same line the
         # session-shaped VM serves, now with no session at all.
