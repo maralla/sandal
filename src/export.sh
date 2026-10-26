@@ -47,7 +47,10 @@ while [ "$N" -lt 10 ]; do
 done
 
 # Write tar archive to {DATA_DEV} (uncompressed — VMM will zstd-compress it).
-tar cf - -C "$UPPER" . > {DATA_DEV} 2>/dev/null
+# tmp/ rides the overlay upper (it shares the data disk) — it is
+# workspace scratch and must NEVER be exported; excluded here and
+# filtered again VMM-side (handle_export_done) so no path can leak it.
+tar cf - -C "$UPPER" --exclude=./tmp --exclude=tmp . > {DATA_DEV} 2>/dev/null
 
 # Signal VMM that tar data is ready.
 /usr/sbin/sandal-export-done 2>/dev/null

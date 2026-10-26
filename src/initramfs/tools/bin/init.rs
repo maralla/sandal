@@ -252,10 +252,11 @@ fn network_up() {
 #[no_mangle]
 pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     // ── Phase 1: the essential mounts ────────────────────────────────
+    // (No /tmp mount: /tmp rides the overlay root — in disk mode it
+    // shares the data disk instead of a fixed half-RAM tmpfs.)
     let _ = mount(S_PROC, S_PROC_PATH, S_PROC, 0, 0);
     let _ = mount(S_SYSFS, S_SYS_PATH, S_SYSFS, 0, 0);
     let _ = mount(S_DEVTMPFS, S_DEV_PATH, S_DEVTMPFS, 0, 0);
-    let _ = mount(S_TMPFS, S_TMP_PATH, S_TMPFS, 0, 0);
 
     // ── The run configuration ────────────────────────────────────────
     let c = config_load();
@@ -309,7 +310,11 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     let _ = mount(S_PROC, S_PROC_PATH, S_PROC, 0, 0);
     let _ = mount(S_SYSFS, S_SYS_PATH, S_SYSFS, 0, 0);
     let _ = mount(S_DEVTMPFS, S_DEV_PATH, S_DEVTMPFS, 0, 0);
-    let _ = mount(S_TMPFS, S_TMP_PATH, S_TMPFS, 0, 0);
+
+    // /tmp is NOT overmounted: it rides the overlay root (the data disk
+    // in disk mode). Workspace scratch — the export filters tmp/ out of
+    // every layer (handle_export_done).
+    let _ = chmod(S_TMP_PATH, 0o1777);
 
     // /dev/fd and /dev/std*: alias to the per-process /proc/self/fd.
     let _ = symlink(b"/proc/self/fd\0", b"/dev/fd\0");

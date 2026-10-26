@@ -78,6 +78,7 @@ pub mod nr {
     pub const MKDIRAT: usize = 258;
     pub const SYMLINKAT: usize = 266;
     pub const CHDIR: usize = 80;
+    pub const FCHMODAT: usize = 268;
     pub const CLOCK_SETTIME: usize = 228;
     pub const PIVOT_ROOT: usize = 217;
     pub const REBOOT: usize = 169;
@@ -109,6 +110,7 @@ pub mod nr {
     pub const MKDIRAT: usize = 34;
     pub const SYMLINKAT: usize = 36;
     pub const CHDIR: usize = 49;
+    pub const FCHMODAT: usize = 53;
     pub const CLOCK_SETTIME: usize = 113;
     pub const PIVOT_ROOT: usize = 151;
     pub const REBOOT: usize = 142;
@@ -272,6 +274,17 @@ pub fn symlink(target: &[u8], link: &[u8]) -> isize {
         AT_FDCWD,
         link.as_ptr() as usize,
         0,
+        0,
+        0,
+    ])
+}
+
+pub fn chmod(path: &[u8], mode: u32) -> isize {
+    syscall(nr::FCHMODAT, [
+        AT_FDCWD,
+        path.as_ptr() as usize,
+        mode as usize,
+        0, // no AT_SYMLINK_NOFOLLOW: the init's paths are real
         0,
         0,
     ])

@@ -1323,6 +1323,20 @@ impl Drop for Vmm {
 // Device dispatch (MMIO) — both architectures share the virtio-MMIO layout;
 // the GIC (arm64) and the hypercall page (x86_64) are arch-specific.
 // ─────────────────────────────────────────────────────────────────────────────
+/// The layer carries WORKSPACE data, never session state: the shell
+/// history and the /tmp scratch are filtered out of every export.
+/// /tmp rides the overlay root (it shares the data disk), so without
+/// this filter every export would carry the guest's scratch — the
+/// invariant: sandal-export NEVER delivers /tmp content.
+fn filter_export_entries(entries: Vec<crate::tar::TarEntry>) -> Vec<crate::tar::TarEntry> {
+    let mut entries = entries;
+    entries.retain(|e| {
+        let p = e.path.trim_start_matches("./");
+        !p.ends_with("/.ash_history") && p != "tmp" && !p.starts_with("tmp/")
+    });
+    entries
+}
+
 impl Vmm {
     fn mmio_read(&mut self, addr: u64, len: usize, sas: u8) -> u64 {
         let mw = self.mmio_window();
@@ -1566,37 +1580,27 @@ impl Vmm {
         // (it is exactly the copy the boot path skipped).
         dev.flatten_sparse();
 
-        let tar_data = match crate::ext2::read_upper_tar_entries(&dev.disk_image).map(|entries| {
-            // Shell history is session state, not guest data: the
-            // export deliberately skips it so it never round-trips
-            // through layers. History still lives in the data disk for
-            // the running VM.
-            let mut entries: Vec<_> = entries;
-            entries.retain(|e| !e.path.ends_with("/.ash_history"));
-            entries
-        }) {
-            Ok(entries) if !entries.is_empty() => crate::tar::write_tar(&entries),
-            _ => {
-                // Fall back to a raw tar the guest wrote to the device
-                // (tmpfs-mode export). Parse and re-serialize so the shell
-                // history filter above applies to this path too; if the tar
-                // is not parseable, forward it verbatim.
-                let end = crate::tar::find_tar_end(&dev.disk_image);
-                if end == 0 {
-                    log::warn!("export done: no exportable data found");
-                    console_eprintln("sandal: export failed: no exportable data found");
-                    return;
-                }
-                let raw = &dev.disk_image[..end];
-                match crate::tar::read_tar(raw) {
-                    Ok(mut entries) => {
-                        entries.retain(|e| !e.path.ends_with("/.ash_history"));
-                        crate::tar::write_tar(&entries)
+        let tar_data =
+            match crate::ext2::read_upper_tar_entries(&dev.disk_image).map(filter_export_entries) {
+                Ok(entries) if !entries.is_empty() => crate::tar::write_tar(&entries),
+                _ => {
+                    // Fall back to a raw tar the guest wrote to the device
+                    // (tmpfs-mode export). Parse and re-serialize so the shell
+                    // history filter above applies to this path too; if the tar
+                    // is not parseable, forward it verbatim.
+                    let end = crate::tar::find_tar_end(&dev.disk_image);
+                    if end == 0 {
+                        log::warn!("export done: no exportable data found");
+                        console_eprintln("sandal: export failed: no exportable data found");
+                        return;
                     }
-                    Err(_) => raw.to_vec(),
+                    let raw = &dev.disk_image[..end];
+                    match crate::tar::read_tar(raw) {
+                        Ok(entries) => crate::tar::write_tar(&filter_export_entries(entries)),
+                        Err(_) => raw.to_vec(),
+                    }
                 }
-            }
-        };
+            };
 
         // The chunked container: compression parallelizes across cores
         // too (see crate::zchunk) — the export's slow direction.

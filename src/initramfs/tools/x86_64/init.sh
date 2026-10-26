@@ -9,7 +9,6 @@ export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t tmpfs tmpfs /tmp
 
 # ── Parse /etc/sandal.conf (VMM-injected run configuration) ────────────
 DISK_MODE=
@@ -69,7 +68,12 @@ pivot_root . mnt/root
 mount --move /mnt/root/dev /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t tmpfs tmpfs /tmp
+
+# /tmp is NOT overmounted: it rides the overlay root, so in disk mode it
+# shares the data disk (--disk-size) instead of a fixed half-RAM tmpfs.
+# /tmp is workspace scratch — it must never leak into an exported layer
+# (the VMM filters tmp/ out of every export; see handle_export_done).
+chmod 1777 /tmp 2>/dev/null
 
 # /dev/fd and /dev/std* are not provided by devtmpfs: alias them to the
 # per-process /proc/self/fd entries. bash process substitution (`<(...)`) and

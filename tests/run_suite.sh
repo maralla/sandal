@@ -57,6 +57,7 @@ exit-codes|2400|$PYTHON tests/test_exit_codes.py
 console-input|0|$PYTHON tests/test_console_input.py
 marker-passthrough|0|$PYTHON tests/test_marker_passthrough.py
 export|0|$PYTHON tests/test_export.py
+tmp-space|0|$PYTHON tests/test_tmp_space.py
 layer|0|$PYTHON tests/test_layer.py
 share|0|$PYTHON tests/test_share.py
 geometry|0|$PYTHON tests/test_geometry.py
