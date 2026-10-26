@@ -1,7 +1,7 @@
 //! The `sandal-export-resize` guest helper: asks the VMM to grow /dev/vdb
 //! (tmpfs-upper mode) — the x86_64 side stores the RESIZE signal word to
 //! the hypercall page (a /dev/mem MMIO write), the aarch64 side raises the
-//! RESIZE BRK immediate. See `sandal-export` (the script that drives it).
+//! RESIZE BRK immediate. See `sandal-export` (the Rust binary that drives it).
 
 #![no_std]
 #![no_main]

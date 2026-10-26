@@ -215,8 +215,8 @@ pub(super) fn spawn_device_threads(vmm: &mut Vmm) -> DeviceThreads {
         }));
     }
 
-    // The console input reader is gone: the session input rides the
-    // vsock line (the guest's vsockd bridges it to the session's pty).
+    // The session input rides the vsock line (the guest's vsockd
+    // bridges it to the session's pty).
 
     DeviceThreads { stop, handles }
 }

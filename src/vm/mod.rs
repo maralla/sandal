@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -388,7 +388,7 @@ impl GuestRam {
         // (close(vmfd): ~87 ms, the single largest term of the teardown),
         // and every guest page fault built page tables one page at a time.
         // With 2 MB huge pages behind it, the mmu works 512x coarser.
-        // On `never` hosts this is a no-op (the old behavior). MADV_HUGEPAGE
+        // On `never` hosts this is a no-op. MADV_HUGEPAGE
         // is a Linux-only constant (macOS has no transparent hugepage advice).
         #[cfg(target_os = "linux")]
         unsafe {
@@ -536,8 +536,7 @@ struct Vmm {
     verbose_uart: bool,
     /// Guest command exit status: set by the exit hypercall (x86_64:
     /// `sandal-exit`'s MMIO store) or the exit BRK (aarch64: the crafted
-    /// init, the code in x15) — marker-free since the console protocol is
-    /// gone.
+    /// init, the code in x15).
     guest_exit_code: Option<i32>,
 }
 
@@ -674,9 +673,9 @@ fn run_script_client(port: &str, script: &[u8]) -> Result<i32> {
 
     // The host stdout's own line discipline was disabled by the VMM's
     // raw-mode setup; a terminal needs the translation back.
-    let to_tty = unsafe { libc::isatty(1) == 1 };
+    let to_tty = std::io::stdout().is_terminal();
     let mut last_was_cr = false;
-    let mut emit = |out: &mut std::io::Stdout, chunk: &[u8], last_was_cr: &mut bool| {
+    let emit = |out: &mut std::io::Stdout, chunk: &[u8], last_was_cr: &mut bool| {
         if !to_tty {
             let _ = out.write_all(chunk);
             return;
@@ -743,16 +742,16 @@ impl Drop for ScriptJoin {
     }
 }
 
-pub fn run(mut args: Args) -> Result<i32> {
+pub fn run(args: Args) -> Result<i32> {
     let timing = std::env::var_os("SANDAL_DEBUG_TIMING").is_some();
     let t0 = BOOT_T0.get_or_init(std::time::Instant::now);
 
     // The script payload reads early: a missing/unreadable file fails
     // before any VM exists.
     let script_payload = match &args.script {
-        Some(path) => Some(fs::read(path).map_err(|e| {
-            anyhow!("--script: read {}: {e}", path.display())
-        })?),
+        Some(path) => {
+            Some(fs::read(path).map_err(|e| anyhow!("--script: read {}: {e}", path.display()))?)
+        }
         None => None,
     };
 
@@ -819,7 +818,7 @@ pub fn run(mut args: Args) -> Result<i32> {
 /// the workload command — `uanme` for `uname` — exited 125 with not
 /// one byte of output). The VMM names the failure itself: it built the
 /// command line, and the codes are its own protocol (the portagent:
-/// 125 = the session exec failed; the init script: 126 = no session
+/// 125 = the session exec failed; the guest init: 126 = no session
 /// transport). The code is forwarded UNCHANGED (see
 /// test_exit_codes.py); only the diagnostic is added.
 pub(crate) fn diagnose_session_exit(code: i32, command: &[String]) {
@@ -1456,14 +1455,9 @@ impl Drop for Vmm {
 // Device dispatch (MMIO) — both architectures share the virtio-MMIO layout;
 // the GIC (arm64) and the hypercall page (x86_64) are arch-specific.
 // ─────────────────────────────────────────────────────────────────────────────
-/// The layer carries WORKSPACE data, never session state: the shell
-/// history and the /tmp scratch are filtered out of every export.
-/// /tmp rides the overlay root (it shares the data disk), so without
-/// this filter every export would carry the guest's scratch — the
-/// invariant: sandal-export NEVER delivers /tmp content.
 /// The overlay-upper marker file that carries the guest's requested
-/// layer name (see export.sh): consumed by the export, filtered from
-/// the layer content.
+/// layer name: consumed by the export, filtered from the layer
+/// content.
 const LAYER_NAME_MARKER: &str = ".sandal-layer-name";
 
 /// Pull the requested layer name out of the export entries: the marker
@@ -1556,6 +1550,12 @@ fn sanitize_layer_name(name: &str) -> Option<String> {
     })
 }
 
+/// The export's ignore rules: the layer carries WORKSPACE data, never
+/// session state — the shell history and the /tmp scratch are filtered
+/// out of every export. /tmp rides the overlay root (it shares the
+/// data disk), so without this filter every export would carry the
+/// guest's scratch — the invariant: sandal-export NEVER delivers /tmp
+/// content.
 fn filter_export_entries(entries: Vec<crate::tar::TarEntry>) -> Vec<crate::tar::TarEntry> {
     let mut entries = entries;
     entries.retain(|e| {
@@ -1755,9 +1755,8 @@ impl Vmm {
                     }
                     // The command execution line's readiness event: the
                     // guest's vsockd bound its listener — connect every
-                    // parked front end now. The event replaces the old
-                    // RST-retry loop: the REQUEST goes out exactly once,
-                    // at the moment the guest can accept it.
+                    // parked front end now. The REQUEST goes out exactly
+                    // once, at the moment the guest can accept it.
                     READY => {
                         log::info!("vsockd: the READY hypercall landed");
                         if let Some(vsock) = self.vsock.as_ref() {
@@ -1925,7 +1924,7 @@ impl Vmm {
             layer_data.hash(&mut hasher);
             PathBuf::from(format!("layer-{:016x}.layer", hasher.finish()))
         };
-        let save_path = match requested_name.as_deref() {
+        let save_path = match requested_name {
             Some(raw) => match sanitize_layer_name(raw) {
                 Some(name) => {
                     let path = PathBuf::from(&name);
@@ -1941,9 +1940,8 @@ impl Vmm {
                 }
                 None => {
                     console_eprintln(&format!(
-                        "sandal: export: the requested layer name {:?} is not usable; \
+                        "sandal: export: the requested layer name {raw:?} is not usable; \
                          using the content-addressed name",
-                        raw
                     ));
                     content_addressed(&layer_data)
                 }

@@ -193,8 +193,7 @@ impl Vmm {
             initramfs::EXPORT_RESIZE_IMM => self.handle_export_resize(),
             initramfs::EXPORT_DONE_IMM => self.handle_export_done(false),
             initramfs::EXPORT_DONE_FULL_IMM => self.handle_export_done(true),
-            // The exit protocol: the code rides x15 (marker-free — the old
-            // fixed `SANDAL_EXIT:<code>` stdout marker is gone).
+            // The exit protocol: the code rides x15.
             initramfs::EXIT_IMM => {
                 let code = self.vcpu.read_register(Reg::X15)? as u32 as i32;
                 self.guest_exit_code = Some(code);

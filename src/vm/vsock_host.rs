@@ -262,7 +262,7 @@ fn vsock_accepter(
 /// this irq lock, the run loop blocked on it, and the vCPU never ran
 /// again — so the re-post/credit event the loop was spinning for never
 /// happened (MEASURED: reproduced at will with a stream larger than one
-/// posted set; the loop is gone).
+/// posted set).
 ///
 /// The slice is a fixed 20 ms park: the next event is the kernel's or
 /// the guest's own; an idle bridge costs 50 wakeups a second. The

@@ -174,7 +174,7 @@ impl Vmm {
                     if progressed {
                         // The KVM_IRQ_LINE pulse — the same contract as
                         // the console/net line updates (see the bridge's
-                        // note: the KVM_IRQFD path is gone).
+                        // note).
                         irq_pulse(
                             &self.host.irq_levels,
                             (SPI_VSOCK - SPI_NET) as usize,

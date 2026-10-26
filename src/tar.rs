@@ -1,7 +1,7 @@
 /// Minimal tar archive reader.
 ///
 /// Supports reading raw tar archives (for finding the end of a tar written
-/// to a block device) and parsing gzip-compressed tar archives (.layer files).
+/// to a block device) and parsing compressed tar archives (.layer files).
 ///
 /// Only handles regular files, directories, and symlinks — sufficient for
 /// the `.layer` format used by `sandal-export`.
@@ -190,7 +190,7 @@ pub fn find_tar_end(data: &[u8]) -> usize {
 /// Serialize entries as an uncompressed ustar archive.
 ///
 /// Used by `sandal-export` to turn the overlay upper directory (read back out
-/// of the ext2 data disk) into a `.layer` payload before gzip compression.
+/// of the ext2 data disk) into a `.layer` payload before compression.
 pub fn write_tar(entries: &[TarEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {

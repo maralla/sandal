@@ -2,7 +2,7 @@
 //! ready (the x86_64 side stores the DONE signal word to the hypercall
 //! page, the aarch64 side raises the DONE BRK immediate; the VMM then
 //! extracts the overlay upper directory into a .layer file). See
-//! `sandal-export` (the script that drives it).
+//! `sandal-export` (the Rust binary that drives it).
 
 #![no_std]
 #![no_main]

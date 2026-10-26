@@ -1,7 +1,7 @@
 //! The `sandal-exit` guest helper: the exit protocol.
 //!
 //! The init runs `sandal-exit <status>` once the session is reaped, and the
-//! helper delivers the code marker-free: the x86_64 side stores
+//! helper delivers the code: the x86_64 side stores
 //! `EXIT_PORT | (code << 16)` to the VMM's hypercall page (a /dev/mem MMIO
 //! write — userspace MMIO; nested KVM denies I/O-port privileges), the
 //! aarch64 side raises the EXIT BRK with the code in x15. The VMM matches

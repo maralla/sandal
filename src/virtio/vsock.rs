@@ -67,10 +67,8 @@ use super::{
 };
 use std::collections::{HashMap, VecDeque};
 
-/// The host side of one connection: a TCP loopback stream (the Unix
-/// stream this once also was is gone — measured broken, accept() never
-/// returned pending connections; see vm/linux.rs), behind one object so
-/// the device never cares which.
+/// The host side of one connection: a TCP loopback stream, behind one
+/// object so the device never cares which.
 pub trait HostStream: std::io::Read + std::io::Write + Send {
     fn shutdown_both(&self);
     /// The fd the bridge's poll side watches for reads (unix only — the
@@ -354,12 +352,11 @@ pub struct VirtioVsockDevice {
     /// One-shot: the guest driver's first status write (the probe proof).
     probed: bool,
     /// The guest's command-execution listener announced itself (the
-    /// READY hypercall: vsockd stores it right after listen()). The
-    /// event replaces the old connect-retry loop: front ends register
-    /// BEFORE this and sit parked (no REQUEST — the guest would only
-    /// RST it); when the event lands, every parked connection's
-    /// REQUEST goes out, exactly once, at the moment the guest can
-    /// accept it.
+    /// READY hypercall: vsockd stores it right after listen()). Front
+    /// ends register BEFORE this and sit parked (no REQUEST — the
+    /// guest would only RST it); when the event lands, every parked
+    /// connection's REQUEST goes out, exactly once, at the moment the
+    /// guest can accept it.
     guest_listening: bool,
     /// The bridge's wake eventfd: written on every guest-visible
     /// progress, read (drained) by the bridge at each round start.
@@ -431,11 +428,9 @@ impl VirtioVsockDevice {
         // re-init), which is exactly when front end 1 (the session
         // handler) is registered — a reset that dropped it left the
         // bridge with ZERO streams forever (MEASURED: the bridge looped
-        // empty every round; nothing ever flowed). The old contract
-        // closed the host sockets here (the guest's af_vsock was gone);
-        // the guest's vsockd re-binds after the re-probe and the
-        // connection re-arms with it — the host stream was never the
-        // guest's to close.
+        // empty every round; nothing ever flowed). The guest's vsockd
+        // re-binds after the re-probe and the connection re-arms with
+        // it — the host stream was never the guest's to close.
     }
 
     /// Register one accepted host connection (the listener thread): the
@@ -493,9 +488,8 @@ impl VirtioVsockDevice {
     /// has already announced itself — the synthesized REQUEST. Before
     /// the READY event the connection parks with nothing in flight:
     /// a REQUEST against a guest that cannot listen would be RST'd,
-    /// and the old design answered that with a timed retry loop; the
-    /// READY event (see [`VirtioVsockDevice::set_guest_listening`])
-    /// removed the race this loop existed to paper over.
+    /// so the REQUEST waits for the READY event (see
+    /// [`VirtioVsockDevice::set_guest_listening`]).
     pub fn register_connection(&mut self, host: Box<dyn HostStream>) {
         let host_port = self.next_host_port;
         self.next_host_port = self.next_host_port.wrapping_add(1).max(1024);
@@ -702,7 +696,7 @@ impl VirtioVsockDevice {
         if header.vtype != TYPE_STREAM {
             return false;
         }
-        // The connection this packet belongs to: the guest's vsockrelay
+        // The connection this packet belongs to: the guest's vsockd
         // answers to the host port the connection was synthesized from.
         let Some(connection) = self
             .connections
@@ -1642,8 +1636,7 @@ mod tests {
 
     /// The whole connection lifecycle through the real surfaces: the
     /// READY event connects the parked front end (pre-ready, nothing
-    /// is in flight — the old design's REQUEST raced the guest's bind
-    /// and burned RST cycles), the REQUEST lands in a posted buffer
+    /// is in flight), the REQUEST lands in a posted buffer
     /// (one used entry, whole packet), the window starts CLOSED (the
     /// guest admitted nothing yet — the pre-open would let a pass blow
     /// past the guest's budget and the guest would DROP the excess,

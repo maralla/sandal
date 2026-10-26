@@ -2615,48 +2615,6 @@ pub fn read_upper_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
     Ok(out)
 }
 
-/// Read the ROOTFS image (vda, the overlay's lower/base) as tar entries
-/// with root-relative paths. The base side of the --full export's
-/// merge. Device nodes (the image's baked /dev, shadowed by devtmpfs
-/// at runtime) are skipped — they never belong in a layer.
-pub fn read_rootfs_tar_entries(image: &[u8]) -> Result<Vec<TarEntry>> {
-    let sb = Ext2Superblock::parse(image)?;
-    let bgdt = Ext2BgdTable::parse(image, &sb)?;
-    let mut out = Vec::new();
-
-    for entry in walk_ext2(image, &sb, &bgdt)? {
-        let mode = (entry.mode as u16) & 0o7777;
-        let file_type = (entry.mode as u16) & 0xF000;
-        match file_type {
-            S_IFDIR => out.push(TarEntry {
-                path: entry.path.clone(),
-                mode,
-                entry_type: TarEntryType::Directory,
-                link_target: String::new(),
-                data: Vec::new(),
-            }),
-            S_IFREG => out.push(TarEntry {
-                path: entry.path.clone(),
-                mode,
-                entry_type: TarEntryType::File,
-                link_target: String::new(),
-                data: entry.data,
-            }),
-            S_IFLNK => out.push(TarEntry {
-                path: entry.path.clone(),
-                mode,
-                entry_type: TarEntryType::Symlink,
-                link_target: String::from_utf8_lossy(&entry.data).into_owned(),
-                data: Vec::new(),
-            }),
-            _ => {}
-        }
-    }
-
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
-}
-
 /// Remove a directory entry by name from a directory's data block.
 fn remove_dir_entry(
     image: &mut [u8],
@@ -2792,7 +2750,7 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
     // general command execution proxy. One forked child per connection;
     // SIGCHLD is SIG_IGN inside it (auto-reaped), and every refusal
     // funnels through one paced retry. Nothing runs it
-    // unless the init script does (the VMM's own
+    // unless the init does (the VMM's own
     // channel passes VSOCKD below). Every platform runs the line now —
     // the vsock IS the session transport on each of them.
     let vsockd_elf = initramfs::tools::bin::vsockd_helper();
@@ -2842,10 +2800,9 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         initramfs::tools::bin::export_helper(),
         0o755,
     )?;
-    // The exit protocol helper: the init script runs `sandal-exit <status>`
+    // The exit protocol helper: the guest init runs `sandal-exit <status>`
     // once the session is reaped — a /dev/mem MMIO store of
-    // `EXIT_PORT | (code << 16)` to the hypercall page (marker-free exit
-    // code delivery; the old console marker is gone). x86_64 only: the
+    // `EXIT_PORT | (code << 16)` to the hypercall page. x86_64 only: the
     // aarch64 session's exit rides the EXIT BRK from vsockd itself.
     #[cfg(target_arch = "x86_64")]
     inject_file(
@@ -2858,9 +2815,8 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         0o755,
     )?;
 
-    // /init: the compiled Rust init on BOTH architectures (the x86_64
-    // busybox script it replaced is gone — same flow, one binary; both
-    // exec /bin/vsockd as their last command).
+    // /init: the compiled Rust init on BOTH architectures — same flow,
+    // one binary; both exec /bin/vsockd as their last command.
     let init_binary = initramfs::tools::bin::init_helper();
     inject_file(image, &sb, &bgdt, &mut alloc, "init", init_binary, 0o755)?;
 

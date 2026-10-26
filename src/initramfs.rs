@@ -8,11 +8,6 @@ use std::fs;
 /// (ctty, portagent, the export signal helpers).
 pub mod tools;
 
-/// Mount point and device path constants.
-pub const MNT_TMP: &str = "/mnt/tmpupper"; // tmpfs-backed upper (layer + default)
-pub const MNT_DISK: &str = "/mnt/diskupper"; // ext2-backed upper (disk mode)
-pub const DATA_DEV: &str = "/dev/vdb"; // secondary virtio-blk device
-
 /// The run configuration injected into the rootfs as /etc/sandal.conf (a
 /// plain file read needs no privileges — the same channel on both arches).
 pub const CONFIG_PATH: &str = "etc/sandal.conf";
@@ -51,9 +46,8 @@ pub const EXPORT_DONE_IMM: u32 = 0x5D3; // "SanDal 3"
 pub const EXPORT_DONE_FULL_IMM: u32 = 0x5D7; // the full-export done
 
 /// Exit protocol signal (aarch64): the init BRKs with the session's exit
-/// code in x15; the VMM reads the register at the trap (the marker-free
-/// exit protocol — the old fixed `SANDAL_EXIT:<code>` stdout marker is
-/// gone). The x86_64 carries the code in the hypercall store's high half.
+/// code in x15; the VMM reads the register at the trap. The x86_64
+/// carries the code in the hypercall store's high half.
 pub const EXIT_IMM: u32 = 0x5D5; // "SanDal 5"
 
 /// The command execution line's readiness (aarch64): vsockd's listener is
@@ -118,9 +112,3 @@ pub fn build_init_config_text(
     }
     out.into_bytes()
 }
-
-// The `sandal-export` guest command is a compiled binary, not a
-// generated script: the flow (the overlay-upper walk, the ustar, the
-// resize/done hypercalls) lives in
-// src/initramfs/tools/bin/export.rs, injected at ext2.rs's runtime
-// files (usr/sbin/sandal-export).

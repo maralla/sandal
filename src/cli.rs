@@ -77,7 +77,7 @@ pub struct RunArgs {
     #[arg(long = "disk-size", value_name = "MB")]
     pub disk_size: Option<usize>,
 
-    /// Load a .layer file (gzip-compressed tar) into the overlay filesystem.
+    /// Load a .layer file (zstd-compressed tar) into the overlay filesystem.
     /// Can be specified multiple times; layers are applied in order.
     /// When combined with --disk-size, layers are injected into the ext2 disk.
     #[arg(long = "layer", value_name = "PATH")]

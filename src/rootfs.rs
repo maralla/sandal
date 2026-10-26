@@ -5,8 +5,9 @@
 //!
 //! zstd (not gzip) is used for the embedded blob: the VMM decompresses it on
 //! every VM start, and zstd decodes ~3x faster than gzip at a similar ratio
-//! (~10ms off the boot time). The `.layer` archives keep using gzip — their
-//! format is part of the export/load interface.
+//! (~10ms off the boot time). The `.layer` archives use the chunked zstd
+//! container (see crate::zchunk) — their format is part of the
+//! export/load interface.
 
 /// zstd-compressed minimal ext2 rootfs image.
 pub const BUILTIN_ROOTFS_ZST: &[u8] = include_bytes!("rootfs.ext2.zst");

@@ -35,8 +35,7 @@ pub fn export_done_helper() -> &'static [u8] {
 }
 
 /// The compiled `sandal-export` guest binary (the whole export flow:
-/// the upper walk, the ustar, the resize/done signals — the busybox
-/// script it replaced is gone).
+/// the upper walk, the ustar, the resize/done signals).
 pub static EXPORT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/export.bin"));
 
 /// The compiled `sandal-export` guest binary.

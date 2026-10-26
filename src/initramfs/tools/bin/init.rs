@@ -1,6 +1,5 @@
 //! The guest `/init` — one compiled binary on BOTH architectures (the
-//! x86_64 busybox script it replaces is gone; the flow was identical and
-//! the syscalls are arch-uniform).
+//! syscalls are arch-uniform).
 //!
 //! The run configuration arrives as the SAME text file the script read
 //! (`/etc/sandal.conf`, VMM-injected); the session transport is the vsock

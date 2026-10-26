@@ -1,9 +1,8 @@
 //! The `sandal-export` guest binary: turns the overlay upper directory
 //! into the tar archive the VMM consumes as a `.layer` file.
 //!
-//! Rust replaces the busybox shell script — the flow is syscall-shaped
-//! (walk, tar, two hypercalls) and the tar writing is where the script
-//! was thinnest (exclusions, device buffering). Both architectures:
+//! The flow is syscall-shaped (walk, tar, two hypercalls). Both
+//! architectures:
 //!
 //! 1. Find the overlay upper (the disk mode's ext2 upper, else the
 //!    tmpfs one).

@@ -92,7 +92,7 @@ fn run_vm(mut args: Args) -> Result<()> {
 
     // --script rejects the command: the script IS the workload, delivered
     // whole through the command line — a shell line alongside it has no
-    // meaning and the old foot-guns (quoting, the 64 KiB cap) none either.
+    // meaning.
     if let Some(path) = &args.script {
         if !args.command.is_empty() {
             anyhow::bail!(
@@ -101,10 +101,7 @@ fn run_vm(mut args: Args) -> Result<()> {
             );
         }
         if !path.is_file() {
-            anyhow::bail!(
-                "sandal: the script file {} does not exist",
-                path.display()
-            );
+            anyhow::bail!("sandal: the script file {} does not exist", path.display());
         }
         // The script rides the command line: an ephemeral local port when
         // the caller named none.

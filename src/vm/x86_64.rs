@@ -137,9 +137,8 @@ pub(crate) const MAX_FS_DEVICES: usize = 5;
 /// keyboard, cascade, serial, RTC lines). Device slot i takes POOL[i];
 /// the slot index matches the `virtio_mmio.device=` cmdline order.
 /// Index 10 (the vsock device) takes the FPU line: nothing registers
-/// IRQ 13 on x86_64 (the coprocessor-overrun handler was removed;
-/// the FPU exception is a CPU vector, not this PIC line), so
-/// request_irq(13) succeeds exactly like the lines above it.
+/// IRQ 13 on x86_64 (the FPU exception is a CPU vector, not this PIC
+/// line), so request_irq(13) succeeds exactly like the lines above it.
 pub(super) const ISA_IRQ_POOL: [u32; 11] = [3, 5, 6, 7, 9, 10, 11, 12, 14, 15, 13];
 
 /// COM1 (earlycon) base port.
