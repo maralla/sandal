@@ -36,9 +36,10 @@ fn main() {
     // set; the injection sites (ext2.rs inject_runtime_files) pick.
     //
     //   vsockd         — the command execution line (every platform)
-    //   sandal-exit    — the exit protocol (x86_64: the init script's tail)
+    //   sandal-exit    — the exit protocol helper (x86_64)
     //   export resize/done — the overlay export signals (every platform)
-    //   init           — the aarch64 /init (x86_64 runs the shell script)
+    //   init           — the guest /init (every platform: one compiled
+    //                    binary, both architectures)
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target = match arch.as_str() {
         "x86_64" => "x86_64-unknown-none",
@@ -50,7 +51,7 @@ fn main() {
         ("export_resize", true),
         ("export_done", true),
         ("sandal_exit", arch == "x86_64"),
-        ("init", arch == "aarch64"),
+        ("init", true),
     ];
     guests.retain(|(_, build)| *build);
     println!("cargo::rerun-if-changed=src/initramfs/tools/bin/common.rs");

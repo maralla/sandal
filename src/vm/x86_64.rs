@@ -168,9 +168,9 @@ pub fn x86_hypercall_page_off(mmio_base: u64) -> (u64, u64) {
 
 /// Guest RAM declared in the boot memory map. The KVM slot maps the whole
 /// `--memory` cap, but only this floor is declared as RAM: the rest is a
-/// hole the guest init hot-adds in section-sized steps (see init.sh —
-/// a fixed headroom at session start, then one section per MemAvailable
-/// descent), so the host resident set tracks what workloads touch, not
+/// hole the guest init hot-adds in section-sized steps (a fixed headroom
+/// at session start, then one section per MemAvailable descent — see the
+/// guest init), so the host resident set tracks what workloads touch, not
 /// the cap. The floor is the measured size that boots the kernel, the
 /// initramfs and the rootfs pivot with several-fold margin for ordinary
 /// commands (python/git/ripgrep peak at tens of MB); its whole boot

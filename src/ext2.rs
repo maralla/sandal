@@ -2801,11 +2801,9 @@ pub fn inject_runtime_files(image: &mut [u8], network: bool, host_term: &str) ->
         0o755,
     )?;
 
-    // /init: x86_64 — the busybox shell script; aarch64 — the compiled
-    // Rust init (both exec /bin/vsockd as their last command).
-    #[cfg(target_arch = "x86_64")]
-    let init_binary = initramfs::tools::x86_64::init::init_binary("/dev/hvc0");
-    #[cfg(target_arch = "aarch64")]
+    // /init: the compiled Rust init on BOTH architectures (the x86_64
+    // busybox script it replaced is gone — same flow, one binary; both
+    // exec /bin/vsockd as their last command).
     let init_binary = initramfs::tools::bin::init_helper();
     inject_file(image, &sb, &bgdt, &mut alloc, "init", init_binary, 0o755)?;
 

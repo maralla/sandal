@@ -1,24 +1,25 @@
-//! The aarch64 guest `/init`: the Rust port of the crafted machine-code
-//! init (the ELF DSL that generated it is gone).
+//! The guest `/init` — one compiled binary on BOTH architectures (the
+//! x86_64 busybox script it replaces is gone; the flow was identical and
+//! the syscalls are arch-uniform).
 //!
-//! The x86_64 guest runs a busybox shell script instead (see
-//! `tools/x86_64/init.sh`); this is the same flow as a program — the
-//! aarch64 has busybox too, but the init predates the script and stays
-//! compiled. The run configuration arrives as the SAME text file the
-//! script reads (`/etc/sandal.conf`, VMM-injected); the session transport
-//! is the vsock line on every platform, so the init's last act is the
-//! same exec the script makes: `/bin/vsockd <port>`, PID 1 IS the accept
-//! loop, and the command execution rides the session front end.
+//! The run configuration arrives as the SAME text file the script read
+//! (`/etc/sandal.conf`, VMM-injected); the session transport is the vsock
+//! line on every platform, so the init's last act is the same exec the
+//! script made: `/bin/vsockd <port>`, PID 1 IS the accept loop, and the
+//! command execution rides the session front end.
 //!
-//! Flow (mirrors the x86_64 init.sh):
-//!   1. mount proc/sys/devtmpfs/tmpfs
+//! Flow:
+//!   1. mount proc/sys/devtmpfs
 //!   2. parse /etc/sandal.conf (disk mode, network, clock, shares, TERM,
-//!      the vsockd port)
+//!      the memory cap, the vsockd port)
 //!   3. set the wall clock; bring up the network (static 10.0.2.15 NAT)
 //!   4. build the overlayfs root (tmpfs or /dev/vdb upper) and pivot_root
 //!   5. mount virtiofs shares
-//!   6. exec /bin/vsockd (the accept loop IS PID 1; the session's exit
-//!      code rides the EXIT BRK — the code in x15 — from vsockd itself)
+//!   6. grow the RAM floor toward the cap (x86_64's memory hotplug: the
+//!      headroom online before the session, then a daemon adding more)
+//!   7. exec /bin/vsockd (the accept loop IS PID 1; the session's exit
+//!      code rides the EXIT signal — the hypercall store on x86_64, the
+//!      BRK on aarch64 — from vsockd itself)
 
 #![no_std]
 #![no_main]
@@ -58,6 +59,14 @@ const S_RESOLV_PATH: &[u8] = b"/etc/resolv.conf\0";
 const S_RESOLV_DATA: &[u8] = b"nameserver 10.0.2.3\n";
 const S_CONF: &[u8] = b"/etc/sandal.conf\0";
 const S_VSOCKD: &[u8] = b"/bin/vsockd\0";
+const S_PTMX: &[u8] = b"/dev/ptmx\0";
+const S_PTMX_TARGET: &[u8] = b"pts/ptmx\0";
+const S_DEVPTS_NEWINSTANCE: &[u8] = b"newinstance\0";
+const S_MEMINFO: &[u8] = b"/proc/meminfo\0";
+const S_MEM_PROBE: &[u8] = b"/sys/devices/system/memory/probe\0";
+const S_MEM_DIR: &[u8] = b"/sys/devices/system/memory/\0";
+const S_ONLINE: &[u8] = b"online\0";
+const S_MEMAVAIL: &[u8] = b"MemAvailable:";
 
 const ENV_HOME: &[u8] = b"HOME=/root\0";
 const ENV_PATH: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0";
@@ -86,6 +95,10 @@ struct Config {
     shares: [(&'static [u8], &'static [u8]); 64],
     n_shares: usize,
     term: Option<&'static [u8]>,
+    /// The hotplug cap in bytes (the whole KVM slot): the RAM floor
+    /// grows toward it. Zero — no hotplug (a cap at or below the floor,
+    /// or the aarch64 kernel, whose slot is fully declared RAM).
+    memcap: u64,
     vsockd: u32,
     hypercall: Option<&'static [u8]>,
 }
@@ -130,6 +143,7 @@ fn config_load() -> Config {
         shares: [(&[], &[]); 64],
         n_shares: 0,
         term: None,
+        memcap: 0,
         vsockd: 0,
         hypercall: None,
     };
@@ -173,6 +187,16 @@ fn config_load() -> Config {
                 }
             }
             b"TERM" => c.term = Some(val),
+            b"MEMCAP" => {
+                let mut v = 0u64;
+                for &b in val {
+                    match b {
+                        b'0'..=b'9' => v = v * 10 + (b - b'0') as u64,
+                        _ => break,
+                    }
+                }
+                c.memcap = v;
+            }
             b"VSOCKD" => {
                 let mut v = 0u32;
                 for &b in val {
@@ -249,6 +273,107 @@ fn network_up() {
     }
 }
 
+/// mkdir -p: create every component of an absolute path. Existing
+/// components (EEXIST) are fine. Every syscall gets a NUL-terminated
+/// copy — the syscall reads the pathname to the NUL, and a NUL-less
+/// slice makes it read straight through into the conf buffer's tail
+/// (`/root` + `go/pkg\0` = `/rootgo/pkg`, MEASURED: the share mounts
+/// all failed with paths the guest had never heard of).
+fn mkdir_p(path: &[u8]) {
+    let mut buf = [0u8; 128];
+    buf[..path.len()].copy_from_slice(path);
+    for i in 1..path.len() {
+        if path[i] == b'/' {
+            buf[i] = 0;
+            let _ = mkdir(&buf, 0o755); // the prefix path[..i]
+            buf[i] = b'/';
+        }
+    }
+    let _ = mkdir(&buf, 0o755); // the full path (the copy's tail is NUL)
+}
+
+/// Decimal digits of `v` into `buf`; returns the length. (no_std: no
+/// fmt machinery — the probe address and the section index are the only
+/// numbers this init ever prints.)
+fn format_u64(buf: &mut [u8], v: u64) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    let mut v = v;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        buf[i] = tmp[n - 1 - i];
+    }
+    n
+}
+
+/// "/sys/devices/system/memory/memory{idx}" — the hotplug block's node.
+fn format_mem_node(idx: usize) -> [u8; 80] {
+    let mut out = [0u8; 80];
+    let base = S_MEM_DIR.len() - 1; // without the NUL
+    out[..base].copy_from_slice(&S_MEM_DIR[..base]);
+    let mut at = base;
+    out[at..at + 6].copy_from_slice(b"memory");
+    at += 6;
+    let mut num = [0u8; 20];
+    let n = format_u64(&mut num, idx as u64);
+    out[at..at + n].copy_from_slice(&num[..n]);
+    at += n;
+    out[at] = 0;
+    out
+}
+
+/// "/sys/devices/system/memory/memory{idx}/state" — the online control.
+fn format_mem_node_state(idx: usize) -> [u8; 80] {
+    let mut out = format_mem_node(idx);
+    let at = out.iter().position(|&b| b == 0).unwrap_or(78);
+    out[at..at + 6].copy_from_slice(b"/state");
+    out[at + 6] = 0;
+    out
+}
+
+/// MemAvailable in kB, parsed from /proc/meminfo (the daemon's growth
+/// trigger). Zero when the read or the parse fails — the daemon then
+/// just idles until the next tick.
+fn mem_available_kb() -> u64 {
+    let mut buf = [0u8; 4096];
+    let fd = open(S_MEMINFO, O_RDONLY, 0);
+    if fd < 0 {
+        return 0;
+    }
+    let mut n = 0usize;
+    while n < buf.len() {
+        let r = read(fd, &mut buf[n..]);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    close(fd);
+    let line = &buf[..n];
+    let key = S_MEMAVAIL;
+    let mut at = match line.windows(key.len()).position(|w| *w == *key) {
+        Some(i) => i + key.len(),
+        None => return 0,
+    };
+    while at < line.len() && (line[at] == b' ' || line[at] == b'\t') {
+        at += 1;
+    }
+    let mut v = 0u64;
+    while at < line.len() && line[at].is_ascii_digit() {
+        v = v * 10 + (line[at] - b'0') as u64;
+        at += 1;
+    }
+    v
+}
+
 #[no_mangle]
 pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     // ── Phase 1: the essential mounts ────────────────────────────────
@@ -263,7 +388,7 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
 
     // ── The wall clock (the VMM snapshots the host time at boot) ────
     if c.clock > 0 {
-        let _ = clock_settime(c.clock);
+        let _ = settimeofday_secs(c.clock);
     }
 
     // ── The network ──────────────────────────────────────────────────
@@ -323,20 +448,128 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     let _ = symlink(b"/proc/self/fd/2\0", b"/dev/stderr\0");
 
     // PTYs: devtmpfs provides /dev/ptmx but not the pts filesystem.
+    // newinstance: a private devpts instance whose ptmx WORKS — the pty
+    // lands in THIS instance, so /dev/pts/ptmx and TIOCGPTPEER give the
+    // master's own slave (a plain compat mount's ptmx is non-functional,
+    // and the pty would land in a different instance than the slave path
+    // resolves in). The symlink makes every ptmx open land in THIS
+    // instance. Both best-effort (the script's 2>/dev/null): a kernel
+    // without the option keeps the compat mount's ptmx.
     let _ = mkdir(S_DEVPTS_PATH, 0o755);
-    let _ = mount(S_DEVPTS, S_DEVPTS_PATH, S_DEVPTS, 0, 0);
+    let _ = mount(S_DEVPTS, S_DEVPTS_PATH, S_DEVPTS, 0, S_DEVPTS_NEWINSTANCE.as_ptr() as usize);
+    let _ = unlink(S_PTMX);
+    let _ = symlink(S_PTMX_TARGET, S_PTMX);
     let _ = chdir(S_SLASH);
 
     // ── The virtiofs shares ──────────────────────────────────────────
     for i in 0..c.n_shares {
         let (tag, path) = c.shares[i];
-        let _ = mkdir(path, 0o755);
-        let _ = mount(tag, path, S_VIRTIOFS, 0, 0);
+        // The mount source: a NUL-terminated COPY of the tag. The tag's
+        // slice points into the conf buffer, where the tag is followed by
+        // ':' and the path — mount(2) reads to the NUL and would take the
+        // WHOLE `tag:path` value as the virtiofs tag (MEASURED: the
+        // kernel's `tag <share0:/mnt/share> not found`).
+        let mut tag_buf = [0u8; 36]; // the virtiofs tag: 36 bytes max
+        tag_buf[..tag.len()].copy_from_slice(tag);
+        let tag_nul = &tag_buf[..tag.len() + 1];
+        // mkdir -p: the share paths are multi-level (/root/go/pkg) and
+        // the parents may not exist.
+        mkdir_p(path);
+        const MS_SILENT: usize = 0x8000;
+        let _ = mount(tag_nul, path, S_VIRTIOFS, MS_SILENT, 0);
     }
 
     // ── The home directory is the default cwd (the session line forks
     // below it and inherits THIS cwd) ────────────────────────────────
     let _ = chdir(S_HOME);
+
+    // ── The home directory is the default cwd (the session line forks
+    // below it and inherits THIS cwd) ────────────────────────────────
+    let _ = chdir(S_HOME);
+
+    // ── Memory hotplug: the floor is online; the cap arrives on demand ──
+    // x86_64's memory model: the VMM maps the whole cap as one lazy slot
+    // but declares only a RAM floor in the boot memory map; [floor, cap)
+    // is a hole the guest grows into. A fixed headroom goes online before
+    // the session (an instant allocation outruns any poll), then a daemon
+    // adds one section at a time whenever MemAvailable descends below one
+    // section. Pages nothing touches stay lazy host zero mappings.
+    //
+    // The section index advances UNCONDITIONALLY: a refused probe is
+    // permanent — the first section above the floor is where the
+    // virtio-mmio blocks live (0x10000000, the kernel resource tree holds
+    // it) and the kernel answers EEXIST forever; a stuck index spun the
+    // boot until the probe deadline killed it (MEASURED: no READY, no
+    // session line). The loop is bounded by the cap either way, and the
+    // skipped sections are exactly the ones that cannot work.
+    let probe_fd = open(S_MEM_PROBE, O_WRONLY, 0);
+    if c.memcap > 0 && probe_fd >= 0 {
+        close(probe_fd);
+        const SECTION_KB: usize = 128 * 1024; // block_size_bytes / 1024
+        let cap_kb = (c.memcap as usize) / 1024; // never cross the slot
+        // The next section index: one past the highest block the kernel
+        // already carries (the RAM floor's own blocks). Found by probing
+        // the state files — the blocks are contiguous from 0.
+        let mut idx = 0usize;
+        loop {
+            let name = format_mem_node(idx);
+            if open(&name, O_RDONLY, 0) < 0 {
+                break;
+            }
+            idx += 1;
+        }
+        idx += 1;
+        let mut add_section = |idx: usize| -> bool {
+            let mut p = [0u8; 24];
+            let addr = format_u64(&mut p, (idx as u64) * (SECTION_KB as u64) * 1024);
+            let fd = open(S_MEM_PROBE, O_WRONLY, 0);
+            if fd < 0 {
+                return false;
+            }
+            let ok = write(fd, &p[..addr]) > 0;
+            close(fd);
+            if !ok {
+                return false;
+            }
+            let name = format_mem_node_state(idx);
+            let fd = open(&name, O_WRONLY, 0);
+            if fd < 0 {
+                return false;
+            }
+            let ok = write(fd, &S_ONLINE[..S_ONLINE.len() - 1]) > 0;
+            close(fd);
+            ok
+        };
+        // The headroom: the whole cap online before the session. A partial
+        // envelope loses to the linker's working set (multi-GB in one
+        // allocation, far past any measured toolchain peak), and an instant
+        // allocation that exceeds the envelope OOM-kills the session before
+        // any poll could deliver the difference — so nothing is left to a
+        // poll: the pages stay lazy host zero mappings, and the cost is the
+        // vmemmap and about a second of boot time.
+        while (idx as u64) * (SECTION_KB as u64) < cap_kb as u64 {
+            let _ = add_section(idx);
+            idx += 1;
+        }
+        // The daemon: one section at a time, each time MemAvailable
+        // descends below one section, up to the cap. fork + loop — the
+        // child IS the daemon and never returns; the parent execs below.
+        let daemon = fork();
+        if daemon == 0 {
+            loop {
+                if mem_available_kb() < SECTION_KB as u64
+                    && (idx as u64) * (SECTION_KB as u64) < cap_kb as u64
+                {
+                    let _ = add_section(idx);
+                    idx += 1;
+                }
+                nap100();
+            }
+        }
+        // The daemon's death is the VM's death (PID 1's exec replaces THIS
+        // image; the daemon is a child of the pre-exec image and dies with
+        // the machine).
+    }
 
     // ── The command execution line IS the init's last command ───────
     // exec, not a background child: PID 1 IS the accept loop — the
@@ -372,22 +605,30 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     env_ptrs[2] = ENV_SSL.as_ptr();
     if let Some(t) = c.term {
         // TERM=<value>\0 — the value's slice is NUL-terminated in the
-        // conf buffer; prepend the key by pointing one byte back (the
-        // conf line is "TERM=<value>\0": the '=' sits right before it).
+        // conf buffer; the env string starts at the KEY: "TERM=" is five
+        // bytes, so the 'T' sits five back from the value's start (the
+        // '=' the slice's first byte backs onto is at value-1). The old
+        // arithmetic (sub(5) from the '=') landed on the PREVIOUS line's
+        // NUL: the guest exported an empty TERM (MEASURED).
         unsafe {
             let p = t.as_ptr().sub(1);
             if p.read() == b'=' && n_env < env_ptrs.len() - 1 {
                 n_env += 1;
-                env_ptrs[n_env - 1] = p.sub(5); // "TERM" + '='
+                env_ptrs[n_env - 1] = p.sub(4); // "TERM" + '='
             }
         }
     }
     if let Some(h) = c.hypercall {
+        // HYPERCALL=<addr>\0 — "HYPERCALL=" is ten bytes: the 'H' sits
+        // ten back from the value's start (sub(9) from the '='). The old
+        // arithmetic (sub(10) from the '=') landed on the previous NUL:
+        // vsockd saw no HYPERCALL address and never signaled the VMM —
+        // no READY, no session, the boot parked forever (MEASURED).
         unsafe {
             let p = h.as_ptr().sub(1);
             if p.read() == b'=' && n_env < env_ptrs.len() - 1 {
                 n_env += 1;
-                env_ptrs[n_env - 1] = p.sub(10); // "HYPERCALL" + '='
+                env_ptrs[n_env - 1] = p.sub(9); // "HYPERCALL" + '='
             }
         }
     }

@@ -46,13 +46,11 @@ pub fn sandal_exit_helper() -> &'static [u8] {
     SANDAL_EXIT
 }
 
-/// The compiled aarch64 `/init` guest binary (the Rust port of the
-/// machine-code init; the x86_64 init is the shell script).
-#[cfg(target_arch = "aarch64")]
+/// The compiled guest `/init` binary (every architecture — the one init
+/// binary serves both).
 pub static INIT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.bin"));
 
-/// The compiled aarch64 `/init` guest binary.
-#[cfg(target_arch = "aarch64")]
+/// The compiled guest `/init` binary.
 pub fn init_helper() -> &'static [u8] {
     INIT
 }

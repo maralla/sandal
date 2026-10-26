@@ -80,10 +80,12 @@ pub mod nr {
     pub const MOUNT: usize = 165;
     pub const MKDIRAT: usize = 258;
     pub const SYMLINKAT: usize = 266;
+    pub const UNLINKAT: usize = 263;
     pub const CHDIR: usize = 80;
     pub const FCHMODAT: usize = 268;
     pub const CLOCK_SETTIME: usize = 228;
-    pub const PIVOT_ROOT: usize = 217;
+    pub const SETTIMEOFDAY: usize = 164;
+    pub const PIVOT_ROOT: usize = 155;
     pub const REBOOT: usize = 169;
 }
 
@@ -112,10 +114,12 @@ pub mod nr {
     pub const MOUNT: usize = 40;
     pub const MKDIRAT: usize = 34;
     pub const SYMLINKAT: usize = 36;
+    pub const UNLINKAT: usize = 35;
     pub const CHDIR: usize = 49;
     pub const FCHMODAT: usize = 53;
     pub const CLOCK_SETTIME: usize = 113;
-    pub const PIVOT_ROOT: usize = 151;
+    pub const SETTIMEOFDAY: usize = 164;
+    pub const PIVOT_ROOT: usize = 51;
     pub const REBOOT: usize = 142;
 }
 
@@ -282,6 +286,13 @@ pub fn symlink(target: &[u8], link: &[u8]) -> isize {
     ])
 }
 
+/// Remove one path (unlinkat AT_FDCWD, no flags). The /dev/ptmx swap in
+/// the guest init: devtmpfs's own ptmx node must go before the symlink
+/// that redirects every ptmx open into the devpts instance.
+pub fn unlink(path: &[u8]) -> isize {
+    syscall(nr::UNLINKAT, [AT_FDCWD, path.as_ptr() as usize, 0, 0, 0, 0])
+}
+
 pub fn chmod(path: &[u8], mode: u32) -> isize {
     syscall(nr::FCHMODAT, [
         AT_FDCWD,
@@ -297,6 +308,15 @@ pub fn chmod(path: &[u8], mode: u32) -> isize {
 pub fn clock_settime(secs: u64) -> isize {
     let ts = [secs as usize, 0usize];
     syscall(nr::CLOCK_SETTIME, [0, ts.as_ptr() as usize, 0, 0, 0, 0])
+}
+
+/// settimeofday({secs, 0}): the wall clock set. The init uses this
+/// instead of clock_settime — the syscall returns 0 yet the timekeeping
+/// ignores the store on x86_64 (MEASURED: rc=0, the wall unchanged),
+/// while settimeofday lands (the busybox date -s path).
+pub fn settimeofday_secs(secs: u64) -> isize {
+    let ts = [secs as usize, 0usize];
+    syscall(nr::SETTIMEOFDAY, [ts.as_ptr() as usize, 0, 0, 0, 0, 0])
 }
 
 pub fn pivot_root(new_root: &[u8], put_old: &[u8]) -> isize {
