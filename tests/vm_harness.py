@@ -57,8 +57,12 @@ class Vm:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         self.master = master
         self.verbose_env = verbose_env
+        # An empty command is the daemon shape: `--port` with no session
+        # command at all — the VM serves the port and quits on the guest's
+        # native power commands (no `--` separator, nothing after it).
+        session = ["--", *command] if command else []
         self.proc = subprocess.Popen(
-            [str(SANDAL), *extra_args, "--", *command],
+            [str(SANDAL), *extra_args, *session],
             stdin=slave,
             stdout=slave,
             stderr=slave,

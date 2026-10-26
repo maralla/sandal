@@ -22,8 +22,13 @@ pub enum Command {
 
 #[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
-    /// Command to run inside the VM
-    #[arg(required = true)]
+    /// Command to run inside the VM. Optional with --port: a VM without
+    /// a command is the pure command daemon — it serves every command
+    /// through the port and never quits on its own; the guest's native
+    /// power commands (poweroff, halt, reboot — they signal PID 1, and
+    /// the accept loop IS PID 1) shut it down cleanly. Without --port
+    /// the command is required.
+    #[arg(required = false)]
     pub command: Vec<String>,
 
     /// Shared directories from host (format: host_path:guest_path)
@@ -70,15 +75,22 @@ pub struct RunArgs {
     #[arg(long = "layer", value_name = "PATH")]
     pub layers: Vec<PathBuf>,
 
-    /// Enable the virtio-vsock device: the VMM listens on
-    /// ADDR:PORT (ADDR defaults to 127.0.0.1; 0.0.0.0 exposes it) and
-    /// bridges every connection through vsock to the guest's own TCP
-    /// loopback — /bin/vsockrelay forwards to sshd there, unmodified.
-    /// No port file: the port is the one you named. The guest side
-    /// needs sshd listening on its own loopback (apk add openssh;
-    /// see tests/test_ssh_relay.py for the proven recipe); auth is
-    /// whatever sshd allows — key-only for root by openssh's own
-    /// defaults.
+    /// Enable the virtio-vsock device: the VMM listens on ADDR:PORT
+    /// (ADDR defaults to 127.0.0.1; 0.0.0.0 exposes it) and bridges every
+    /// connection through vsock to the guest's /bin/vsockd — the command
+    /// execution line. Each connection carries a 9-byte header
+    /// ({mode, rows, cols, cmd_len}, little-endian) plus the command
+    /// line; the command's output comes back verbatim and the stream
+    /// ends with a 17-byte status trailer (16 magic bytes + the exit
+    /// status). Connections are concurrent: the guest forks per
+    /// connection.
+    ///
+    /// With a command, the VM ALSO runs that command as its session
+    /// (`sandal --port 8022 -- tmux`), and the VM's life is the
+    /// session's. Without one, the VM is the pure command daemon: it
+    /// boots, serves the port, and quits only on the guest's native
+    /// power commands (poweroff/halt/reboot — they signal PID 1, and
+    /// the accept loop IS PID 1) or when the host kills it.
     #[arg(long = "port", value_name = "[ADDR:]PORT")]
     pub port: Option<String>,
 }

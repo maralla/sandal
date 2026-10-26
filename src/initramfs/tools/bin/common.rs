@@ -23,6 +23,9 @@ pub const SIGCHLD: usize = 17;
 pub const SIGPIPE: usize = 13;
 pub const SIGKILL: usize = 9;
 pub const SIGTSTP: usize = 20;
+pub const SIGTERM: usize = 15;
+pub const SIGUSR1: usize = 10;
+pub const SIGUSR2: usize = 12;
 pub const SIG_IGN: usize = 1;
 pub const SIG_DFL: usize = 0;
 pub const EINTR: isize = 4;
@@ -354,6 +357,58 @@ pub fn rt_sigaction(sig: usize, handler: usize) -> isize {
         8, // the sigset size
         0, 0,
     ])
+}
+
+// The sigreturn trampoline: the kernel jumps here when a handled signal
+// returns (x86_64's rt_sigaction demands SA_RESTORER with a userspace
+// restorer — there is no libc to host the vDSO trampoline). rt_sigreturn
+// is syscall 15; the kernel restores the interrupted context from the
+// signal frame the SP already points at.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl sigreturn_trampoline",
+    "sigreturn_trampoline:",
+    "mov $15, %eax",
+    "syscall",
+    options(att_syntax)
+);
+
+/// Register a real signal HANDLER (the SIG_DFL/SIG_IGN path is
+/// [`rt_sigaction`]). x86_64 needs SA_RESTORER with a userspace
+/// sigreturn trampoline (see the stub above); aarch64's kernel carries
+/// its own trampoline, so the plain flags work there.
+pub fn rt_sigaction_handler(sig: usize, handler: extern "C" fn(i32)) -> isize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const SA_RESTORER: usize = 0x0400_0000;
+        extern "C" {
+            fn sigreturn_trampoline();
+        }
+        let act = SigAction {
+            handler: handler as usize,
+            flags: SA_RESTORER,
+            restorer: sigreturn_trampoline as usize,
+            mask: 0,
+        };
+        syscall(nr::RT_SIGACTION, [
+            sig,
+            &act as *const SigAction as usize,
+            0,
+            8,
+            0, 0,
+        ])
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let act = SigAction { handler: handler as usize, flags: 0, restorer: 0, mask: 0 };
+        syscall(nr::RT_SIGACTION, [
+            sig,
+            &act as *const SigAction as usize,
+            0,
+            8,
+            0, 0,
+        ])
+    }
 }
 
 // ── The ABI structs (repr(C): the kernel's own layouts) ─────────────

@@ -313,6 +313,24 @@ fn child(conn: i32, envp: usize) {
     exit(124);
 }
 
+// ── The init power signals: the daemon's power switch ──────────────
+//
+// The guest's native power commands (busybox halt/poweroff/reboot)
+// work by SIGNALING PID 1 — the SIGUSR1/SIGUSR2/SIGTERM convention —
+// and in the command daemon the accept loop IS PID 1. Handling the
+// signals here is what makes the commands real: `poweroff` through the
+// port signals this process, the handler stores the EXIT hypercall,
+// and the VMM tears the VM down. (Plain PID-1 signal protection would
+// otherwise drop them: without the handlers the daemon ignores the
+// guest's own power switch — MEASURED, the unhandled-signal drop.)
+// The guest's state is ephemeral and dies with the VM; exit code 0 is
+// the whole contract. The signal fires mid-command — the command's own
+// status trailer races the teardown and may not land; a shutdown ack
+// is the connection's EOF, not the trailer.
+extern "C" fn power_signal(_sig: i32) {
+    exit_vm(0);
+}
+
 // ── The readiness event + the stage traces ──────────────────────────
 
 fn signal_ready() {
@@ -342,6 +360,11 @@ fn main_logic(port: u32, envp: usize) -> ! {
     }
     signal_ready();
     let _ = rt_sigaction(SIGCHLD, SIG_IGN);
+    // The init power signals (see power_signal): the daemon quits when
+    // the guest's native halt/poweroff/reboot commands run.
+    let _ = rt_sigaction_handler(SIGUSR1, power_signal);
+    let _ = rt_sigaction_handler(SIGUSR2, power_signal);
+    let _ = rt_sigaction_handler(SIGTERM, power_signal);
 
     loop {
         let conn = accept(lfd);

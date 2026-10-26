@@ -45,6 +45,9 @@ from vm_harness import Vm, test_main  # noqa: E402
 # works — nothing real listens here — but a PID offset keeps concurrent
 # test runs from sharing a port).
 PORT = 20000 + os.getpid() % 20000
+# The daemon VM's own listener: a second PID-offset port, so concurrent
+# test runs never share it.
+DAEMON_PORT = 21000 + os.getpid() % 20000
 
 # The 17-byte status trailer: 16 magic bytes + the status byte.
 MAGIC = b"VSOCKD:EXIT:01\n\0"
@@ -245,7 +248,7 @@ def main() -> None:
             flush=True,
         )
 
-        # ── 6. The teardown ─────────────────────────────────────────
+        # ── 6. The teardown ─────────────────────────────────
         # The clients closed above (every vsockd_run closes its socket);
         # the child per connection exited (auto-reaped); the accept loop
         # survives and serves again — one more command after the storm.
@@ -257,5 +260,97 @@ def main() -> None:
         vm.close()
 
 
-main_ok = test_main("vsockd", main)
+def main_daemon() -> None:
+    """`--port` with no command: the pure command daemon.
+
+    The VM boots with a listener and NOTHING else — no session, no
+    console command pinning its life — and serves commands through the
+    port until the guest's native power command quits it. The poweroff
+    here is the guest's own busybox one: it signals PID 1 (the accept
+    loop), the handler stores the EXIT hypercall, and the VMM tears the
+    VM down with exit code 0.
+    """
+    daemon = Vm(["--port", str(DAEMON_PORT)], command=())
+    try:
+        # The daemon prints no boot marker on its pty (no session to run
+        # one): readiness is the port itself — the VMM's listener accepts
+        # immediately and parks every connection until the guest's vsockd
+        # signals ready, so a connect-and-run just works at boot.
+        deadline = time.monotonic() + CMD_DEADLINE
+        out = status = None
+        while True:
+            try:
+                out, status = vsockd_run(
+                    DAEMON_PORT, "echo daemon-mode", 30
+                )
+                break
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.5)
+        if status != 0 or b"daemon-mode" not in out:
+            raise AssertionError(f"the daemon refused a command: {status}, {out[-200:]!r}")
+        print("vsockd: the daemon serves the port: OK", flush=True)
+
+        # Concurrent commands, one connection each — the same line the
+        # session-shaped VM serves, now with no session at all.
+        import threading
+        results: list[tuple[int, bytes, int]] = []
+        def _one(i: int) -> None:
+            out, status = vsockd_run(DAEMON_PORT, f"echo daemon-{i}", CMD_DEADLINE)
+            results.append((i, out, status))
+        threads = [threading.Thread(target=_one, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for i, out, status in results:
+            if status != 0 or f"daemon-{i}".encode() not in out:
+                raise AssertionError(f"daemon command {i} failed: {status}, {out[-80:]!r}")
+        print("vsockd: the daemon serves concurrently: OK", flush=True)
+
+        # The quit: the guest's native poweroff. The command signals PID 1
+        # (the accept loop); the handler stores the EXIT hypercall; the VMM
+        # tears the VM down with exit code 0. The command's own trailer
+        # races the teardown — the ACK is the connection's EOF, and the
+        # PROCESS's exit is the contract.
+        s = socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=CMD_DEADLINE)
+        s.sendall(struct.pack("<BHHI", 1, 0, 0, 8) + b"poweroff")
+        s.settimeout(CMD_DEADLINE)
+        try:
+            while s.recv(4096):
+                pass
+        except OSError:
+            pass
+        s.close()
+        exit_deadline = time.monotonic() + 30
+        while time.monotonic() < exit_deadline:
+            if daemon.proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("the daemon never quit after poweroff")
+        if daemon.proc.returncode != 0:
+            raise AssertionError(
+                f"the daemon quit with {daemon.proc.returncode}, want 0"
+            )
+        print("vsockd: the daemon quits on the native poweroff: OK", flush=True)
+
+        # And it stays quit: the listener is gone.
+        try:
+            socket.create_connection(("127.0.0.1", DAEMON_PORT), timeout=2).close()
+            raise AssertionError("the daemon's port still accepts after poweroff")
+        except (ConnectionRefusedError, OSError):
+            pass
+        print("vsockd: the daemon's port is closed after poweroff: OK", flush=True)
+    finally:
+        daemon.close()
+
+
+def all_tests() -> None:
+    main()
+    main_daemon()
+
+
+main_ok = test_main("vsockd", all_tests)
 sys.exit(main_ok)

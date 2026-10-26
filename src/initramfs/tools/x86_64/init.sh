@@ -162,9 +162,17 @@ if [ "$MEMCAP" -gt 0 ] && [ -w /sys/devices/system/memory/probe ]; then
         | sed -n 's/^memory\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
     IDX=$((IDX + 1))
     add_section() {
+        # ONE attempt at ONE section; the address advances UNCONDITIONALLY.
+        # A refused probe is permanent — the first section above the floor
+        # is where the virtio-mmio blocks live (0x10000000, the kernel
+        # resource tree holds it), so the kernel answers EEXIST and would
+        # answer it forever: a stuck IDX spun the boot here until the
+        # probe deadline killed it (MEASURED: no READY, no session line).
+        # Advancing costs nothing — the loop is bounded by the cap — and
+        # the skipped sections are exactly the ones that cannot work.
         echo $((IDX * SECTION_KB * 1024)) > /sys/devices/system/memory/probe \
-            && echo online > /sys/devices/system/memory/memory$IDX/state \
-            && IDX=$((IDX + 1))
+            && echo online > /sys/devices/system/memory/memory$IDX/state
+        IDX=$((IDX + 1))
     }
     # Headroom: the whole cap online before the session. A partial
     # envelope loses to the linker's working set (multi-GB in one

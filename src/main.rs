@@ -80,6 +80,16 @@ fn run_vm(args: Args) -> Result<()> {
         .format_suffix("\r\n")
         .init();
 
+    // The command is optional only with --port: a commandless VM is the
+    // pure command daemon (everything rides the port), and without the
+    // port there is nothing to run and nothing to serve.
+    if args.command.is_empty() && args.port.is_none() {
+        anyhow::bail!(
+            "sandal: nothing to run: give a command, or add --port ADDR:PORT \
+             to serve commands as a daemon"
+        );
+    }
+
     // Check we're running on a supported host.
     #[cfg(target_os = "windows")]
     {

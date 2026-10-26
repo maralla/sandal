@@ -27,6 +27,8 @@ use crate::virtio::vsock::HostStream;
 use crate::virtio::vsock::VirtioVsockDevice;
 use anyhow::Result;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -170,9 +172,23 @@ impl VsockHost {
     pub(super) fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         // Wake the accepter: its blocking accept() only returns when a
-        // connection pends or the listener is shut down; the shutdown
-        // makes it return an error, and the stop flag ends the loop.
-        self.listener = None;
+        // connection pends or the listener is shut down. The accepter owns
+        // the ORIGINAL listener fd — dropping this duplicated handle closes
+        // nothing (the socket stays open, the accept stays parked, and the
+        // join below hangs the whole teardown — MEASURED: every --port run
+        // froze at exit with the vCPU already stopped). The duplicate shares
+        // the socket's file description, so shutdown(Both) on it IS the
+        // listener's shutdown: the blocked accept() returns and the stop
+        // check ends the accepter.
+        if let Some(listener) = self.listener.take() {
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR);
+            }
+            #[cfg(not(unix))]
+            let _ = listener;
+            drop(listener);
+        }
         // Wake the bridge (unix): its parked poll returns now, the round
         // top's stop check ends the loop — the join below waits
         // microseconds, not a slice.
