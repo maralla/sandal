@@ -41,7 +41,7 @@ mod zchunk;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Args, Cli, Command, PackArgs};
+use cli::{Args, Command, PackArgs};
 use std::fs;
 
 fn run_pack(pack_args: &PackArgs) -> Result<()> {
@@ -151,30 +151,11 @@ fn run_vm(mut args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    // Try parsing with subcommands first. If that fails (e.g. `sandal echo hello`
-    // where `echo` isn't a known subcommand), fall back to parsing the entire
-    // command line as RunArgs for backward compatibility.
-    match Cli::try_parse() {
-        Ok(cli) => match cli.command {
-            Some(Command::Run(args)) => run_vm(args),
-            Some(Command::Pack(pack_args)) => run_pack(&pack_args),
-            None => {
-                // `sandal` with no args — show help
-                let _ = Cli::parse(); // This will print help and exit
-                Ok(())
-            }
-        },
-        Err(_) => {
-            // Failed to parse as subcommand — try as bare RunArgs
-            // (backward compat: `sandal echo hello` == `sandal run echo hello`)
-            let args = Args::try_parse()
-                .map_err(|e| {
-                    // If this also fails, show the original CLI help
-                    e.exit();
-                })
-                .unwrap();
-
-            run_vm(args)
-        }
+    let mut args = Args::parse();
+    // The pack subcommand is the rootfs build's tool, not a VM action.
+    // Everything else — including a bare `sandal echo hi` — runs the VM.
+    match args.action.take() {
+        Some(Command::Pack(pack_args)) => run_pack(&pack_args),
+        _ => run_vm(args),
     }
 }
