@@ -22,6 +22,7 @@ use super::GuestRam;
 use super::RAM_BASE;
 #[cfg(target_os = "linux")]
 use crate::hypervisor::Vm;
+#[cfg(target_os = "linux")]
 use crate::irqs::{SPI_NET, SPI_VSOCK};
 #[cfg(not(unix))]
 use crate::virtio::vsock::HostStream;

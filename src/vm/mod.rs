@@ -12,7 +12,7 @@
 
 pub(crate) use crate::cli::Args;
 #[cfg(not(target_os = "windows"))]
-pub(crate) use crate::irqs::{SPI_BLK, SPI_DATA_BLK, SPI_FS_START, SPI_NET, SPI_RNG, SPI_VSOCK};
+pub(crate) use crate::irqs::*;
 
 use crate::hypervisor::{Vcpu, Vm};
 
