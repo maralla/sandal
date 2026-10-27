@@ -10,8 +10,6 @@
 use super::{Args, Vmm, RAM_BASE};
 use crate::hypervisor::KvmExit;
 use anyhow::Result;
-use std::ffi::c_void;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

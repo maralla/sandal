@@ -100,23 +100,21 @@ pub trait HostStream: std::io::Read + std::io::Write + Send {
     }
 }
 
-impl HostStream for std::os::unix::net::UnixStream {
-    fn shutdown_both(&self) {
-        let _ = self.shutdown(std::net::Shutdown::Both);
-    }
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        AsRawFd::as_raw_fd(self)
-    }
-}
-
 impl HostStream for std::net::TcpStream {
     fn shutdown_both(&self) {
         let _ = self.shutdown(std::net::Shutdown::Both);
     }
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        AsRawFd::as_raw_fd(self)
+    fn as_raw_fd(&self) -> i32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            AsRawFd::as_raw_fd(self)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            AsRawSocket::as_raw_socket(self) as i32
+        }
     }
 }
 
@@ -590,6 +588,7 @@ impl VirtioVsockDevice {
             // device's outbox filling on the run loop's thread. Wake it
             // (see the wake_fd note): the output delivery drops from
             // "one poll slice" to "now".
+            #[cfg(unix)]
             self.wake_bridge();
         }
         progressed
@@ -1796,7 +1795,9 @@ mod tests {
     /// never reads or writes it (the bridge paths are exercised only
     /// through the device's public methods above).
     fn dummy_socket() -> Box<dyn HostStream> {
-        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let a = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        drop(listener);
         Box::new(a)
     }
 }

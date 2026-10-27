@@ -4,8 +4,12 @@
 
 use super::{
     resolve_data_path, Args, Vmm, MMIO_OFF_BLK, MMIO_OFF_DATA_BLK, MMIO_OFF_HYPERCALL,
-    MMIO_OFF_NET, MMIO_OFF_RNG, MMIO_OFF_VSOCK,
+    MMIO_OFF_NET, MMIO_OFF_RNG,
 };
+// The vsock MMIO dispatch is Linux's (the Windows WHP backend has no
+// vsock window yet).
+#[cfg(target_os = "linux")]
+use super::MMIO_OFF_VSOCK;
 // The virtiofs MMIO window is Unix-only (no --share on Windows).
 #[cfg(not(target_os = "windows"))]
 use super::{MMIO_OFF_FS, VIRTIOFS_SIZE};

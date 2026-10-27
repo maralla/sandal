@@ -64,12 +64,23 @@ extern "C" fn on_sigwinch(_sig: i32) {
 /// the session, so the session re-sizes itself exactly like a real
 /// terminal).
 fn rsz1_record() -> [u8; 8] {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
     let mut record = [0u8; 8];
     record[..4].copy_from_slice(b"RSZ1");
-    record[4..6].copy_from_slice(&ws.ws_col.to_le_bytes());
-    record[6..8].copy_from_slice(&ws.ws_row.to_le_bytes());
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
+        record[4..6].copy_from_slice(&ws.ws_col.to_le_bytes());
+        record[6..8].copy_from_slice(&ws.ws_row.to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        // The Windows console has no TIOCGWINSZ: the default geometry —
+        // the guest's vsockd applies what the record says, and 80x24 is
+        // the honest default.
+        record[4..6].copy_from_slice(&80u16.to_le_bytes());
+        record[6..8].copy_from_slice(&24u16.to_le_bytes());
+    }
     record
 }
 
@@ -125,10 +136,20 @@ impl SessionStream {
         // point), and its reaper exits without the hypercall — the
         // guest cannot tell the front ends apart, so the mode byte is
         // the only thing that carries the ownership.
+        // The geometry: TIOCGWINSZ is unix-only — Windows ships the
+        // honest 80x24 default (the guest pty takes what the header
+        // carries).
+        #[cfg(unix)]
         let (mode, rows, cols) = if interactive {
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
             unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
             (3u8, ws.ws_row, ws.ws_col)
+        } else {
+            (1u8, 0, 0)
+        };
+        #[cfg(windows)]
+        let (mode, rows, cols) = if interactive {
+            (3u8, 24u16, 80u16)
         } else {
             (1u8, 0, 0)
         };
@@ -151,6 +172,7 @@ impl SessionStream {
         // partial count and duplicate the output: MEASURED, the
         // flashing pane), and the resize signal armed (the handler only
         // sets the flag).
+        #[cfg(unix)]
         unsafe {
             for fd in [0, 1] {
                 let fl = libc::fcntl(fd, libc::F_GETFL);
@@ -219,7 +241,7 @@ impl Read for SessionStream {
         // pane stopped reacting to ANY input). The transport is now
         // event-driven end to end, and its backpressure is the
         // protocol's own credit window, so the burst is safe.
-        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len() as _) };
         if n < 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
         }
@@ -358,7 +380,7 @@ impl Write for SessionStream {
 /// POLLOUT. A partial accept returns the prefix; the caller loops.
 fn write_stdout_exact(data: &[u8], len: usize) -> std::io::Result<usize> {
     loop {
-        let n = unsafe { libc::write(1, data.as_ptr().cast(), len) };
+        let n = unsafe { libc::write(1, data.as_ptr().cast(), len as _) };
         if n >= 0 {
             return Ok(n as usize);
         }
@@ -373,16 +395,20 @@ fn write_stdout_exact(data: &[u8], len: usize) -> std::io::Result<usize> {
 impl HostStream for SessionStream {
     fn shutdown_both(&self) {
         // The host stdio is not ours to shut down (the harness owns it);
-        // EOF on the read side is the honest signal.
-        let _ = unsafe { libc::shutdown(0, libc::SHUT_RDWR) };
+        // EOF on the read side is the honest signal. libc's windows
+        // surface has no shutdown — the handles were never socketed.
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc::shutdown(0, libc::SHUT_RDWR);
+        }
     }
 
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+    fn as_raw_fd(&self) -> i32 {
         // The poll side: the host stdin (the read side).
         0
     }
 
-    fn write_fd(&self) -> Option<std::os::unix::io::RawFd> {
+    fn write_fd(&self) -> Option<i32> {
         // The poll side for the outbox: the host STDOUT — a different
         // fd than the read side, and (dup'd descriptions aside) its own
         // writability. See the trait note: polling the read fd for

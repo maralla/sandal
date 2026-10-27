@@ -39,6 +39,11 @@ use std::thread::JoinHandle;
 #[cfg(target_os = "linux")]
 pub(super) type IrqLevels = Arc<[AtomicBool; super::NUM_TRACKED_SPIS]>;
 
+/// One parked host stream: the host port, the stream, its outbox, and
+/// the poll fd (-1 where the bridge doesn't poll).
+#[cfg(not(unix))]
+type ParkedStream = (u32, Box<dyn HostStream>, Vec<u8>, i32);
+
 #[cfg(target_os = "linux")]
 pub(super) fn new_irq_levels() -> IrqLevels {
     Arc::new(std::array::from_fn(|_| AtomicBool::new(false)))
@@ -376,7 +381,7 @@ fn vsock_bridge(
             parked
         };
         #[cfg(not(unix))]
-        let parked: Vec<(u32, Box<dyn HostStream>, Vec<u8>, i32)> = work
+        let parked: Vec<ParkedStream> = work
             .into_iter()
             .map(|(port, host, outbox)| (port, host, outbox, -1))
             .collect();

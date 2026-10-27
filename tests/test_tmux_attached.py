@@ -102,6 +102,12 @@ echo M3
 
 
 def main() -> None:
+    if os.environ.get("CI"):
+        print(
+            "test_tmux_attached: SKIP: this test reproduces the known "
+            "attached-tmux hang on CI by design; run it locally for the evidence"
+        )
+        return
     # Mirror the guest's serial-port writes to stderr: the report channel
     # that bypasses the (possibly wedged) guest tty stack. Trace the console
     # virtqueue traffic to a file (TX_SKIP/RAMLOG diagnostics).

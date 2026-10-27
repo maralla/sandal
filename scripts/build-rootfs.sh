@@ -4,9 +4,7 @@
 #
 # Usage: build-rootfs.sh <output.ext2.zst> <pack-binary>
 #
-# Self-contained: the rootfs config lives below (this script is the single
-# source of truth — callable from `make rootfs-minimal` AND directly from
-# CI), and the Alpine minirootfs downloads on first use.
+# Runs on Linux/macOS only (the symlinks need a real OS).
 #   ROOTFS_BASELAYOUT — space-separated base-layout files to copy (relative to rootfs/)
 
 set -euo pipefail
@@ -45,22 +43,12 @@ ROOTFS_BASELAYOUT="etc/passwd etc/group etc/shadow etc/shells etc/hostname \
 	etc/hosts etc/issue etc/nsswitch.conf etc/alpine-release usr/lib/os-release"
 
 # The Alpine tree downloads on first use (a fresh checkout / CI). The
-# extraction is marker-verified: the tarball carries absolute-target
-# symlinks (etc/ssl1.1/certs → /etc/ssl/certs) that Windows tar cannot
-# create without symlink privilege — those failures are tolerable (the
-# loader, the busybox applets and apk all resolve without them), a
-# failed download is not.
+# extraction is strict: any failure is fatal.
 if [ ! -f "$SRCDIR/etc/alpine-release" ]; then
     echo "build-rootfs: downloading Alpine $ALPINE_VERSION ($ALPINE_ARCH)..."
     rm -rf "$SRCDIR"
     mkdir -p "$SRCDIR"
-    if ! curl -fSL --progress-bar "$ALPINE_URL" | tar xz -C "$SRCDIR"; then
-        [ -f "$SRCDIR/etc/alpine-release" ] || {
-            echo "build-rootfs: the Alpine extraction failed" >&2
-            exit 1
-        }
-        echo "build-rootfs: some symlink entries were skipped (harmless)"
-    fi
+    curl -fSL --progress-bar "$ALPINE_URL" | tar xz -C "$SRCDIR"
 fi
 
 # Bootstrap: if the pack binary doesn't exist yet (fresh checkout / CI),
@@ -150,13 +138,6 @@ for f in $ROOTFS_FILES; do
     fi
 done
 
-# Create symlinks
-for pair in $ROOTFS_SYMLINKS; do
-    target="${pair%%:*}"
-    link="${pair#*:}"
-    ln -s "$target" "$_R/$link"
-done
-
 # Create empty placeholder files (apk database)
 for f in $ROOTFS_TOUCH; do
     touch "$_R/$f"
@@ -170,13 +151,24 @@ if [ -n "${ROOTFS_APK_KEYS:-}" ] && [ -d "$SRCDIR/$ROOTFS_APK_KEYS" ]; then
     cp "$SRCDIR/$ROOTFS_APK_KEYS"/* "$_R/$ROOTFS_APK_KEYS/"
 fi
 
-# Base-layout files (passwd/group/os-release/...). -p preserves source modes
-# (e.g. /etc/shadow is 0640).
+# Base-layout files (passwd/group/os-release/...). -p preserves source
+# modes (e.g. /etc/shadow is 0640). Copied BEFORE the symlinks so their
+# staging targets exist.
 if [ -n "${ROOTFS_BASELAYOUT:-}" ]; then
     for f in $ROOTFS_BASELAYOUT; do
         cp -p "$SRCDIR/$f" "$_R/$f"
     done
 fi
+
+# Create symlinks (real links; the ext2 writer preserves them and the
+# layer format round-trips them). The baselayout copy above staged their
+# targets first.
+for pair in $ROOTFS_SYMLINKS; do
+    target="${pair%%:*}"
+    link="${pair#*:}"
+    mkdir -p "$_R/$(dirname "$link")"
+    ln -s "$target" "$_R/$link"
+done
 
 # Replicate all busybox symlinks from the source rootfs
 for dir in bin sbin usr/bin usr/sbin; do
@@ -190,8 +182,7 @@ done
 
 # Pack into ext2 and compress (zstd: ~3x faster to decode than gzip at
 # a similar ratio — the VMM decompresses this on every VM start). The
-# compression rides the sandal binary's own zstd: no system zstd needed
-# (Windows runners ship none).
+# compression rides the sandal binary's own zstd.
 "$PACK_BIN" pack "$_R" -o "$_R/minimal.ext2" --zstd
 mv "$_R/minimal.ext2" "$OUTPUT"
 
