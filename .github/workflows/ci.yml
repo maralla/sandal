@@ -106,6 +106,12 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: sudo apt-get update -q && sudo apt-get install -y -q expect
 
+      # The blob is gitignored — generated per run; rootfs.rs includes
+      # it and the suite's VMs boot it.
+      - name: Generate the built-in rootfs
+        shell: bash
+        run: bash scripts/build-rootfs.sh src/rootfs.ext2.zst target/release/sandal
+
       - name: Format
         run: cargo fmt --all -- --check
 

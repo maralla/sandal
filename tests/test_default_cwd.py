@@ -7,7 +7,7 @@ session it forks lands in the home, and the shell's own prompt renders
 the HOME-abbreviated form (`~ # `).
 
 The regression this test pins: the line's start moved BEFORE the cd (the
-daemon start block sits early in the init script), so every session
+daemon start block sits early in the init), so every session
 inherited the pre-cd cwd — which, after the pivot_root, resolved to the
 pivoted root's `/` — and the shell's own prompt rendered it (MEASURED:
 `pwd` printed `/`, the prompt `/ # `). The cd now comes first; this test

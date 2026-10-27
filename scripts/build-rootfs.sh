@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 #
-# build-rootfs.sh — Assemble a minimal embedded rootfs from an Alpine rootfs dir.
+# build-rootfs.sh — Assemble a minimal embedded rootfs from an Alpine minirootfs.
 #
-# Usage: build-rootfs.sh <output.ext2.gz> <pack-binary>
+# Usage: build-rootfs.sh <output.ext2.zst> <pack-binary>
 #
-# Environment variables (set by the Makefile):
-#   ROOTFS_FILES     — space-separated list of files to copy (relative to rootfs/)
-#   ROOTFS_SYMLINKS  — space-separated target:link-path pairs
-#   ROOTFS_DIRS      — space-separated directories to create
-#   ROOTFS_TOUCH     — space-separated empty files to create
-#   ROOTFS_APK_CONF  — space-separated apk config files to copy (relative to rootfs/)
-#   ROOTFS_APK_KEYS  — path to apk signing keys directory (relative to rootfs/)
+# Self-contained: the rootfs config lives below (this script is the single
+# source of truth — callable from `make rootfs-minimal` AND directly from
+# CI), and the Alpine minirootfs downloads on first use.
 #   ROOTFS_BASELAYOUT — space-separated base-layout files to copy (relative to rootfs/)
 
 set -euo pipefail
@@ -19,10 +15,50 @@ OUTPUT="$1"
 PACK_BIN="$2"
 SRCDIR="rootfs"
 
+# ── The rootfs config (moved here from the Makefile: this script is the
+# ── single source of truth, callable from make AND directly from CI).
+UNAME_M="$(uname -m)"
+case "$UNAME_M" in arm64) ALPINE_ARCH=aarch64 ;; *) ALPINE_ARCH="$UNAME_M" ;; esac
+ALPINE_VERSION="3.24.2"
+ALPINE_RELEASE="${ALPINE_VERSION%.*}"
+ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
+ALPINE_URL="$ALPINE_MIRROR/v$ALPINE_RELEASE/releases/$ALPINE_ARCH/alpine-minirootfs-$ALPINE_VERSION-$ALPINE_ARCH.tar.gz"
+
+# Binaries and libraries to copy into the minimal rootfs. Entries may be
+# shell globs, and symlinks are dereferenced below: name the loader-facing
+# soname (usr/lib/libz.so.1) and glob the patch-versioned real file
+# (usr/lib/libapk.so.*) instead of pinning per-Alpine-release versions.
+ROOTFS_FILES="bin/busybox lib/ld-musl-$ALPINE_ARCH.so.1 sbin/apk usr/bin/ldd \
+	usr/bin/ssl_client usr/lib/libapk.so.* usr/lib/libcrypto.so.* \
+	usr/lib/libssl.so.* usr/lib/libz.so.1"
+ROOTFS_SYMLINKS="ld-musl-$ALPINE_ARCH.so.1:lib/libc.musl-$ALPINE_ARCH.so.1 \
+	../usr/lib/os-release:etc/os-release"
+ROOTFS_DIRS="bin sbin usr/bin usr/sbin lib/apk/db usr/lib dev proc sys tmp \
+	var/cache/apk etc/apk/keys root"
+ROOTFS_TOUCH="lib/apk/db/lock lib/apk/db/triggers"
+ROOTFS_APK_CONF="etc/apk/repositories etc/apk/arch etc/apk/world lib/apk/db/installed"
+ROOTFS_APK_KEYS="etc/apk/keys"
+# The alpine-baselayout files: /etc/passwd + /etc/group give `id` a user
+# database, /etc/os-release tells distro-sniffing scripts something. A few
+# KiB of text (~1 KiB compressed).
+ROOTFS_BASELAYOUT="etc/passwd etc/group etc/shadow etc/shells etc/hostname \
+	etc/hosts etc/issue etc/nsswitch.conf etc/alpine-release usr/lib/os-release"
+
+# The Alpine tree downloads on first use (a fresh checkout / CI).
+if [ ! -f "$SRCDIR/etc/alpine-release" ]; then
+    echo "build-rootfs: downloading Alpine $ALPINE_VERSION ($ALPINE_ARCH)..."
+    rm -rf "$SRCDIR"
+    mkdir -p "$SRCDIR"
+    curl -fSL --progress-bar "$ALPINE_URL" | tar xz -C "$SRCDIR"
+fi
+
 # Bootstrap: if the pack binary doesn't exist yet (fresh checkout / CI),
-# build it with a stub rootfs so we can use `sandal pack`.
+# build it so we can use `sandal pack`. The touch is load-bearing: the
+# crate embeds this very file (include_bytes!), so it must EXIST — empty
+# — before the first compile; the real blob replaces it right after, and
+# the caller's cargo step rebuilds with the real content.
 if [ ! -x "$PACK_BIN" ]; then
-    echo "Bootstrapping: building binary with stub rootfs..."
+    echo "Bootstrapping: building pack binary..."
     touch "$OUTPUT"
     cargo build --release
     if [ -f sandal.entitlements ] && [ "$(uname -s)" = "Darwin" ]; then
@@ -142,8 +178,10 @@ for dir in bin sbin usr/bin usr/sbin; do
 done
 
 # Pack into ext2 and compress (zstd: ~3x faster to decode than gzip at
-# a similar ratio — the VMM decompresses this on every VM start).
-"$PACK_BIN" pack "$_R" -o "$_R/minimal.ext2"
-zstd -19 -c "$_R/minimal.ext2" > "$OUTPUT"
+# a similar ratio — the VMM decompresses this on every VM start). The
+# compression rides the sandal binary's own zstd: no system zstd needed
+# (Windows runners ship none).
+"$PACK_BIN" pack "$_R" -o "$_R/minimal.ext2" --zstd
+mv "$_R/minimal.ext2" "$OUTPUT"
 
 echo "Built $OUTPUT ($(wc -c < "$OUTPUT" | tr -d ' ') bytes)"

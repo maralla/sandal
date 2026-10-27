@@ -1748,7 +1748,7 @@ impl Vmm {
                     DONE_FULL => self.handle_export_done(true),
                     // The exit protocol: the low half selects the signal,
                     // the high half carries the session's exit code (the
-                    // init script's `sandal-exit <status>` helper).
+                    // init's `sandal-exit <status>` helper).
                     EXIT => {
                         self.guest_exit_code = Some((val >> 16) as i32);
                         self.guest_shutdown = true;

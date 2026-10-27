@@ -2,13 +2,13 @@
 """Exit-code forwarding test for the session agent (portagent).
 
 The session agent is the reaper: the session's exit status must reach
-the VMM's exit protocol — the init script's exit marker — EXACTLY:
+the VMM's exit protocol — the exit hypercall — EXACTLY:
 
   * a normal exit (`exit N`) forwards N (the reaper's status >> 8),
   * a signal death would forward 128+signal (the reaper's other path —
     exercised end-to-end by test_console_input's Ctrl-C check, 130),
-  * nothing else may substitute: the VMM exits 0 only when the marker
-    never matched, which is exactly the failure this test catches;
+  * nothing else may substitute: no other path writes the exit
+    code, which is exactly the failure this test catches;
   * the session-failure code (127: the guest shell's own not-found
     code — e.g. a typo in the workload command) forwards UNCHANGED,
     with the diagnostic on the NON-INTERACTIVE path only: there the

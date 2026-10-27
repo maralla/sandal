@@ -208,9 +208,9 @@ pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
 
 /// The vsock port the command execution line forwards (`/bin/vsockd`'s
-/// listen port — see initramfs/tools/x86_64/vsockd.c): the VMM
-/// synthesizes its REQUESTs with this dst_port, and the guest's vsockd
-/// — started by the init script off the VMM's own config — binds it
+/// listen port): the VMM synthesizes its REQUESTs with this dst_port,
+/// and the guest's vsockd — started by the init off the VMM's own
+/// config — binds it
 /// and runs what each connection carries (the general command
 /// execution proxy: the connection's own bytes decide what runs).
 /// Nothing real ever listened here; the value is fixed by this design

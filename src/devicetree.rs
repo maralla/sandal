@@ -41,6 +41,7 @@ impl DeviceTree {
         data_blk: Option<(u64, u32)>,
         virtio_rng: Option<(u64, u32)>,
         virtiofs: &[(u64, u32)],
+        virtio_vsock: Option<(u64, u32)>,
         verbose: bool,
         overlay_bootarg: Option<&str>,
         rng_seed: Option<&[u8]>,
@@ -223,6 +224,11 @@ impl DeviceTree {
 
         // Virtiofs MMIO nodes (shared directories)
         for &(base, spi) in virtiofs {
+            Self::virtio_mmio_node(&mut dt, base, spi);
+        }
+
+        // Virtio-vsock MMIO node (the command execution line)
+        if let Some((base, spi)) = virtio_vsock {
             Self::virtio_mmio_node(&mut dt, base, spi);
         }
 

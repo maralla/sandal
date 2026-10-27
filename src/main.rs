@@ -52,12 +52,19 @@ fn run_pack(pack_args: &PackArgs) -> Result<()> {
     eprintln!("Packing {:?} into {:?}...", pack_args.dir, pack_args.output);
 
     let image = ext2::pack_directory(&pack_args.dir)?;
+    // --zstd: the built-in rootfs's own format (the VMM decompresses it
+    // on every start; see rootfs.rs).
+    let payload = if pack_args.zstd {
+        zstd::encode_all(&image[..], 19)?
+    } else {
+        image
+    };
 
-    fs::write(&pack_args.output, &image)?;
+    fs::write(&pack_args.output, &payload)?;
     eprintln!(
         "Wrote {} bytes ({} KB) to {:?}",
-        image.len(),
-        image.len() / 1024,
+        payload.len(),
+        payload.len() / 1024,
         pack_args.output,
     );
 

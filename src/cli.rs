@@ -111,6 +111,11 @@ pub struct PackArgs {
     /// Output ext2 image path
     #[arg(short = 'o', long = "output", default_value = "rootfs.ext2")]
     pub output: PathBuf,
+
+    /// Compress the image with zstd (the built-in rootfs's own format —
+    /// the VMM decompresses it on every start).
+    #[arg(long = "zstd")]
+    pub zstd: bool,
 }
 
 /// Legacy Args type alias — used by vm.rs and main.rs.

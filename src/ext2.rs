@@ -2494,7 +2494,7 @@ fn inject_symlink(
 ///
 /// Creates directories, writes files, and creates symlinks as needed.
 /// All entry paths are placed under `upper/` to match the overlayfs
-/// directory layout expected by the guest init script.
+/// directory layout expected by the guest init.
 pub fn inject_tar_entries_ref(
     image: &mut [u8],
     tars: &[std::sync::Arc<Vec<u8>>],

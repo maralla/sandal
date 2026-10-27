@@ -46,7 +46,7 @@ def main() -> None:
         out = run("ls /dev/pts >/dev/null 2>&1 && echo PTS_OK; echo M1", "M1")
         if "PTS_OK" not in out:
             raise AssertionError(
-                "/dev/pts is not mounted — devpts missing from the init script"
+                "/dev/pts is not mounted — devpts missing from the init"
             )
 
         out = run(

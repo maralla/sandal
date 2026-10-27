@@ -4,7 +4,7 @@
 The session agent (portagent) bridges a guest pty to the virtio-console
 host device port. The geometry chain:
 
-  * boot:   the init script passes the VMM's advertised window on the
+  * boot:   the init passes the VMM's advertised window on the
             agent's command line; the agent applies it to the pty pair
             before the fork, so the session starts sized;
   * live:   the VMM polls the host pty's winsize (the kernel's

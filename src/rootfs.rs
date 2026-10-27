@@ -9,7 +9,9 @@
 //! container (see crate::zchunk) — their format is part of the
 //! export/load interface.
 
-/// zstd-compressed minimal ext2 rootfs image.
+/// zstd-compressed minimal ext2 rootfs image. GENERATED (`make
+/// rootfs-minimal`: the Alpine minirootfs packed through `sandal pack
+/// --zstd`) and gitignored — never committed.
 pub const BUILTIN_ROOTFS_ZST: &[u8] = include_bytes!("rootfs.ext2.zst");
 
 /// Decompress and return the built-in rootfs as a raw ext2 image.
