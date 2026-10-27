@@ -70,10 +70,6 @@ ARCH="$(map_arch "${1:-$(uname -m)}")" || {
 }
 
 OUT="$PROJECT_DIR/vmlinux-sandal-$ARCH"
-if [ -e "$OUT" ]; then
-    ok "$(basename "$OUT") already present ($(du -h "$OUT" | cut -f1)); delete it to re-fetch"
-    exit 0
-fi
 
 info "Fetching SHA256SUMS from $RELEASES/latest/..."
 SUMS="$(curl -fsSL "$RELEASES/latest/download/SHA256SUMS")" || {
@@ -86,6 +82,18 @@ EXPECTED="$(awk -v f="vmlinux-sandal-$ARCH" '$2 == f { print $1 }' <<<"$SUMS")"
     error "SHA256SUMS has no entry for vmlinux-sandal-$ARCH"
     exit 1
 }
+
+# A local kernel is kept only if it matches the latest release's hash: a
+# new sandal-assets tag moves the release, and a cached/stale file (CI
+# caches the blob by this script's hash) must follow it, not linger.
+if [ -e "$OUT" ]; then
+    LOCAL="$(sha256sum "$OUT" | cut -d' ' -f1)"
+    if [ "$LOCAL" = "$EXPECTED" ]; then
+        ok "$(basename "$OUT") already present and current ($(du -h "$OUT" | cut -f1))"
+        exit 0
+    fi
+    info "$(basename "$OUT") differs from the latest release; re-fetching"
+fi
 
 info "Fetching vmlinux-sandal-$ARCH..."
 PART="$OUT.part"
