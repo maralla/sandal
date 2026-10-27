@@ -1074,8 +1074,12 @@ impl Vmm {
 
             #[cfg(target_os = "macos")]
             {
-                let fl = libc::fcntl(0, libc::F_GETFL);
-                let _ = libc::fcntl(0, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                // The session's stdin: nonblocking (the run loop's poll
+                // owns the pacing; a blocking read would stall it).
+                unsafe {
+                    let fl = libc::fcntl(0, libc::F_GETFL);
+                    let _ = libc::fcntl(0, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
             }
 
             // The exit-path restore: `process::exit` never runs the

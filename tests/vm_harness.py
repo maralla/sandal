@@ -191,8 +191,46 @@ def host_can_run_vm() -> bool:
             return False
         return machine in ("aarch64", "arm64")
     if sys.platform.startswith("linux"):
-        return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+        if os.environ.get("SANDAL_KVM_UNUSABLE"):
+            return False
+        if not (os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)):
+            return False
+        return guest_entry_works()
     return False
+
+
+_ENTRY_OK: bool | None = None
+
+
+def guest_entry_works() -> bool:
+    """One tiny boot decides the KVM question decisively.
+
+    A runner can ship an accessible /dev/kvm that cannot actually
+    validate our guest state — GitHub's nested KVM fails every vmentry
+    with hardware_entry_failure_reason=0x80000021. The existence check
+    cannot see that; one `--script` boot (the lightest path) can, and
+    the result is memoized for the process.
+    """
+    global _ENTRY_OK
+    if _ENTRY_OK is not None:
+        return _ENTRY_OK
+    import tempfile
+
+    fd, script = tempfile.mkstemp(suffix=".sh")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("echo ENTRY-PROBE-OK\n")
+        r = subprocess.run(
+            [str(SANDAL), "--script", script],
+            capture_output=True,
+            timeout=120,
+        )
+        _ENTRY_OK = r.returncode == 0 and b"ENTRY-PROBE-OK" in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        _ENTRY_OK = False
+    finally:
+        os.unlink(script)
+    return _ENTRY_OK
 
 
 def skip_reason() -> str:

@@ -44,12 +44,23 @@ ROOTFS_APK_KEYS="etc/apk/keys"
 ROOTFS_BASELAYOUT="etc/passwd etc/group etc/shadow etc/shells etc/hostname \
 	etc/hosts etc/issue etc/nsswitch.conf etc/alpine-release usr/lib/os-release"
 
-# The Alpine tree downloads on first use (a fresh checkout / CI).
+# The Alpine tree downloads on first use (a fresh checkout / CI). The
+# extraction is marker-verified: the tarball carries absolute-target
+# symlinks (etc/ssl1.1/certs → /etc/ssl/certs) that Windows tar cannot
+# create without symlink privilege — those failures are tolerable (the
+# loader, the busybox applets and apk all resolve without them), a
+# failed download is not.
 if [ ! -f "$SRCDIR/etc/alpine-release" ]; then
     echo "build-rootfs: downloading Alpine $ALPINE_VERSION ($ALPINE_ARCH)..."
     rm -rf "$SRCDIR"
     mkdir -p "$SRCDIR"
-    curl -fSL --progress-bar "$ALPINE_URL" | tar xz -C "$SRCDIR"
+    if ! curl -fSL --progress-bar "$ALPINE_URL" | tar xz -C "$SRCDIR"; then
+        [ -f "$SRCDIR/etc/alpine-release" ] || {
+            echo "build-rootfs: the Alpine extraction failed" >&2
+            exit 1
+        }
+        echo "build-rootfs: some symlink entries were skipped (harmless)"
+    fi
 fi
 
 # Bootstrap: if the pack binary doesn't exist yet (fresh checkout / CI),

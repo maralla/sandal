@@ -20,6 +20,7 @@
 
 use super::GuestRam;
 use super::RAM_BASE;
+#[cfg(target_os = "linux")]
 use crate::hypervisor::Vm;
 use crate::irqs::{SPI_NET, SPI_VSOCK};
 #[cfg(not(unix))]
@@ -145,6 +146,7 @@ impl VsockHost {
                             memory,
                             #[cfg(target_os = "linux")]
                             (vm, irq_line),
+                            #[cfg(target_os = "linux")]
                             irq_lock,
                             #[cfg(target_os = "linux")]
                             irq_levels,
@@ -278,7 +280,7 @@ fn vsock_accepter(
 fn vsock_bridge(
     memory: Arc<GuestRam>,
     #[cfg(target_os = "linux")] (vm, irq_line): (Vm, u32),
-    irq_lock: Arc<Mutex<()>>,
+    #[cfg(target_os = "linux")] irq_lock: Arc<Mutex<()>>,
     #[cfg(target_os = "linux")] irq_levels: IrqLevels,
     device: Arc<Mutex<VirtioVsockDevice>>,
     stop: Arc<AtomicBool>,
@@ -488,7 +490,8 @@ fn vsock_bridge(
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _guard = irq_lock.lock();
+            // No IRQ lock here: the pulse discipline is Linux's (the
+            // device's own mutex already serializes this exchange).
             let mut guard = device.lock().unwrap();
             guard.bridge_exchange(returned, read, closed, delivered);
             guard.process(memory.as_shared_slice(), RAM_BASE);

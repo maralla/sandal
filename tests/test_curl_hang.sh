@@ -28,7 +28,7 @@ if [ "${SANDAL_HVF_UNUSABLE:-}" = "1" ]; then
     echo "test_curl_hang: SKIP: HVF probe failed (hv_vm_create unusable)"
     exit 0
 fi
-if [ "$(uname -s)" = "Linux" ] && ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+if [ -n "${SANDAL_KVM_UNUSABLE:-}" ] || { [ "$(uname -s)" = "Linux" ] && ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; }; then
     echo "test_curl_hang: SKIP: no accessible /dev/kvm (no nested virtualization)"
     exit 0
 fi

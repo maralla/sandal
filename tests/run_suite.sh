@@ -38,6 +38,20 @@ else
     PYTHON="python3"
 fi
 
+
+# The VM-entry probe: a runner can ship an accessible /dev/kvm that
+# cannot actually validate our guest state (GitHub's nested KVM fails
+# every vmentry with 0x80000021). One tiny boot decides; on a bad host
+# the VM tests self-skip instead of failing 17 times.
+if ! $PYTHON -c "
+import sys
+sys.path.insert(0, 'tests')
+from vm_harness import guest_entry_works
+sys.exit(0 if guest_entry_works() else 1)
+" 2>/dev/null; then
+    export SANDAL_KVM_UNUSABLE=1
+    echo "SKIP: this host cannot run the guest (the KVM entry probe failed) — the VM tests self-skip"
+fi
 # name|timeout|command — the suite, in run order. $PYTHON expands
 # here, once. The timeout column (seconds) replaces TEST_TIMEOUT for
 # that test; 0 = the TEST_TIMEOUT default. The channel tests (vsock,
