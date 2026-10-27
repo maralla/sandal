@@ -125,14 +125,12 @@ def main() -> None:
             raise AssertionError(f"Ctrl-C did not return the prompt: {vm.buf[-120:]!r}")
         vm.buf = b""
         os.write(vm.master, b"echo S=$?\r")
-        # The interrupted status: 128+9 — the shell's children IGNORE
-        # SIGINT/SIGQUIT (busybox ash's set_safe_signals, the POSIX
-        # rule for uncaptured jobs), so the bridge delivers SIGKILL:
-        # the job dies deterministically and the shell reports the
-        # shell-convention code for a SIGKILLed job.
-        if not vm.wait_for(b"S=137", 1, 5):
-            raise AssertionError(f"interrupted command exit status != 137: {vm.buf[-120:]!r}")
-        print("console-input: Ctrl-C interrupts (status 137)")
+        # The interrupted status: 128+2 — the tty's line discipline
+        # delivered the SIGINT to the foreground job (the standard ISIG
+        # job control: the pty has the controlling terminal).
+        if not vm.wait_for(b"S=130", 1, 5):
+            raise AssertionError(f"interrupted command exit status != 130: {vm.buf[-120:]!r}")
+        print("console-input: Ctrl-C interrupts (status 130)")
 
         vm.buf = b""
         os.write(vm.master, b"sleep 60\r")

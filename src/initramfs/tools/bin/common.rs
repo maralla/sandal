@@ -870,16 +870,6 @@ pub fn open_dev_ptmx() -> i32 {
     syscall(nr::OPENAT, [AT_FDCWD, path.as_ptr() as usize, O_RDWR, 0, 0, 0]) as i32
 }
 
-pub fn signal_pgrps(skip: i32, sig: usize) {
-    let mut p: i32 = 2;
-    while p < 4096 {
-        if p != skip {
-            let _ = kill(-p, sig);
-        }
-        p += 1;
-    }
-}
-
 pub fn status_byte(status: i32) -> u8 {
     if status & 0x7F != 0 {
         (128 + (status & 0x7F)) as u8
