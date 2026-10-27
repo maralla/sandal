@@ -89,9 +89,7 @@ fn strip_input(master: i32, session_pid: i32, input: &mut [u8]) -> usize {
             // Control bytes (Ctrl-C, Ctrl-Z, Ctrl-\) pass through RAW:
             // the session's pty has a controlling terminal with ISIG on,
             // so the kernel's line discipline does standard job control
-            // (SIGINT/SIGQUIT/SIGTSTP to the foreground group). The
-            // console-era manual signaling is gone — a stripped 0x03
-            // made the interactive shell deaf to Ctrl-C.
+            // (SIGINT/SIGQUIT/SIGTSTP to the foreground group).
             _ => {
                 if input.len() - i >= 8 && &input[i..i + 4] == b"RSZ1" {
                     let cols = u16::from_le_bytes([input[i + 4], input[i + 5]]);

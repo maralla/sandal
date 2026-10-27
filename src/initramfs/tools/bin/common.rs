@@ -22,7 +22,6 @@ pub const POLLOUT: i16 = 0x004;
 pub const SIGCHLD: usize = 17;
 pub const SIGPIPE: usize = 13;
 pub const SIGKILL: usize = 9;
-pub const SIGTSTP: usize = 20;
 pub const SIGTERM: usize = 15;
 pub const SIGUSR1: usize = 10;
 pub const SIGUSR2: usize = 12;

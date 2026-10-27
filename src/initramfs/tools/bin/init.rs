@@ -1,11 +1,10 @@
 //! The guest `/init` — one compiled binary on BOTH architectures (the
 //! syscalls are arch-uniform).
 //!
-//! The run configuration arrives as the SAME text file the script read
-//! (`/etc/sandal.conf`, VMM-injected); the session transport is the vsock
-//! line on every platform, so the init's last act is the same exec the
-//! script made: `/bin/vsockd <port>`, PID 1 IS the accept loop, and the
-//! command execution rides the session front end.
+//! The run configuration arrives as `/etc/sandal.conf` (VMM-injected);
+//! the session transport is the vsock line on every platform, so the
+//! init's last act is the exec: `/bin/vsockd <port>`, PID 1 IS the
+//! accept loop, and the command execution rides the session front end.
 //!
 //! Flow:
 //!   1. mount proc/sys/devtmpfs
@@ -459,8 +458,8 @@ pub extern "C" fn guest_entry(_rsp: usize) -> ! {
     // master's own slave (a plain compat mount's ptmx is non-functional,
     // and the pty would land in a different instance than the slave path
     // resolves in). The symlink makes every ptmx open land in THIS
-    // instance. Both best-effort (the script's 2>/dev/null): a kernel
-    // without the option keeps the compat mount's ptmx.
+    // instance. Both best-effort: a kernel without the option keeps the
+    // compat mount's ptmx.
     let _ = mkdir(S_DEVPTS_PATH, 0o755);
     let _ = mount(S_DEVPTS, S_DEVPTS_PATH, S_DEVPTS, 0, S_DEVPTS_NEWINSTANCE.as_ptr() as usize);
     let _ = unlink(S_PTMX);
