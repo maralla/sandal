@@ -78,6 +78,7 @@ geometry|0|$PYTHON tests/test_geometry.py
 session-resize|0|$PYTHON tests/test_session_resize.py
 tmux|0|$PYTHON tests/test_tmux.py
 tmux-attached|0|$PYTHON tests/test_tmux_attached.py
+bhb|0|$PYTHON tests/test_bhb.py
 python-repl|0|$PYTHON tests/test_python_repl.py
 packages|0|$PYTHON tests/test_packages.py
 curl-hang|0|tests/test_curl_hang.sh 1 128

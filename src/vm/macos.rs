@@ -257,8 +257,13 @@ impl Vmm {
         let fid = self.vcpu.read_register(Reg::X0)?;
         let ret: u64 = match fid {
             0x8400_0000 => 0x0000_0001_0000_0002, // PSCI_VERSION → 1.1
-            0x8400_0002 => 0,                     // CPU_OFF: success
-            0xc400_0003 | 0x8400_0003 => 0,       // CPU_ON: single CPU, treat as success
+            0x8000_0000 | 0x8000_7fff | 0x8000_8000 => {
+                // The architectural calls (SMCCC_VERSION, ARCH_FEATURES,
+                // ARCH_WORKAROUND_1): the spectre-BHB conduit.
+                smccc_arch_call(fid, self.vcpu.read_register(Reg::X1)?)
+            }
+            0x8400_0002 => 0,               // CPU_OFF: success
+            0xc400_0003 | 0x8400_0003 => 0, // CPU_ON: single CPU, treat as success
             0x8400_0008 | 0x8400_0009 => {
                 // SYSTEM_OFF / SYSTEM_RESET: stop the VM.
                 self.guest_shutdown = true;
@@ -271,6 +276,27 @@ impl Vmm {
         };
         self.vcpu.write_register(Reg::X0, ret)?;
         Ok(())
+    }
+
+    /// The architectural SMCCC calls the guest's spectre-BHB hardening
+    /// probes: VERSION, ARCH_FEATURES, ARCH_WORKAROUND_1. Pure — the
+    /// unit tests pin the responses on the macOS CI runner, where
+    /// hv_vm_create is too flaky to run the VM integration suite.
+    fn smccc_arch_call(fid: u64, arg: u64) -> u64 {
+        match fid {
+            0x8000_0000 => 0x0001_0001, // SMCCC_VERSION → 1.1
+            0x8000_7fff => {
+                // ARCH_FEATURES(ARCH_WORKAROUND_1): 0 = implemented and
+                // required; anything else probed is not implemented.
+                if arg == 0x8000_8000 {
+                    0
+                } else {
+                    0xffff_ffff_ffff_ffff
+                }
+            }
+            0x8000_8000 => 0, // ARCH_WORKAROUND_1: mitigated
+            _ => 0xffff_ffff_ffff_ffff,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -576,5 +602,38 @@ impl Vmm {
             Some(r) => self.vcpu.read_register(r),
             None => Ok(0),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod smccc_tests {
+    use super::smccc_arch_call;
+
+    #[test]
+    fn smccc_version_reports_1_1() {
+        assert_eq!(smccc_arch_call(0x8000_0000, 0), 0x0001_0001);
+    }
+
+    #[test]
+    fn arch_features_reports_the_bhb_workaround_implemented() {
+        assert_eq!(smccc_arch_call(0x8000_7fff, 0x8000_8000), 0);
+    }
+
+    #[test]
+    fn arch_features_rejects_unknown_functions() {
+        assert_eq!(
+            smccc_arch_call(0x8000_7fff, 0x8400_0002),
+            0xffff_ffff_ffff_ffff
+        );
+    }
+
+    #[test]
+    fn workaround_call_succeeds() {
+        assert_eq!(smccc_arch_call(0x8000_8000, 0), 0);
+    }
+
+    #[test]
+    fn unknown_arch_calls_return_not_implemented() {
+        assert_eq!(smccc_arch_call(0x8000_0001, 0), 0xffff_ffff_ffff_ffff);
     }
 }

@@ -36,8 +36,8 @@ impl Vm {
         // only be unmasked once the guest has serviced INTID 27 (unmasking
         // earlier re-fires the still-expired comparator).  Observing that EOI
         // requires the ICC sysregs to trap, which only happens while HVF does
-        // not own the GIC.  With the native GIC the vtimer fires once and then
-        // stays masked, which is why the previous timer workarounds existed.
+        // not own the GIC — with the native GIC the vtimer fires once and
+        // then stays masked.
         Ok(Vm {
             _marker: std::marker::PhantomData,
         })
