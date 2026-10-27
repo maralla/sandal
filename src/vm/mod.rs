@@ -27,6 +27,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -1176,6 +1177,7 @@ impl Vmm {
             let host_spawner = (host.irq_lock.clone(), host.irq_levels.clone());
             Some(vsock_host::VsockHost::spawn(
                 memory.clone(),
+                #[cfg(target_os = "linux")]
                 vm.clone(),
                 #[cfg(target_os = "linux")]
                 host_spawner.0,

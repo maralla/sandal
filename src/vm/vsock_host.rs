@@ -65,7 +65,7 @@ impl VsockHost {
     /// One core, two front ends — the exchange loop is stream-agnostic.
     pub(super) fn spawn(
         memory: Arc<GuestRam>,
-        vm: Vm,
+        #[cfg(target_os = "linux")] vm: Vm,
         #[cfg(target_os = "linux")] irq_lock: Arc<Mutex<()>>,
         #[cfg(target_os = "linux")] irq_levels: IrqLevels,
         listener: Option<std::net::TcpListener>,
@@ -145,9 +145,6 @@ impl VsockHost {
                             memory,
                             #[cfg(target_os = "linux")]
                             (vm, irq_line),
-                            #[cfg(not(target_os = "linux"))]
-                            vm,
-                            #[cfg(target_os = "linux")]
                             irq_lock,
                             #[cfg(target_os = "linux")]
                             irq_levels,
@@ -281,9 +278,8 @@ fn vsock_accepter(
 fn vsock_bridge(
     memory: Arc<GuestRam>,
     #[cfg(target_os = "linux")] (vm, irq_line): (Vm, u32),
-    #[cfg(not(target_os = "linux"))] _vm: Vm,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] irq_lock: Arc<Mutex<()>>,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] irq_levels: IrqLevels,
+    irq_lock: Arc<Mutex<()>>,
+    #[cfg(target_os = "linux")] irq_levels: IrqLevels,
     device: Arc<Mutex<VirtioVsockDevice>>,
     stop: Arc<AtomicBool>,
     #[cfg(unix)] wake_r: std::os::fd::RawFd,
@@ -355,7 +351,7 @@ fn vsock_bridge(
                 events: libc::POLLIN,
                 revents: 0,
             });
-            let _ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u64, 20) };
+            let _ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 20) };
             if std::env::var_os("SANDAL_VSOCK_DEBUG").is_some() {
                 let mut sum = String::new();
                 for fd in fds.iter() {

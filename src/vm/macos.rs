@@ -240,20 +240,13 @@ impl Vmm {
             }
         }
 
-        // Wait for host stdin and/or the timer deadline.
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, wait_ms) };
-        if n > 0 && pfd.revents & libc::POLLIN != 0 {
-            self.drain_stdin()?;
-        } else if n == 0 {
-            // Timeout: the vtimer expired while the vCPU was idle-parked.
-            self.gic.set_pending(IRQ_VTIMER);
-            self.vtimer_masked = true;
-        }
+        // Park for the vtimer deadline. The session input rides the
+        // vsock line on every platform — the console stdin is not the
+        // macOS input path, so the park needs no stdin poll.
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms.max(0) as u64));
+        // The deadline elapsed while the vCPU was idle-parked.
+        self.gic.set_pending(IRQ_VTIMER);
+        self.vtimer_masked = true;
         Ok(())
     }
 
