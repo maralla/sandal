@@ -41,8 +41,9 @@
 //!     per-round "deliver what does not match" scan printed the whole
 //!     magic to the terminal; see [`SessionStream::write`]).
 
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{env, io, process};
 
 use anyhow::{bail, Result};
 
@@ -90,6 +91,12 @@ fn rsz1_record() -> [u8; 8] {
 pub(super) struct SessionStream {
     /// The pending header + command (the first read, delivered whole).
     pending: Vec<u8>,
+    /// Windows: the console read(0) blocks, so a dedicated reader thread
+    /// owns stdin and hands batches over this channel; the bridge's read
+    /// side drains it without ever blocking the round. Unix keeps the
+    /// nonblocking fd (the poll drives it).
+    #[cfg(windows)]
+    stdin_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     /// The command line, kept for the failure diagnostic (see
     /// [`SessionStream::write`] — the non-interactive path's failure
     /// must be NAMED, never silent).
@@ -125,10 +132,12 @@ impl SessionStream {
         if command_line.is_empty() {
             bail!("no command");
         }
+
         // The mirror rule: the guest session's tty-ness mirrors this
         // session's. A real terminal additionally carries its own
         // geometry; the header carries it to the guest pty pair.
         let interactive = unsafe { libc::isatty(0) == 1 };
+
         // Mode 0x03, not 0x02: the session line's pty session OWNS the
         // VM's lifetime — the command's exit ends the VM (the guest's
         // reaper ends in the exit hypercall). 0x02 is --port's pty
@@ -147,18 +156,21 @@ impl SessionStream {
         } else {
             (1u8, 0, 0)
         };
+
         #[cfg(windows)]
         let (mode, rows, cols) = if interactive {
             (3u8, 24u16, 80u16)
         } else {
             (1u8, 0, 0)
         };
+
         let mut pending = Vec::with_capacity(9 + command_line.len());
         pending.push(mode);
         pending.extend_from_slice(&rows.to_le_bytes());
         pending.extend_from_slice(&cols.to_le_bytes());
         pending.extend_from_slice(&(command_line.len() as u32).to_le_bytes());
         pending.extend_from_slice(command_line.as_bytes());
+
         // The host tty's OPOST is the VMM's own doing (see Vmm::new:
         // the output is pre-formed by the guest pty), and its restore is
         // the VMM's own exit-path handler — this stream never touches
@@ -183,8 +195,33 @@ impl SessionStream {
                 on_sigwinch as extern "C" fn(i32) as libc::sighandler_t,
             );
         }
+
+        #[cfg(windows)]
+        let stdin_rx = {
+            use std::sync::mpsc;
+            use std::thread;
+
+            // The Windows console read blocks, so a dedicated thread owns
+            // stdin and hands whole reads to the bridge through a channel.
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            thread::spawn(move || loop {
+                let mut buf = [0u8; 4096];
+                match unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len() as _) } {
+                    n if n > 0 => {
+                        if tx.send(buf[..n as usize].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break, // stdin closed: the session's input ends
+                }
+            });
+            rx
+        };
+
         Ok(Self {
-            pending,
+            pending: Vec::new(),
+            #[cfg(windows)]
+            stdin_rx,
             command: command_line.into_bytes(),
             interactive,
             tail: Vec::new(),
@@ -210,6 +247,7 @@ impl Read for SessionStream {
             self.pending.drain(..n);
             return Ok(n);
         }
+
         // A resize: the record ahead of the input (the guest's vsockd
         // strips and applies it).
         if RESIZED.swap(false, Ordering::SeqCst) {
@@ -218,6 +256,7 @@ impl Read for SessionStream {
             buf[..n].copy_from_slice(&record[..n]);
             return Ok(n);
         }
+
         // The WHOLE available host stdin — the batch. EAGAIN (the
         // empty host stdin) is EOF to the exchange loop's round: the
         // round proceeds to the device's process pass (the input's own
@@ -241,16 +280,43 @@ impl Read for SessionStream {
         // pane stopped reacting to ANY input). The transport is now
         // event-driven end to end, and its backpressure is the
         // protocol's own credit window, so the burst is safe.
-        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len() as _) };
-        if n < 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        #[cfg(windows)]
+        {
+            use std::sync::mpsc::TryRecvError;
+
+            // The reader thread's batches: TryCurrent would block-poll;
+            // try_recv is the nonblocking drain (WouldBlock = no input
+            // this round, exactly the unix EAGAIN's meaning here).
+            match self.stdin_rx.try_recv() {
+                Ok(batch) => {
+                    let n = batch.len().min(buf.len());
+                    buf[..n].copy_from_slice(&batch[..n]);
+                    if batch.len() > n {
+                        self.pending = batch[n..].to_vec();
+                    }
+                    Ok(n)
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // stdin ended: no input this round
+                    Ok(0)
+                }
+                Err(TryRecvError::Empty) => Err(Error::from(ErrorKind::WouldBlock)),
+            }
         }
-        // EOF (n == 0) is a REAL signal: the bridge distinguishes it
-        // from EAGAIN via eof_is_hangup (false here) — the session's
-        // stdin ending never closes the session (the command's output
-        // must keep flowing), and the bridge stops polling the read
-        // side instead of spinning on a permanently-ready EOF.
-        Ok(n as usize)
+
+        #[cfg(unix)]
+        {
+            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len() as _) };
+            if n < 0 {
+                return Err(Error::from(ErrorKind::WouldBlock));
+            }
+            // EOF (n == 0) is a REAL signal: the bridge distinguishes it
+            // from EAGAIN via eof_is_hangup (false here) — the session's
+            // stdin ending never closes the session (the command's output
+            // must keep flowing), and the bridge stops polling the read
+            // side instead of spinning on a permanently-ready EOF.
+            Ok(n as usize)
+        }
     }
 }
 
@@ -293,6 +359,7 @@ impl Write for SessionStream {
         let mut scan = Vec::with_capacity(self.tail.len() + buf.len());
         scan.extend_from_slice(&self.tail);
         scan.extend_from_slice(buf);
+
         // The completed trailer at the scan's end: everything before it
         // is the session's output (the withholding rounds held it back),
         // then the exit.
@@ -307,6 +374,7 @@ impl Write for SessionStream {
                     // the pty takes it.
                     let _ = write_stdout_exact(&scan, at);
                 }
+
                 // The exit diagnostic: the NON-INTERACTIVE path only.
                 // There the failing command's own output never becomes
                 // visible (the guest drops most of it before it ever
@@ -324,13 +392,15 @@ impl Write for SessionStream {
                         &[String::from_utf8_lossy(&self.command).into_owned()],
                     );
                 }
-                if std::env::var_os("SANDAL_DEBUG_TIMING").is_some() {
+
+                if env::var_os("SANDAL_DEBUG_TIMING").is_some() {
                     eprintln!(
                         "BOOT_TIMING trailer_scan_exit: {:?}",
                         crate::vm::BOOT_T0.get().map(|t| t.elapsed())
                     );
                 }
-                std::process::exit(status as i32);
+
+                process::exit(status as i32);
             }
         }
         // No trailer: withhold the longest suffix that could be its
@@ -343,10 +413,12 @@ impl Write for SessionStream {
                 withhold = prefix;
             }
         }
+
         let deliver = scan.len() - withhold;
         if deliver == 0 {
             return Ok(0);
         }
+
         // ONE raw write, exact count. The accepted bytes consume the
         // tail first (already reported delivered by the round that
         // withheld them — writing them again must not charge this
@@ -362,11 +434,13 @@ impl Write for SessionStream {
             self.tail = self.tail[n..].to_vec();
             return Ok(0);
         }
+
         self.tail.clear();
+
         Ok(n - self.tail.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         // The bytes go to the pty through raw write(2) — no userspace
         // buffering to flush.
         Ok(())
@@ -378,16 +452,18 @@ impl Write for SessionStream {
 /// fills under a burst) returns WouldBlock with nothing consumed — the
 /// caller keeps its buffers and the bridge parks on stdout's own
 /// POLLOUT. A partial accept returns the prefix; the caller loops.
-fn write_stdout_exact(data: &[u8], len: usize) -> std::io::Result<usize> {
+fn write_stdout_exact(data: &[u8], len: usize) -> io::Result<usize> {
     loop {
         let n = unsafe { libc::write(1, data.as_ptr().cast(), len as _) };
         if n >= 0 {
             return Ok(n as usize);
         }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
+
+        let err = Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
             continue;
         }
+
         return Err(err);
     }
 }
@@ -404,7 +480,14 @@ impl HostStream for SessionStream {
     }
 
     fn as_raw_fd(&self) -> i32 {
-        // The poll side: the host stdin (the read side).
+        // The poll side: the host stdin (the read side). Windows: the
+        // console stdin is a HANDLE, not a pollable descriptor — the
+        // reader thread owns it and the round drains its channel, so
+        // the poll must skip this stream (a -1 fd is never polled).
+        #[cfg(windows)]
+        return -1;
+
+        #[cfg(unix)]
         0
     }
 
@@ -413,6 +496,12 @@ impl HostStream for SessionStream {
         // fd than the read side, and (dup'd descriptions aside) its own
         // writability. See the trait note: polling the read fd for
         // POLLOUT woke the round forever while stdout stayed blocked.
+        // Windows: the stdout is a HANDLE — the write side is drained
+        // directly each round, nothing to poll.
+        #[cfg(windows)]
+        return None;
+
+        #[cfg(unix)]
         Some(1)
     }
 

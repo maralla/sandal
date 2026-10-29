@@ -20,20 +20,25 @@
 
 use super::GuestRam;
 use super::RAM_BASE;
-#[cfg(target_os = "linux")]
-use crate::hypervisor::Vm;
-#[cfg(target_os = "linux")]
-use crate::irqs::{SPI_NET, SPI_VSOCK};
-#[cfg(not(unix))]
-use crate::virtio::vsock::HostStream;
+
 use crate::virtio::vsock::VirtioVsockDevice;
 use anyhow::Result;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+#[cfg(target_os = "linux")]
+use crate::hypervisor::Vm;
+
+#[cfg(target_os = "linux")]
+use crate::irqs::{SPI_NET, SPI_VSOCK};
+
+#[cfg(not(unix))]
+use crate::virtio::vsock::HostStream;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 /// The tracked IRQ level for the vsock line (the Linux KVM line mirror).
 #[cfg(target_os = "linux")]
@@ -97,6 +102,7 @@ impl VsockHost {
                 "vsock: pipe: {}",
                 std::io::Error::last_os_error()
             );
+
             // Both ends nonblocking: the device's progress write must
             // never block (a full 64 KiB pipe is 512 pending wakes), and
             // the poll side must not stall shutdown.
@@ -104,7 +110,9 @@ impl VsockHost {
                 let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                 let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
             }
+
             device.lock().unwrap().set_wake_fd(fds[1]);
+
             (fds[0], fds[1])
         };
 
@@ -119,12 +127,14 @@ impl VsockHost {
         }
 
         let mut threads = Vec::new();
+
         // The shutdown wakes the accepter by dropping its listener; keep
         // a duplicated handle for that (the accepter moves the original).
         let shutdown_listener = match &listener {
             Some(l) => Some(l.try_clone()?),
             None => None,
         };
+
         if let Some(listener) = listener {
             // The listener stays BLOCKING: the dedicated accepter's
             // blocking accept() returns the pending connection the
@@ -139,6 +149,7 @@ impl VsockHost {
                     })?,
             );
         }
+
         // The bridge: the live streams only — the I/O and ONE device
         // process pass per round (the front ends register the streams).
         threads.push(
@@ -164,6 +175,7 @@ impl VsockHost {
                     }
                 })?,
         );
+
         Ok(Self {
             device,
             stop,
@@ -190,10 +202,13 @@ impl VsockHost {
             unsafe {
                 let _ = libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR);
             }
+
             #[cfg(not(unix))]
             let _ = listener;
+
             drop(listener);
         }
+
         // Wake the bridge (unix): its parked poll returns now, the round
         // top's stop check ends the loop — the join below waits
         // microseconds, not a slice.
@@ -204,6 +219,7 @@ impl VsockHost {
                 let _ = libc::write(self.wake_w, one.as_ptr().cast(), one.len());
             }
         }
+
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -298,6 +314,7 @@ fn vsock_bridge(
     while !stop.load(Ordering::Relaxed) {
         // (a) Take the parked sockets and outboxes out of the device.
         let work = device.lock().unwrap().take_bridge_work();
+
         // (b) The park: one poll over every live socket, on a 20 ms
         // slice (the accepter owns the listener; see vsock_accepter).
         // POLLIN always; POLLOUT only where last round's outbox did
@@ -320,6 +337,7 @@ fn vsock_bridge(
                 let fd = host.as_raw_fd();
                 let wfd = host.write_fd().filter(|w| *w != fd);
                 let out_pending = !outbox.is_empty();
+
                 // A consumed EOF (see eof_is_hangup) stops the POLLIN arm:
                 // the read side is done, and an EOF-ready device (/dev/null,
                 // a closed terminal) would spin the park forever.
@@ -328,25 +346,40 @@ fn vsock_bridge(
                 } else {
                     libc::POLLIN
                 };
+
                 if out_pending && wfd.is_none() {
                     events |= libc::POLLOUT;
                 }
-                fds.push(libc::pollfd {
-                    fd,
-                    events,
-                    revents: 0,
-                });
+
+                // fd < 0: the stream's I/O is driven by the round's own
+                // attempts (the Windows console stream — a HANDLE, not a
+                // pollable descriptor); the poll set carries only real
+                // descriptors.
+                if fd >= 0 {
+                    fds.push(libc::pollfd {
+                        fd,
+                        events,
+                        revents: 0,
+                    });
+                }
+
                 if out_pending {
                     if let Some(w) = wfd {
-                        fds.push(libc::pollfd {
-                            fd: w,
-                            events: libc::POLLOUT,
-                            revents: 0,
-                        });
+                        // The same descriptor rule: only real fds enter
+                        // the poll set.
+                        if w >= 0 {
+                            fds.push(libc::pollfd {
+                                fd: w,
+                                events: libc::POLLOUT,
+                                revents: 0,
+                            });
+                        }
                     }
                 }
+
                 parked.push((port, host, outbox, fd));
             }
+
             // The wake pipe: the device writes it when guest-visible
             // progress lands on the run loop's thread (the outbox filling
             // is the one that matters — the host sockets cannot see it).
@@ -359,6 +392,7 @@ fn vsock_bridge(
                 events: libc::POLLIN,
                 revents: 0,
             });
+
             let _ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 20) };
             if std::env::var_os("SANDAL_VSOCK_DEBUG").is_some() {
                 let mut sum = String::new();
@@ -370,6 +404,7 @@ fn vsock_bridge(
                     sum, _ready
                 ));
             }
+
             // Drain the wake pipe (one read resets it; a zero read means
             // the poll timed out on the slice).
             if fds[wake_slot].revents & libc::POLLIN != 0 {
@@ -380,11 +415,13 @@ fn vsock_bridge(
             }
             parked
         };
+
         #[cfg(not(unix))]
         let parked: Vec<ParkedStream> = work
             .into_iter()
             .map(|(port, host, outbox)| (port, host, outbox, -1))
             .collect();
+
         #[cfg(not(unix))]
         {
             // The Windows park: a plain slice. The sockets are
@@ -393,10 +430,12 @@ fn vsock_bridge(
             // does not exist — the slice bounds the delivery latency.
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+
         let mut read: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut closed: Vec<u32> = Vec::new();
         let mut delivered: Vec<(u32, usize)> = Vec::new();
         let mut returned = Vec::with_capacity(parked.len());
+
         // Every live socket: the outbox out (the command's output),
         // the socket's bytes in (the command) — nonblocking, every
         // round, regardless of what the poll reported.
@@ -429,6 +468,7 @@ fn vsock_bridge(
                     }
                 }
             }
+
             let mut buffer = [0u8; 64 * 1024];
             loop {
                 match host.read(&mut buffer) {
@@ -473,8 +513,10 @@ fn vsock_bridge(
             if port_delivered > 0 {
                 delivered.push((port, port_delivered));
             }
+
             returned.push((port, host, outbox));
         }
+
         // (c) Exchange + ONE process pass (+ ONE pulse on Linux), under
         // the irq lock (the locking contract: the main loop's line
         // update runs under the same lock, so the pulse can never be
@@ -494,6 +536,7 @@ fn vsock_bridge(
                 super::linux::irq_pulse(&irq_levels, idx, &vm, irq_line);
             }
         }
+
         #[cfg(not(target_os = "linux"))]
         {
             // No IRQ lock here: the pulse discipline is Linux's (the

@@ -101,7 +101,7 @@ const EXIT_CTX_SIZE: usize = 4096;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FFI: the WHv entry points are resolved dynamically from
-// WindowsHypervisorPlatform.dll (no import library needed at build time).
+// WinHvPlatform.dll (no import library needed at build time).
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Handle = isize;
@@ -182,11 +182,11 @@ fn whv_api() -> Result<WhvApi> {
         return Ok((*cached).unwrap());
     }
     let loaded = (|| unsafe {
-        let lib_name: Vec<u16> = "WindowsHypervisorPlatform.dll\0".encode_utf16().collect();
+        let lib_name: Vec<u16> = "WinHvPlatform.dll\0".encode_utf16().collect();
         let lib = LoadLibraryW(lib_name.as_ptr());
         if lib == 0 {
             return Err(anyhow!(
-                "WindowsHypervisorPlatform.dll not loaded — enable the \
+                "WinHvPlatform.dll not loaded — enable the \
                  'Virtual Machine Platform' or 'Windows Hypervisor Platform' \
                  Windows feature and reboot"
             ));
